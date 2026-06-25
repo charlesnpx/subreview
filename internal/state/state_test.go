@@ -137,6 +137,50 @@ func TestInitRejectsInvalidExistingLedgerBeforeWritingManifest(t *testing.T) {
 	}
 }
 
+func TestInitRollsBackManifestWhenInitialLedgerAppendFails(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if err := os.Mkdir(stateDir, 0o755); err != nil {
+		t.Fatalf("mkdir state root: %v", err)
+	}
+	oldTimeout := ledgerLockTimeout
+	oldPoll := ledgerLockPollInterval
+	ledgerLockTimeout = 20 * time.Millisecond
+	ledgerLockPollInterval = time.Millisecond
+	t.Cleanup(func() {
+		ledgerLockTimeout = oldTimeout
+		ledgerLockPollInterval = oldPoll
+	})
+	lockPath := filepath.Join(stateDir, "ledger.lock")
+	if err := os.WriteFile(lockPath, []byte("stale\n"), 0o644); err != nil {
+		t.Fatalf("write stale lock: %v", err)
+	}
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err == nil || !strings.Contains(err.Error(), "timed out waiting for ledger lock") {
+		t.Fatalf("expected stale lock init failure, got %v", err)
+	}
+	manifestPath := filepath.Join(stateDir, "manifests", "state.json")
+	if _, err := os.Stat(manifestPath); !os.IsNotExist(err) {
+		t.Fatalf("manifest should be rolled back after initial append failure, stat err=%v", err)
+	}
+	ledgerInfo, err := os.Stat(filepath.Join(stateDir, "ledger.jsonl"))
+	if err != nil {
+		t.Fatalf("stat ledger: %v", err)
+	}
+	if ledgerInfo.Size() != 0 {
+		t.Fatalf("ledger should remain empty after failed initial append, size=%d", ledgerInfo.Size())
+	}
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatalf("remove stale lock: %v", err)
+	}
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(101, 0)}); err != nil {
+		t.Fatalf("Init retry after rollback: %v", err)
+	}
+	validation := Validate(stateDir)
+	if !validation.OK {
+		t.Fatalf("state should validate after retry: %+v", validation.Errors)
+	}
+}
+
 func TestValidateRejectsSymlinkedLayoutDirs(t *testing.T) {
 	tests := map[string]string{
 		"objects":        "invalid_objects_dir",

@@ -20,6 +20,11 @@ const (
 	maxLedgerLineBytes = 1 << 20
 )
 
+var (
+	ledgerLockTimeout      = 10 * time.Second
+	ledgerLockPollInterval = 10 * time.Millisecond
+)
+
 type InitOptions struct {
 	StateDir string
 	RepoPath string
@@ -146,6 +151,9 @@ func Init(opts InitOptions) (InitResult, error) {
 		},
 	})
 	if err != nil {
+		if rollbackErr := rollbackManifestIfEmptyLedger(manifestPath, lay.ledgerPath); rollbackErr != nil {
+			return InitResult{}, fmt.Errorf("initial ledger event failed: %w; rollback failed: %v", err, rollbackErr)
+		}
 		return InitResult{}, err
 	}
 	return InitResult{
@@ -280,7 +288,7 @@ func (s Store) Read(digest string) ([]byte, error) {
 
 func withLedgerLock(root string, fn func() (Event, error)) (Event, error) {
 	lockPath := filepath.Join(root, "ledger.lock")
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(ledgerLockTimeout)
 	for {
 		f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err == nil {
@@ -303,7 +311,7 @@ func withLedgerLock(root string, fn func() (Event, error)) (Event, error) {
 		if time.Now().After(deadline) {
 			return Event{}, fmt.Errorf("timed out waiting for ledger lock: %s", lockPath)
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(ledgerLockPollInterval)
 	}
 }
 
@@ -805,6 +813,20 @@ func prepareLedgerForInit(root, path string) error {
 		return err
 	}
 	return f.Close()
+}
+
+func rollbackManifestIfEmptyLedger(manifestPath, ledgerPath string) error {
+	info, err := os.Stat(ledgerPath)
+	if err == nil && info.Size() != 0 {
+		return nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(manifestPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func writeJSONFileExclusive(path string, value any) error {
