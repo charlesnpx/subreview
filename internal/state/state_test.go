@@ -383,6 +383,57 @@ func TestLedgerAppendPreservesLedgerWithoutTrailingNewline(t *testing.T) {
 	}
 }
 
+func TestLedgerAcceptsSupportedLargeEvents(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := AppendEvent(stateDir, Event{
+		Time: time.Unix(101, 0).UTC().Format(time.RFC3339Nano),
+		Type: "large",
+		Details: map[string]string{
+			"payload": strings.Repeat("x", 70*1024),
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent large: %v", err)
+	}
+	if _, err := AppendEvent(stateDir, Event{Time: time.Unix(102, 0).UTC().Format(time.RFC3339Nano), Type: "after_large"}); err != nil {
+		t.Fatalf("AppendEvent after large: %v", err)
+	}
+	validation := Validate(stateDir)
+	if !validation.OK {
+		t.Fatalf("state should validate with supported large event: %+v", validation.Errors)
+	}
+	if validation.EventCount != 3 {
+		t.Fatalf("unexpected event count after large event: %+v", validation)
+	}
+}
+
+func TestLedgerRejectsOversizedEvents(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := AppendEvent(stateDir, Event{
+		Time: time.Unix(101, 0).UTC().Format(time.RFC3339Nano),
+		Type: "too_large",
+		Details: map[string]string{
+			"payload": strings.Repeat("x", maxLedgerLineBytes),
+		},
+	}); err == nil || !strings.Contains(err.Error(), "ledger event exceeds") {
+		t.Fatalf("expected oversized ledger event rejection, got %v", err)
+	}
+	validation := Validate(stateDir)
+	if !validation.OK {
+		t.Fatalf("state should remain valid after oversized event rejection: %+v", validation.Errors)
+	}
+	if validation.EventCount != 1 {
+		t.Fatalf("oversized event should not be written: %+v", validation)
+	}
+}
+
 func TestLedgerConcurrentAppendsRemainLinked(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")

@@ -15,7 +15,10 @@ import (
 	"time"
 )
 
-const SchemaVersion = 1
+const (
+	SchemaVersion      = 1
+	maxLedgerLineBytes = 1 << 20
+)
 
 type InitOptions struct {
 	StateDir string
@@ -309,6 +312,9 @@ func appendLedgerLine(path string, event Event) (Event, error) {
 	if err != nil {
 		return Event{}, err
 	}
+	if len(line) > maxLedgerLineBytes {
+		return Event{}, fmt.Errorf("ledger event exceeds %d byte line limit", maxLedgerLineBytes)
+	}
 	var f *os.File
 	needsSeparator := false
 	if info, err := os.Lstat(path); err == nil {
@@ -507,6 +513,7 @@ func validateLedger(lay layout, result *ValidationResult) []string {
 	defer f.Close()
 	var referenced []string
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLedgerLineBytes)
 	lineNo := 0
 	prior := ""
 	for scanner.Scan() {
@@ -757,6 +764,7 @@ func lastEventID(path string) (string, error) {
 	}
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLedgerLineBytes)
 	last := ""
 	lineNo := 0
 	for scanner.Scan() {
