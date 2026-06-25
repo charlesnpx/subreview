@@ -128,11 +128,37 @@ func TestRunUninstallStagedTools(t *testing.T) {
 	}
 }
 
+func TestAssistantUninstallDoesNotRemoveTools(t *testing.T) {
+	stage := t.TempDir()
+	if _, err := Run(Options{Operation: "install", Target: "all", InstallRoot: stage, Version: "test"}); err != nil {
+		t.Fatalf("Run install all: %v", err)
+	}
+	binPath := filepath.Join(stage, ".local", "bin", "subreview")
+	codexSkill := filepath.Join(stage, ".codex", "skills", "subreview", "SKILL.md")
+	claudeSkill := filepath.Join(stage, ".claude", "skills", "subreview", "SKILL.md")
+	for _, path := range []string{binPath, codexSkill, claudeSkill} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected staged file before uninstall %s: %v", path, err)
+		}
+	}
+	if _, err := Run(Options{Operation: "uninstall", Target: "codex", InstallRoot: stage, Version: "test"}); err != nil {
+		t.Fatalf("Run uninstall codex: %v", err)
+	}
+	if _, err := os.Stat(codexSkill); !os.IsNotExist(err) {
+		t.Fatalf("expected codex skill removed, stat err=%v", err)
+	}
+	for _, path := range []string{binPath, claudeSkill} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("assistant uninstall should not remove %s: %v", path, err)
+		}
+	}
+}
+
 func TestRunTargetFiltering(t *testing.T) {
 	tests := map[string][]string{
 		"tools":  {"tools"},
-		"codex":  {"codex", "tools"},
-		"claude": {"claude", "tools"},
+		"codex":  {"codex"},
+		"claude": {"claude"},
 		"all":    {"claude", "codex", "tools"},
 	}
 	for target, wantTargets := range tests {
@@ -145,8 +171,10 @@ func TestRunTargetFiltering(t *testing.T) {
 			if got := targetNames(result.Targets); !reflect.DeepEqual(got, wantTargets) {
 				t.Fatalf("target %s mismatch: got %v want %v; targets=%+v", target, got, wantTargets, result.Targets)
 			}
-			if _, ok := result.Targets["tools"]; !ok {
-				t.Fatalf("target %s should include the CLI tool dependency: %+v", target, result.Targets)
+			if target != "all" && target != "tools" {
+				if _, ok := result.Targets["tools"]; ok {
+					t.Fatalf("target %s should not include tools target: %+v", target, result.Targets)
+				}
 			}
 			if target == "codex" {
 				assertSinglePath(t, result.Targets["codex"].Files, filepath.Join(stage, ".codex", "skills", "subreview", "SKILL.md"))

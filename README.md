@@ -19,7 +19,7 @@ The repository also exposes the delegated installer expected by `mise-en-place`:
 ./install-skill.sh --uninstall --target all --json --install-root /tmp/subreview-stage
 ```
 
-The delegated installer stages the self-contained CLI under `.local/bin/subreview` relative to the selected install root. It also installs thin early-stage Codex and Claude skill scaffolds under `.codex/skills/subreview/SKILL.md` and `.claude/skills/subreview/SKILL.md`.
+The delegated installer stages the self-contained CLI under `.local/bin/subreview` when the selected target includes `tools`, and it installs thin early-stage Codex and Claude skill scaffolds under `.codex/skills/subreview/SKILL.md` and `.claude/skills/subreview/SKILL.md` when those targets are selected.
 
 Real installs without `--install-root` target hidden home paths such as `~/.local`, `~/.codex`, and `~/.claude`. Environments that require explicit approval for hidden-file writes should obtain operator approval before running a real install. Tests and validation should use an explicit temporary install root.
 

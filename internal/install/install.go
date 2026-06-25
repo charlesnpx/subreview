@@ -129,7 +129,7 @@ func installHome(root string) (string, error) {
 }
 
 func buildPlan(home, target string) []plannedFile {
-	includeTools := target == "all" || target == "tools" || target == "codex" || target == "claude"
+	includeTools := target == "all" || target == "tools"
 	includeCodex := target == "all" || target == "codex"
 	includeClaude := target == "all" || target == "claude"
 	var files []plannedFile
