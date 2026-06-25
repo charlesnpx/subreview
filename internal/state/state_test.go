@@ -54,6 +54,46 @@ func TestInitRejectsHiddenStateParent(t *testing.T) {
 	}
 }
 
+func TestInitRejectsSymlinkedHiddenStateParent(t *testing.T) {
+	root := t.TempDir()
+	hidden := filepath.Join(root, ".subreview")
+	if err := os.Mkdir(hidden, 0o755); err != nil {
+		t.Fatalf("mkdir hidden parent: %v", err)
+	}
+	link := filepath.Join(root, "visible-link")
+	if err := os.Symlink(hidden, link); err != nil {
+		t.Fatalf("symlink hidden parent: %v", err)
+	}
+	if _, err := Init(InitOptions{StateDir: filepath.Join(link, "state"), RepoPath: root}); err == nil {
+		t.Fatal("expected symlinked hidden state parent error")
+	}
+	if _, err := os.Stat(filepath.Join(hidden, "state")); !os.IsNotExist(err) {
+		t.Fatalf("state should not be created through hidden symlink, stat err=%v", err)
+	}
+}
+
+func TestInitDoesNotOverwriteExistingManifest(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	manifestPath := filepath.Join(stateDir, "manifests", "state.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+		t.Fatalf("mkdir manifest parent: %v", err)
+	}
+	if err := os.WriteFile(manifestPath, []byte("sentinel"), 0o644); err != nil {
+		t.Fatalf("write manifest sentinel: %v", err)
+	}
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root}); err == nil {
+		t.Fatal("expected existing manifest to block init")
+	}
+	body, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest sentinel: %v", err)
+	}
+	if string(body) != "sentinel" {
+		t.Fatalf("manifest was overwritten: %q", body)
+	}
+}
+
 func TestCASRoundTripsAndDetectsDigestMismatch(t *testing.T) {
 	store := Store{root: t.TempDir()}
 	text, err := store.PutText("hello")
@@ -128,6 +168,23 @@ func TestLedgerAppendsPriorEventLinkage(t *testing.T) {
 	}
 }
 
+func TestAppendEventRejectsInvalidInputs(t *testing.T) {
+	stateDir := t.TempDir()
+	if _, err := AppendEvent(stateDir, Event{Time: "not-a-time", Type: "bad"}); err == nil {
+		t.Fatal("expected invalid event time error")
+	}
+	if _, err := AppendEvent(stateDir, Event{Time: time.Unix(1, 0).UTC().Format(time.RFC3339Nano), Type: "bad", ObjectDigests: []string{"not-a-digest"}}); err == nil {
+		t.Fatal("expected invalid object digest error")
+	}
+	missingDigest := "sha256:" + strings.Repeat("a", 64)
+	if _, err := AppendEvent(stateDir, Event{Time: time.Unix(1, 0).UTC().Format(time.RFC3339Nano), Type: "missing", ObjectDigests: []string{missingDigest}}); err == nil {
+		t.Fatal("expected missing object error")
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "ledger.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("invalid events should not create ledger, stat err=%v", err)
+	}
+}
+
 func TestValidateReportsMissingMalformedAndMismatchedState(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")
@@ -164,14 +221,18 @@ func TestValidateReportsMissingMalformedAndMismatchedState(t *testing.T) {
 }
 
 func TestValidateReportsMissingReferencedObject(t *testing.T) {
-	stateDir := t.TempDir()
-	missingDigest := "sha256:" + strings.Repeat("a", 64)
-	if _, err := AppendEvent(stateDir, Event{
-		Time:          time.Unix(1, 0).UTC().Format(time.RFC3339Nano),
-		Type:          "references_missing",
-		ObjectDigests: []string{missingDigest},
-	}); err != nil {
-		t.Fatalf("AppendEvent: %v", err)
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	initResult, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)})
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	path, err := objectPath(stateDir, initResult.Manifest.Digest)
+	if err != nil {
+		t.Fatalf("objectPath: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove referenced object: %v", err)
 	}
 	validation := Validate(stateDir)
 	if validation.OK {

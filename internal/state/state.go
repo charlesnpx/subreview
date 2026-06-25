@@ -104,8 +104,9 @@ func Init(opts InitOptions) (InitResult, error) {
 	if err := os.MkdirAll(lay.manifestsDir, 0o755); err != nil {
 		return InitResult{}, err
 	}
-	if ledgerHasContent(lay.ledgerPath) {
-		return InitResult{}, fmt.Errorf("state already initialized: %s", lay.ledgerPath)
+	manifestPath := filepath.Join(lay.manifestsDir, "state.json")
+	if fileExists(manifestPath) || ledgerHasContent(lay.ledgerPath) {
+		return InitResult{}, fmt.Errorf("state already initialized: %s", root)
 	}
 	if _, err := os.OpenFile(lay.ledgerPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644); err != nil {
 		if !os.IsExist(err) {
@@ -128,8 +129,7 @@ func Init(opts InitOptions) (InitResult, error) {
 	if err != nil {
 		return InitResult{}, err
 	}
-	manifestPath := filepath.Join(lay.manifestsDir, "state.json")
-	if err := writeJSONFile(manifestPath, map[string]any{
+	if err := writeJSONFileExclusive(manifestPath, map[string]any{
 		"schema_version": SchemaVersion,
 		"manifest":       manifest,
 	}); err != nil {
@@ -182,22 +182,11 @@ func (s Store) PutBytes(body []byte, mediaType string) (ObjectRef, error) {
 		mediaType = "application/octet-stream"
 	}
 	digest := digestBytes(body)
+	if err := s.ensureObject(body, digest); err != nil {
+		return ObjectRef{}, err
+	}
 	path, err := objectPath(s.root, digest)
 	if err != nil {
-		return ObjectRef{}, err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return ObjectRef{}, err
-	}
-	if existing, err := os.ReadFile(path); err == nil {
-		if digestBytes(existing) != digest {
-			return ObjectRef{}, fmt.Errorf("existing object digest mismatch: %s", digest)
-		}
-	} else if os.IsNotExist(err) {
-		if err := os.WriteFile(path, body, 0o644); err != nil {
-			return ObjectRef{}, err
-		}
-	} else {
 		return ObjectRef{}, err
 	}
 	abs, err := filepath.Abs(path)
@@ -205,6 +194,47 @@ func (s Store) PutBytes(body []byte, mediaType string) (ObjectRef, error) {
 		return ObjectRef{}, err
 	}
 	return ObjectRef{Digest: digest, MediaType: mediaType, Size: int64(len(body)), Path: abs}, nil
+}
+
+func writeFileExclusive(path string, body []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(body)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
+func verifyExistingObject(path, digest string) error {
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if digestBytes(existing) != digest {
+		return fmt.Errorf("existing object digest mismatch: %s", digest)
+	}
+	return nil
+}
+
+func (s Store) ensureObject(body []byte, digest string) error {
+	path, err := objectPath(s.root, digest)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if err := writeFileExclusive(path, body, 0o644); err != nil {
+		if os.IsExist(err) {
+			return verifyExistingObject(path, digest)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s Store) Read(digest string) ([]byte, error) {
@@ -246,8 +276,20 @@ func AppendEvent(stateDir string, event Event) (Event, error) {
 	if event.Time == "" {
 		event.Time = time.Now().UTC().Format(time.RFC3339Nano)
 	}
+	if _, err := time.Parse(time.RFC3339Nano, event.Time); err != nil {
+		return Event{}, fmt.Errorf("invalid event time: %w", err)
+	}
 	if event.Type == "" {
 		return Event{}, errors.New("event type is required")
+	}
+	store := Store{root: root}
+	for _, digest := range event.ObjectDigests {
+		if err := validateDigest(digest); err != nil {
+			return Event{}, err
+		}
+		if _, err := store.Read(digest); err != nil {
+			return Event{}, err
+		}
 	}
 	event.EventID = eventID(event)
 	line, err := json.Marshal(event)
@@ -438,15 +480,17 @@ func explicitStateDir(path string) (string, error) {
 		return "", err
 	}
 	clean := filepath.Clean(abs)
-	for _, part := range strings.Split(clean, string(os.PathSeparator)) {
-		if part == "" || part == "." {
-			continue
-		}
-		if strings.HasPrefix(part, ".") {
-			return "", fmt.Errorf("state path must not include hidden directories: %s", abs)
-		}
+	if hasHiddenComponent(clean) {
+		return "", fmt.Errorf("state path must not include hidden directories: %s", abs)
 	}
-	return abs, nil
+	resolvedParent, err := resolveExistingParent(clean)
+	if err != nil {
+		return "", err
+	}
+	if hasHiddenComponent(resolvedParent) {
+		return "", fmt.Errorf("state path must not resolve through hidden directories: %s", abs)
+	}
+	return clean, nil
 }
 
 func explicitRepoPath(path string) (string, error) {
@@ -530,7 +574,7 @@ func ledgerHasContent(path string) bool {
 	return err == nil && info.Size() > 0
 }
 
-func writeJSONFile(path string, value any) error {
+func writeJSONFileExclusive(path string, value any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -539,7 +583,7 @@ func writeJSONFile(path string, value any) error {
 		return err
 	}
 	body = append(body, '\n')
-	return os.WriteFile(path, body, 0o644)
+	return writeFileExclusive(path, body, 0o644)
 }
 
 func fileExists(path string) bool {
@@ -557,6 +601,47 @@ func isHex(value string) bool {
 		return false
 	}
 	return true
+}
+
+func hasHiddenComponent(path string) bool {
+	clean := filepath.Clean(path)
+	for _, part := range strings.Split(clean, string(os.PathSeparator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		if strings.HasPrefix(part, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveExistingParent(path string) (string, error) {
+	current := filepath.Clean(path)
+	for {
+		info, err := os.Lstat(current)
+		if err == nil {
+			if current == path && !info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+				return "", fmt.Errorf("state path exists and is not a directory: %s", path)
+			}
+			if current != path && !info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+				return "", fmt.Errorf("state parent exists and is not a directory: %s", current)
+			}
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		next := filepath.Dir(current)
+		if next == current {
+			return current, nil
+		}
+		current = next
+	}
 }
 
 func min(a, b int) int {
