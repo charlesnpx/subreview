@@ -189,7 +189,15 @@ func (s Store) PutBytes(body []byte, mediaType string) (ObjectRef, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return ObjectRef{}, err
 	}
-	if err := os.WriteFile(path, body, 0o644); err != nil {
+	if existing, err := os.ReadFile(path); err == nil {
+		if digestBytes(existing) != digest {
+			return ObjectRef{}, fmt.Errorf("existing object digest mismatch: %s", digest)
+		}
+	} else if os.IsNotExist(err) {
+		if err := os.WriteFile(path, body, 0o644); err != nil {
+			return ObjectRef{}, err
+		}
+	} else {
 		return ObjectRef{}, err
 	}
 	abs, err := filepath.Abs(path)
@@ -354,6 +362,11 @@ func validateLedger(lay layout, result *ValidationResult) []string {
 		if event.Type == "" {
 			result.addError("missing_event_type", lay.ledgerPath, lineNo, "event type is required")
 		}
+		if event.Time == "" {
+			result.addError("missing_event_time", lay.ledgerPath, lineNo, "event time is required")
+		} else if _, err := time.Parse(time.RFC3339Nano, event.Time); err != nil {
+			result.addError("invalid_event_time", lay.ledgerPath, lineNo, err.Error())
+		}
 		if event.PriorEventID != prior {
 			result.addError("prior_event_mismatch", lay.ledgerPath, lineNo, fmt.Sprintf("expected prior_event_id %q, got %q", prior, event.PriorEventID))
 		}
@@ -424,8 +437,14 @@ func explicitStateDir(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if strings.HasPrefix(filepath.Base(abs), ".") {
-		return "", fmt.Errorf("state directory must not be hidden: %s", abs)
+	clean := filepath.Clean(abs)
+	for _, part := range strings.Split(clean, string(os.PathSeparator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		if strings.HasPrefix(part, ".") {
+			return "", fmt.Errorf("state path must not include hidden directories: %s", abs)
+		}
 	}
 	return abs, nil
 }

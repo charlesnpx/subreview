@@ -44,6 +44,16 @@ func TestInitRejectsHiddenStateDir(t *testing.T) {
 	}
 }
 
+func TestInitRejectsHiddenStateParent(t *testing.T) {
+	root := t.TempDir()
+	if _, err := Init(InitOptions{StateDir: filepath.Join(root, ".subreview", "state"), RepoPath: root}); err == nil {
+		t.Fatal("expected hidden state parent error")
+	}
+	if _, err := os.Stat(filepath.Join(root, ".subreview")); !os.IsNotExist(err) {
+		t.Fatalf("hidden parent should not be created, stat err=%v", err)
+	}
+}
+
 func TestCASRoundTripsAndDetectsDigestMismatch(t *testing.T) {
 	store := Store{root: t.TempDir()}
 	text, err := store.PutText("hello")
@@ -74,6 +84,9 @@ func TestCASRoundTripsAndDetectsDigestMismatch(t *testing.T) {
 	}
 	if err := os.WriteFile(path, []byte("tampered"), 0o644); err != nil {
 		t.Fatalf("tamper object: %v", err)
+	}
+	if _, err := store.PutText("hello"); err == nil || !strings.Contains(err.Error(), "existing object digest mismatch") {
+		t.Fatalf("expected immutable CAS write failure, got %v", err)
 	}
 	if _, err := store.Read(text.Digest); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
 		t.Fatalf("expected digest mismatch, got %v", err)
@@ -165,6 +178,45 @@ func TestValidateReportsMissingReferencedObject(t *testing.T) {
 		t.Fatalf("expected missing object validation failure")
 	}
 	requireIssue(t, validation, "object_read_failed")
+}
+
+func TestValidateReportsInvalidEventTime(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	prior, err := lastEventID(filepath.Join(stateDir, "ledger.jsonl"))
+	if err != nil {
+		t.Fatalf("lastEventID: %v", err)
+	}
+	event := Event{
+		SchemaVersion: SchemaVersion,
+		Time:          "not-a-time",
+		Type:          "bad_time",
+		PriorEventID:  prior,
+	}
+	event.EventID = eventID(event)
+	body, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	f, err := os.OpenFile(filepath.Join(stateDir, "ledger.jsonl"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open ledger: %v", err)
+	}
+	if _, err := f.Write(append(body, '\n')); err != nil {
+		_ = f.Close()
+		t.Fatalf("append event: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close ledger: %v", err)
+	}
+	validation := Validate(stateDir)
+	if validation.OK {
+		t.Fatalf("expected invalid event time failure")
+	}
+	requireIssue(t, validation, "invalid_event_time")
 }
 
 func requireIssue(t *testing.T, result ValidationResult, code string) {
