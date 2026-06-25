@@ -42,6 +42,20 @@ func TestRunPlanDoesNotWrite(t *testing.T) {
 	}
 }
 
+func TestRunPlanDoesNotRequireRepoRoot(t *testing.T) {
+	t.Setenv("SUBREVIEW_REPO_ROOT", "")
+	stage := t.TempDir()
+	t.Chdir(t.TempDir())
+	result, err := Run(Options{Operation: "plan", Target: "all", InstallRoot: stage, Version: "test"})
+	if err != nil {
+		t.Fatalf("Run plan outside repo: %v", err)
+	}
+	if got := targetNames(result.Targets); !reflect.DeepEqual(got, []string{"claude", "codex", "tools"}) {
+		t.Fatalf("all target plan mismatch outside repo: %+v", result.Targets)
+	}
+	assertPlanFiles(t, result)
+}
+
 func TestRunInstallStagedAllTargets(t *testing.T) {
 	stage := t.TempDir()
 	result, err := Run(Options{Operation: "install", Target: "all", InstallRoot: stage, Version: "test-version"})

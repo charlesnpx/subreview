@@ -77,16 +77,16 @@ func Run(opts Options) (Result, error) {
 	if opts.Target != "all" && opts.Target != "tools" && opts.Target != "codex" && opts.Target != "claude" {
 		return Result{}, fmt.Errorf("unsupported target: %s", opts.Target)
 	}
-	root, err := repoRoot()
-	if err != nil {
-		return Result{}, err
-	}
 	home, err := installHome(opts.InstallRoot)
 	if err != nil {
 		return Result{}, err
 	}
 	plan := buildPlan(home, opts.Target)
 	if opts.Operation == "install" {
+		root, err := repoRoot()
+		if err != nil {
+			return Result{}, err
+		}
 		if err := applyInstall(root, plan, opts.Version); err != nil {
 			return Result{}, err
 		}
