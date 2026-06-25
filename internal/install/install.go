@@ -55,6 +55,7 @@ type File struct {
 
 type plannedFile struct {
 	target string
+	source string
 	dest   string
 	mode   os.FileMode
 	tool   bool
@@ -129,6 +130,8 @@ func installHome(root string) (string, error) {
 
 func buildPlan(home, target string) []plannedFile {
 	includeTools := target == "all" || target == "tools" || target == "codex" || target == "claude"
+	includeCodex := target == "all" || target == "codex"
+	includeClaude := target == "all" || target == "claude"
 	var files []plannedFile
 	if includeTools {
 		files = append(files, plannedFile{
@@ -136,6 +139,22 @@ func buildPlan(home, target string) []plannedFile {
 			dest:   filepath.Join(home, ".local", "bin", binary),
 			mode:   0o755,
 			tool:   true,
+		})
+	}
+	if includeCodex {
+		files = append(files, plannedFile{
+			target: "codex",
+			source: filepath.Join("skills", "codex", "subreview", "SKILL.md"),
+			dest:   filepath.Join(home, ".codex", "skills", "subreview", "SKILL.md"),
+			mode:   0o644,
+		})
+	}
+	if includeClaude {
+		files = append(files, plannedFile{
+			target: "claude",
+			source: filepath.Join("skills", "claude", "subreview", "SKILL.md"),
+			dest:   filepath.Join(home, ".claude", "skills", "subreview", "SKILL.md"),
+			mode:   0o644,
 		})
 	}
 	return files
@@ -155,8 +174,31 @@ func applyInstall(root string, plan []plannedFile, version string) error {
 			}
 			continue
 		}
+		if err := copyFile(filepath.Join(root, file.source), file.dest, file.mode); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(dst, mode)
 }
 
 func resultFromPlan(operation, version string, plan []plannedFile) (Result, error) {

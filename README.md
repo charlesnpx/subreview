@@ -2,7 +2,7 @@
 
 `subreview` is a local-first controller for structured subagent review loops. The v1 runtime is a Go CLI that records explicit state supplied by the operator; it does not create hidden default state directories.
 
-Current Story 1 commands:
+Current early commands:
 
 ```sh
 subreview version
@@ -19,8 +19,10 @@ The repository also exposes the delegated installer expected by `mise-en-place`:
 ./install-skill.sh --uninstall --target all --json --install-root /tmp/subreview-stage
 ```
 
-Story 1 installs the self-contained CLI under `.local/bin/subreview` relative to the selected install root. Codex and Claude skill files are intentionally not installed yet; they are added by the next story while continuing to use this delegated installer.
+The delegated installer stages the self-contained CLI under `.local/bin/subreview` relative to the selected install root. It also installs thin early-stage Codex and Claude skill scaffolds under `.codex/skills/subreview/SKILL.md` and `.claude/skills/subreview/SKILL.md`.
 
-Real installs without `--install-root` target hidden home paths such as `~/.local`, and later stories will add `~/.codex` and `~/.claude` targets. Environments that require explicit approval for hidden-file writes should obtain operator approval before running a real install. Tests and validation should use an explicit temporary install root.
+Real installs without `--install-root` target hidden home paths such as `~/.local`, `~/.codex`, and `~/.claude`. Environments that require explicit approval for hidden-file writes should obtain operator approval before running a real install. Tests and validation should use an explicit temporary install root.
+
+The installed skills are intentionally thin. They tell agents to invoke the CLI, require explicit `--state <dir>` paths for any command that accepts state, avoid hidden default state creation, and avoid claiming closure from a clean reviewer response alone. Later stories add the actual v1 workflow commands behind the CLI.
 
 The existing `research/` corpus and `scripts/` utilities are research inputs for policy design and evaluation. They are separate from the v1 runtime CLI and are not imported or executed by `subreview` commands.

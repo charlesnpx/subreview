@@ -5,6 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -20,16 +23,20 @@ func TestRunPlanDoesNotWrite(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(stage, ".local", "bin", "subreview")); !os.IsNotExist(err) {
 		t.Fatalf("plan should not write staged binary, stat err=%v", err)
 	}
+	if _, err := os.Stat(filepath.Join(stage, ".codex", "skills", "subreview", "SKILL.md")); !os.IsNotExist(err) {
+		t.Fatalf("plan should not write staged codex skill, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stage, ".claude", "skills", "subreview", "SKILL.md")); !os.IsNotExist(err) {
+		t.Fatalf("plan should not write staged claude skill, stat err=%v", err)
+	}
+	if got := targetNames(result.Targets); !reflect.DeepEqual(got, []string{"claude", "codex", "tools"}) {
+		t.Fatalf("all target plan mismatch: %+v", result.Targets)
+	}
 	toolFiles := result.Targets["tools"].Files
 	if len(toolFiles) != 1 {
 		t.Fatalf("expected one tools file: %+v", result.Targets)
 	}
-	if !filepath.IsAbs(toolFiles[0].Path) {
-		t.Fatalf("planned path should be absolute: %+v", toolFiles[0])
-	}
-	if toolFiles[0].SHA256 != "" {
-		t.Fatalf("plan should not include sha256: %+v", toolFiles[0])
-	}
+	assertPlanFiles(t, result)
 	if len(result.Setup) != 1 || result.Setup[0].Kind != "executable" || result.Setup[0].Executable != "git" {
 		t.Fatalf("expected git setup requirement: %+v", result.Setup)
 	}
@@ -59,11 +66,43 @@ func TestRunInstallStagedAllTargets(t *testing.T) {
 	if got := string(out); got != "test-version\n" {
 		t.Fatalf("version output mismatch: %q", got)
 	}
-	if _, ok := result.Targets["codex"]; ok {
-		t.Fatalf("codex skill files are not part of Story 1: %+v", result.Targets)
+	codexSkill := filepath.Join(stage, ".codex", "skills", "subreview", "SKILL.md")
+	claudeSkill := filepath.Join(stage, ".claude", "skills", "subreview", "SKILL.md")
+	for _, path := range []string{codexSkill, claudeSkill} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected staged skill %s: %v", path, err)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read staged skill %s: %v", path, err)
+		}
+		content := string(body)
+		for _, want := range []string{
+			"subreview version",
+			"subreview install-skills --plan --target all --json",
+			"V1 workflow commands are being implemented across later stories",
+			"Do not simulate unsupported `subreview` commands in prose",
+			"explicit `--state <dir>` path",
+			"Do not create hidden default state directories",
+			"Do not claim review closure from a clean reviewer response alone",
+		} {
+			if !strings.Contains(content, want) {
+				t.Fatalf("staged skill %s missing %q", path, want)
+			}
+		}
 	}
-	if _, ok := result.Targets["claude"]; ok {
-		t.Fatalf("claude skill files are not part of Story 1: %+v", result.Targets)
+	for target, files := range result.Targets {
+		if len(files.Files) == 0 {
+			t.Fatalf("target %s has no files", target)
+		}
+		for _, file := range files.Files {
+			if !filepath.IsAbs(file.Path) {
+				t.Fatalf("target %s path should be absolute: %+v", target, file)
+			}
+			if len(file.SHA256) != 64 {
+				t.Fatalf("target %s file %s missing sha256: %+v", target, file.Path, file)
+			}
+		}
 	}
 }
 
@@ -90,14 +129,36 @@ func TestRunUninstallStagedTools(t *testing.T) {
 }
 
 func TestRunTargetFiltering(t *testing.T) {
-	for _, target := range []string{"tools", "codex", "claude", "all"} {
+	tests := map[string][]string{
+		"tools":  {"tools"},
+		"codex":  {"codex", "tools"},
+		"claude": {"claude", "tools"},
+		"all":    {"claude", "codex", "tools"},
+	}
+	for target, wantTargets := range tests {
 		t.Run(target, func(t *testing.T) {
-			result, err := Run(Options{Operation: "plan", Target: target, InstallRoot: t.TempDir(), Version: "test"})
+			stage := t.TempDir()
+			result, err := Run(Options{Operation: "plan", Target: target, InstallRoot: stage, Version: "test"})
 			if err != nil {
 				t.Fatalf("Run plan: %v", err)
 			}
-			if len(result.Targets) != 1 || len(result.Targets["tools"].Files) != 1 {
-				t.Fatalf("Story 1 target %s should plan the required CLI tool only: %+v", target, result.Targets)
+			if got := targetNames(result.Targets); !reflect.DeepEqual(got, wantTargets) {
+				t.Fatalf("target %s mismatch: got %v want %v; targets=%+v", target, got, wantTargets, result.Targets)
+			}
+			if _, ok := result.Targets["tools"]; !ok {
+				t.Fatalf("target %s should include the CLI tool dependency: %+v", target, result.Targets)
+			}
+			if target == "codex" {
+				assertSinglePath(t, result.Targets["codex"].Files, filepath.Join(stage, ".codex", "skills", "subreview", "SKILL.md"))
+				if _, ok := result.Targets["claude"]; ok {
+					t.Fatalf("codex target should not include claude skill: %+v", result.Targets)
+				}
+			}
+			if target == "claude" {
+				assertSinglePath(t, result.Targets["claude"].Files, filepath.Join(stage, ".claude", "skills", "subreview", "SKILL.md"))
+				if _, ok := result.Targets["codex"]; ok {
+					t.Fatalf("claude target should not include codex skill: %+v", result.Targets)
+				}
 			}
 		})
 	}
@@ -110,6 +171,36 @@ func TestRunRejectsUnsupportedOperationAndTarget(t *testing.T) {
 	if _, err := Run(Options{Operation: "plan", Target: "vim", InstallRoot: t.TempDir()}); err == nil {
 		t.Fatal("expected unsupported target error")
 	}
+}
+
+func assertPlanFiles(t *testing.T, result Result) {
+	t.Helper()
+	for target, files := range result.Targets {
+		for _, file := range files.Files {
+			if !filepath.IsAbs(file.Path) {
+				t.Fatalf("target %s planned path should be absolute: %+v", target, file)
+			}
+			if file.SHA256 != "" {
+				t.Fatalf("target %s plan should not include sha256: %+v", target, file)
+			}
+		}
+	}
+}
+
+func assertSinglePath(t *testing.T, files []File, want string) {
+	t.Helper()
+	if len(files) != 1 || files[0].Path != want {
+		t.Fatalf("expected one path %s, got %+v", want, files)
+	}
+}
+
+func targetNames(targets map[string]Files) []string {
+	names := make([]string, 0, len(targets))
+	for name := range targets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func TestResultJSONShape(t *testing.T) {

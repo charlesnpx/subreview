@@ -102,7 +102,7 @@ Delegated installer operations:
   --json       Emit delegated-installer JSON to stdout
   --target     tools, codex, claude, or all
 
-Story 1 installs the subreview CLI tool. Codex and Claude skill files are added by a later story.`)
+The installer stages the subreview CLI tool. Codex and Claude targets also install thin early-stage skill scaffolds.`)
 }
 
 func hasHelpFlag(args []string) bool {
