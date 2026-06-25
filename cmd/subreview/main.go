@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/charlesnpx/subreview/internal/install"
+	"github.com/charlesnpx/subreview/internal/state"
 )
 
 var Version = "dev"
@@ -21,6 +22,8 @@ func main() {
 	switch os.Args[1] {
 	case "install-skills":
 		err = installSkills(os.Args[2:])
+	case "state":
+		err = stateCommand(os.Args[2:])
 	case "version":
 		fmt.Println(Version)
 	case "-h", "--help", "help":
@@ -37,6 +40,8 @@ func main() {
 func usage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   subreview install-skills [--plan|--install|--uninstall] [--target tools|claude|codex|all] [--json] [--install-root <dir>]
+  subreview state init --state <dir> --repo <path> [--json]
+  subreview state validate --state <dir> [--json]
   subreview version`)
 }
 
@@ -105,6 +110,113 @@ Delegated installer operations:
 The installer stages the subreview CLI tool. Codex and Claude targets also install thin early-stage skill scaffolds.`)
 }
 
+func stateCommand(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("state requires subcommand: init or validate")
+	}
+	if isHelpCommand(args[0]) {
+		usageState(os.Stdout)
+		return nil
+	}
+	switch args[0] {
+	case "init":
+		return stateInit(args[1:])
+	case "validate":
+		return stateValidate(args[1:])
+	default:
+		return fmt.Errorf("state requires subcommand: init or validate")
+	}
+}
+
+func stateInit(args []string) error {
+	if hasHelpFlag(args) {
+		usageStateInit(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("state init", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit non-hidden state directory")
+	repoPath := fs.String("repo", "", "Repository path this state belongs to")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("state init does not accept positional arguments")
+	}
+	result, err := state.Init(state.InitOptions{StateDir: *stateDir, RepoPath: *repoPath})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("initialized subreview state at %s\n", result.State)
+	return nil
+}
+
+func stateValidate(args []string) error {
+	if hasHelpFlag(args) {
+		usageStateValidate(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("state validate", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("state validate does not accept positional arguments")
+	}
+	if *stateDir == "" {
+		return fmt.Errorf("--state is required")
+	}
+	result := state.Validate(*stateDir)
+	if *asJSON {
+		if err := writeJSON(result); err != nil {
+			return err
+		}
+		if !result.OK {
+			return fmt.Errorf("state validation failed")
+		}
+		return nil
+	}
+	if result.OK {
+		fmt.Printf("state valid: %s\n", result.State)
+		return nil
+	}
+	for _, issue := range result.Errors {
+		if issue.Line > 0 {
+			fmt.Fprintf(os.Stderr, "%s:%d: %s: %s\n", issue.Path, issue.Line, issue.Code, issue.Message)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "%s: %s: %s\n", issue.Path, issue.Code, issue.Message)
+	}
+	return fmt.Errorf("state validation failed")
+}
+
+func usageState(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview state init --state <dir> --repo <path> [--json]
+  subreview state validate --state <dir> [--json]`)
+}
+
+func usageStateInit(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview state init --state <dir> --repo <path> [--json]
+
+Creates the supplied non-hidden state directory with objects/, manifests/, and ledger.jsonl.`)
+}
+
+func usageStateValidate(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview state validate --state <dir> [--json]
+
+Validates ledger JSONL, prior-event linkage, referenced CAS objects, and object digests.`)
+}
+
 func hasHelpFlag(args []string) bool {
 	for _, arg := range args {
 		if arg == "-h" || arg == "--help" || arg == "help" {
@@ -112,6 +224,10 @@ func hasHelpFlag(args []string) bool {
 		}
 	}
 	return false
+}
+
+func isHelpCommand(arg string) bool {
+	return arg == "-h" || arg == "--help" || arg == "help"
 }
 
 func writeJSON(v any) error {

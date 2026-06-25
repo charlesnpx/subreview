@@ -6,6 +6,8 @@ Current early commands:
 
 ```sh
 subreview version
+subreview state init --state /tmp/subreview-state --repo . --json
+subreview state validate --state /tmp/subreview-state --json
 subreview install-skills --plan --target all --json
 subreview install-skills --install --target all --json --install-root /tmp/subreview-stage
 subreview install-skills --uninstall --target all --json --install-root /tmp/subreview-stage
@@ -24,5 +26,7 @@ The delegated installer stages the self-contained CLI under `.local/bin/subrevie
 Real installs without `--install-root` target hidden home paths such as `~/.local`, `~/.codex`, and `~/.claude`. Environments that require explicit approval for hidden-file writes should obtain operator approval before running a real install. Tests and validation should use an explicit temporary install root.
 
 The installed skills are intentionally thin. They tell agents to invoke the CLI, require explicit `--state <dir>` paths for any command that accepts state, avoid hidden default state creation, and avoid claiming closure from a clean reviewer response alone. Later stories add the actual v1 workflow commands behind the CLI.
+
+`subreview state init` creates local state only at the supplied non-hidden `--state` path. The state layout contains `objects/sha256/`, `manifests/`, and `ledger.jsonl`. `subreview state validate` checks ledger JSONL, event linkage, referenced CAS objects, and digest integrity.
 
 The existing `research/` corpus and `scripts/` utilities are research inputs for policy design and evaluation. They are separate from the v1 runtime CLI and are not imported or executed by `subreview` commands.

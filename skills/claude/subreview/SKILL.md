@@ -11,6 +11,8 @@ Available now:
 
 ```sh
 subreview version
+subreview state init --state <dir> --repo <path> --json
+subreview state validate --state <dir> --json
 subreview install-skills --plan --target all --json
 ```
 
