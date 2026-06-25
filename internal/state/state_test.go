@@ -116,6 +116,44 @@ func TestInitRejectsSymlinkedLayoutDirs(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsSymlinkedLayoutDirs(t *testing.T) {
+	tests := map[string]string{
+		"objects":        "invalid_objects_dir",
+		"objects_sha256": "invalid_objects_dir",
+		"manifests":      "invalid_manifests_dir",
+	}
+	for name, issueCode := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			stateDir := filepath.Join(root, "state")
+			if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+				t.Fatalf("Init: %v", err)
+			}
+			var replacePath string
+			switch name {
+			case "objects":
+				replacePath = filepath.Join(stateDir, "objects")
+			case "objects_sha256":
+				replacePath = filepath.Join(stateDir, "objects", "sha256")
+			case "manifests":
+				replacePath = filepath.Join(stateDir, "manifests")
+			}
+			external := filepath.Join(root, "external-"+name)
+			if err := os.Rename(replacePath, external); err != nil {
+				t.Fatalf("move layout dir: %v", err)
+			}
+			if err := os.Symlink(external, replacePath); err != nil {
+				t.Fatalf("symlink layout dir: %v", err)
+			}
+			validation := Validate(stateDir)
+			if validation.OK {
+				t.Fatalf("expected symlinked layout validation failure")
+			}
+			requireIssue(t, validation, issueCode)
+		})
+	}
+}
+
 func TestCASRoundTripsAndDetectsDigestMismatch(t *testing.T) {
 	store := Store{root: t.TempDir()}
 	text, err := store.PutText("hello")

@@ -108,10 +108,13 @@ func Init(opts InitOptions) (InitResult, error) {
 	if fileExists(manifestPath) || ledgerHasContent(lay.ledgerPath) {
 		return InitResult{}, fmt.Errorf("state already initialized: %s", root)
 	}
-	if _, err := os.OpenFile(lay.ledgerPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644); err != nil {
+	ledgerFile, err := os.OpenFile(lay.ledgerPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
 		if !os.IsExist(err) {
 			return InitResult{}, err
 		}
+	} else if err := ledgerFile.Close(); err != nil {
+		return InitResult{}, err
 	}
 	store := Store{root: root}
 	manifestObject := map[string]any{
@@ -328,8 +331,11 @@ func appendLedgerLine(path string, event Event) (Event, error) {
 	} else {
 		return Event{}, err
 	}
-	defer f.Close()
 	if _, err := f.Write(append(line, '\n')); err != nil {
+		_ = f.Close()
+		return Event{}, err
+	}
+	if err := f.Close(); err != nil {
 		return Event{}, err
 	}
 	return event, nil
@@ -383,11 +389,11 @@ func Validate(stateDir string) ValidationResult {
 	}
 	result := ValidationResult{SchemaVersion: SchemaVersion, State: root, OK: true}
 	lay := stateLayout(root)
-	if !dirExists(lay.objectsDir) {
-		result.addError("missing_objects_dir", lay.objectsDir, 0, "objects directory is missing")
+	if err := requireExistingStateSubdir(lay.root, "objects", "sha256"); err != nil {
+		result.addError("invalid_objects_dir", lay.objectsDir, 0, err.Error())
 	}
-	if !dirExists(lay.manifestsDir) {
-		result.addError("missing_manifests_dir", lay.manifestsDir, 0, "manifests directory is missing")
+	if err := requireExistingStateSubdir(lay.root, "manifests"); err != nil {
+		result.addError("invalid_manifests_dir", lay.manifestsDir, 0, err.Error())
 	}
 	if !fileExists(lay.ledgerPath) {
 		result.addError("missing_ledger", lay.ledgerPath, 0, "ledger.jsonl is missing")
@@ -742,11 +748,54 @@ func hasHiddenComponent(path string) bool {
 }
 
 func ensureStateSubdir(root string, parts ...string) error {
-	path := root
+	if err := ensureStateRoot(root); err != nil {
+		return err
+	}
+	path := filepath.Clean(root)
 	for _, part := range parts {
 		path = filepath.Join(path, part)
+		info, err := os.Lstat(path)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("state layout path is a symlink: %s", path)
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("state layout path is not a directory: %s", path)
+			}
+			continue
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.Mkdir(path, 0o755); err != nil {
+			return err
+		}
 	}
-	return ensureRealDirPath(path)
+	return nil
+}
+
+func ensureStateRoot(root string) error {
+	clean := filepath.Clean(root)
+	info, err := os.Lstat(clean)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("state root is a symlink: %s", clean)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("state root is not a directory: %s", clean)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	parent := filepath.Dir(clean)
+	if parent != clean {
+		if err := ensureRealDirPath(parent); err != nil {
+			return err
+		}
+	}
+	return os.Mkdir(clean, 0o755)
 }
 
 func ensureRealDirPath(path string) error {
@@ -771,6 +820,38 @@ func ensureRealDirPath(path string) error {
 		}
 	}
 	return os.Mkdir(clean, 0o755)
+}
+
+func requireExistingStateSubdir(root string, parts ...string) error {
+	path := filepath.Clean(root)
+	if err := requireExistingRealDir(path); err != nil {
+		return err
+	}
+	for _, part := range parts {
+		path = filepath.Join(path, part)
+		if err := requireExistingRealDir(path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func requireExistingRealDir(path string) error {
+	clean := filepath.Clean(path)
+	info, err := os.Lstat(clean)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("directory is missing: %s", clean)
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("directory is a symlink: %s", clean)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path is not a directory: %s", clean)
+	}
+	return nil
 }
 
 func resolveExistingParent(path string) (string, error) {
