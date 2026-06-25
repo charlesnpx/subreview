@@ -105,15 +105,10 @@ func Init(opts InitOptions) (InitResult, error) {
 		return InitResult{}, err
 	}
 	manifestPath := filepath.Join(lay.manifestsDir, "state.json")
-	if fileExists(manifestPath) || ledgerHasContent(lay.ledgerPath) {
+	if fileExists(manifestPath) {
 		return InitResult{}, fmt.Errorf("state already initialized: %s", root)
 	}
-	ledgerFile, err := os.OpenFile(lay.ledgerPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if err != nil {
-		if !os.IsExist(err) {
-			return InitResult{}, err
-		}
-	} else if err := ledgerFile.Close(); err != nil {
+	if err := prepareLedgerForInit(root, lay.ledgerPath); err != nil {
 		return InitResult{}, err
 	}
 	store := Store{root: root}
@@ -383,11 +378,17 @@ func AppendEvent(stateDir string, event Event) (Event, error) {
 }
 
 func Validate(stateDir string) ValidationResult {
-	root, err := filepath.Abs(stateDir)
+	stateLabel, err := filepath.Abs(stateDir)
 	if err != nil {
-		root = stateDir
+		stateLabel = stateDir
 	}
-	result := ValidationResult{SchemaVersion: SchemaVersion, State: root, OK: true}
+	result := ValidationResult{SchemaVersion: SchemaVersion, State: stateLabel, OK: true}
+	root, err := explicitStateDir(stateDir)
+	if err != nil {
+		result.addError("invalid_state_path", stateLabel, 0, err.Error())
+		return result.finalize()
+	}
+	result.State = root
 	lay := stateLayout(root)
 	if err := requireExistingStateSubdir(lay.root, "objects", "sha256"); err != nil {
 		result.addError("invalid_objects_dir", lay.objectsDir, 0, err.Error())
@@ -404,7 +405,7 @@ func Validate(stateDir string) ValidationResult {
 	if !fileExists(manifestPath) {
 		result.addError("missing_manifest", manifestPath, 0, "manifests/state.json is missing")
 	} else {
-		referenced = append(referenced, validateManifestFile(manifestPath, &result)...)
+		referenced = append(referenced, validateManifestFile(root, manifestPath, &result)...)
 	}
 	result.ObjectCount = validateObjectFiles(lay, &result)
 	referenced = append(referenced, validateLedger(lay, &result)...)
@@ -523,7 +524,7 @@ func validateLedger(lay layout, result *ValidationResult) []string {
 	return referenced
 }
 
-func validateManifestFile(path string, result *ValidationResult) []string {
+func validateManifestFile(root, path string, result *ValidationResult) []string {
 	if err := checkRegularFile(path); err != nil {
 		result.addError("manifest_not_regular", path, 0, err.Error())
 		return nil
@@ -552,7 +553,51 @@ func validateManifestFile(path string, result *ValidationResult) []string {
 		result.addError("invalid_manifest_digest", path, 0, err.Error())
 		return nil
 	}
+	validateManifestObject(root, manifest.Manifest.Digest, result)
 	return []string{manifest.Manifest.Digest}
+}
+
+func validateManifestObject(root, digest string, result *ValidationResult) {
+	path := objectPathBestEffort(root, digest)
+	body, err := Store{root: root}.Read(digest)
+	if err != nil {
+		result.addError("object_read_failed", path, 0, err.Error())
+		return
+	}
+	var manifest struct {
+		SchemaVersion int    `json:"schema_version"`
+		Repo          string `json:"repo"`
+		State         string `json:"state"`
+		CreatedAt     string `json:"created_at"`
+		Layout        struct {
+			ObjectsDir   string `json:"objects_dir"`
+			ManifestsDir string `json:"manifests_dir"`
+			LedgerPath   string `json:"ledger_path"`
+		} `json:"layout"`
+	}
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		result.addError("malformed_manifest_object", path, 0, err.Error())
+		return
+	}
+	if manifest.SchemaVersion != SchemaVersion {
+		result.addError("unsupported_manifest_object_schema", path, 0, fmt.Sprintf("manifest object schema_version=%d", manifest.SchemaVersion))
+	}
+	if manifest.Repo == "" {
+		result.addError("missing_manifest_repo", path, 0, "manifest object repo is required")
+	}
+	if manifest.State != root {
+		result.addError("manifest_state_mismatch", path, 0, fmt.Sprintf("expected state %q, got %q", root, manifest.State))
+	}
+	if manifest.CreatedAt == "" {
+		result.addError("missing_manifest_created_at", path, 0, "manifest object created_at is required")
+	} else if _, err := time.Parse(time.RFC3339Nano, manifest.CreatedAt); err != nil {
+		result.addError("invalid_manifest_created_at", path, 0, err.Error())
+	}
+	if manifest.Layout.ObjectsDir != "objects/sha256" ||
+		manifest.Layout.ManifestsDir != "manifests" ||
+		manifest.Layout.LedgerPath != "ledger.jsonl" {
+		result.addError("manifest_layout_mismatch", path, 0, "manifest object layout must match state layout")
+	}
 }
 
 func eventID(event Event) string {
@@ -700,9 +745,29 @@ func lastEventID(path string) (string, error) {
 	return last, scanner.Err()
 }
 
-func ledgerHasContent(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.Size() > 0
+func prepareLedgerForInit(root, path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		return f.Close()
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("ledger path is not a regular file: %s", path)
+	}
+	if info.Size() > 0 {
+		return fmt.Errorf("state already initialized: %s", root)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 func writeJSONFileExclusive(path string, value any) error {

@@ -116,6 +116,27 @@ func TestInitRejectsSymlinkedLayoutDirs(t *testing.T) {
 	}
 }
 
+func TestInitRejectsInvalidExistingLedgerBeforeWritingManifest(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if err := os.Mkdir(stateDir, 0o755); err != nil {
+		t.Fatalf("mkdir state root: %v", err)
+	}
+	externalLedger := filepath.Join(root, "external-ledger.jsonl")
+	if err := os.WriteFile(externalLedger, nil, 0o644); err != nil {
+		t.Fatalf("write external ledger: %v", err)
+	}
+	if err := os.Symlink(externalLedger, filepath.Join(stateDir, "ledger.jsonl")); err != nil {
+		t.Fatalf("symlink ledger: %v", err)
+	}
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root}); err == nil || !strings.Contains(err.Error(), "ledger path is not a regular file") {
+		t.Fatalf("expected invalid ledger path error, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "manifests", "state.json")); !os.IsNotExist(err) {
+		t.Fatalf("manifest should not be written after ledger preflight failure, stat err=%v", err)
+	}
+}
+
 func TestValidateRejectsSymlinkedLayoutDirs(t *testing.T) {
 	tests := map[string]string{
 		"objects":        "invalid_objects_dir",
@@ -152,6 +173,36 @@ func TestValidateRejectsSymlinkedLayoutDirs(t *testing.T) {
 			requireIssue(t, validation, issueCode)
 		})
 	}
+}
+
+func TestValidateRejectsHiddenStateDir(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, ".subreview-state")
+	if err := os.Mkdir(stateDir, 0o755); err != nil {
+		t.Fatalf("mkdir hidden state dir: %v", err)
+	}
+	validation := Validate(stateDir)
+	if validation.OK {
+		t.Fatal("expected hidden state validation failure")
+	}
+	requireIssue(t, validation, "invalid_state_path")
+}
+
+func TestValidateRejectsSymlinkedHiddenStateParent(t *testing.T) {
+	root := t.TempDir()
+	hidden := filepath.Join(root, ".subreview")
+	if err := os.Mkdir(hidden, 0o755); err != nil {
+		t.Fatalf("mkdir hidden parent: %v", err)
+	}
+	link := filepath.Join(root, "visible-link")
+	if err := os.Symlink(hidden, link); err != nil {
+		t.Fatalf("symlink hidden parent: %v", err)
+	}
+	validation := Validate(filepath.Join(link, "state"))
+	if validation.OK {
+		t.Fatal("expected symlinked hidden state validation failure")
+	}
+	requireIssue(t, validation, "invalid_state_path")
 }
 
 func TestCASRoundTripsAndDetectsDigestMismatch(t *testing.T) {
@@ -348,6 +399,35 @@ func TestValidateReportsMissingMalformedAndMismatchedState(t *testing.T) {
 	requireIssue(t, validation, "object_digest_mismatch")
 	requireIssue(t, validation, "object_read_failed")
 	requireIssue(t, validation, "malformed_event")
+}
+
+func TestValidateRejectsInvalidManifestObject(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	badManifest, err := Store{root: stateDir}.PutJSON(map[string]any{"not": "a state manifest"}, "application/json")
+	if err != nil {
+		t.Fatalf("PutJSON bad manifest: %v", err)
+	}
+	body, err := json.MarshalIndent(map[string]any{
+		"schema_version": SchemaVersion,
+		"manifest":       badManifest,
+	}, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal manifest pointer: %v", err)
+	}
+	body = append(body, '\n')
+	if err := os.WriteFile(filepath.Join(stateDir, "manifests", "state.json"), body, 0o644); err != nil {
+		t.Fatalf("rewrite manifest pointer: %v", err)
+	}
+	validation := Validate(stateDir)
+	if validation.OK {
+		t.Fatal("expected invalid manifest object validation failure")
+	}
+	requireIssue(t, validation, "unsupported_manifest_object_schema")
+	requireIssue(t, validation, "manifest_state_mismatch")
 }
 
 func TestValidateReportsMissingReferencedObject(t *testing.T) {
