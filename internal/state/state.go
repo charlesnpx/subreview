@@ -98,10 +98,10 @@ func Init(opts InitOptions) (InitResult, error) {
 		now = time.Now().UTC()
 	}
 	lay := stateLayout(root)
-	if err := os.MkdirAll(lay.objectsDir, 0o755); err != nil {
+	if err := ensureStateSubdir(root, "objects", "sha256"); err != nil {
 		return InitResult{}, err
 	}
-	if err := os.MkdirAll(lay.manifestsDir, 0o755); err != nil {
+	if err := ensureStateSubdir(root, "manifests"); err != nil {
 		return InitResult{}, err
 	}
 	manifestPath := filepath.Join(lay.manifestsDir, "state.json")
@@ -209,7 +209,21 @@ func writeFileExclusive(path string, body []byte, mode os.FileMode) error {
 	return closeErr
 }
 
+func checkRegularFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("path is not a regular file: %s", path)
+	}
+	return nil
+}
+
 func verifyExistingObject(path, digest string) error {
+	if err := checkRegularFile(path); err != nil {
+		return err
+	}
 	existing, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -225,7 +239,8 @@ func (s Store) ensureObject(body []byte, digest string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	hexDigest := strings.TrimPrefix(digest, "sha256:")
+	if err := ensureStateSubdir(s.root, "objects", "sha256", hexDigest[:2]); err != nil {
 		return err
 	}
 	if err := writeFileExclusive(path, body, 0o644); err != nil {
@@ -242,6 +257,12 @@ func (s Store) Read(digest string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := checkRegularFile(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("object missing: %s", digest)
+		}
+		return nil, err
+	}
 	body, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -256,21 +277,71 @@ func (s Store) Read(digest string) ([]byte, error) {
 	return body, nil
 }
 
+func withLedgerLock(root string, fn func() (Event, error)) (Event, error) {
+	lockPath := filepath.Join(root, "ledger.lock")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			_, writeErr := fmt.Fprintf(f, "%d\n", os.Getpid())
+			closeErr := f.Close()
+			if writeErr != nil {
+				_ = os.Remove(lockPath)
+				return Event{}, writeErr
+			}
+			if closeErr != nil {
+				_ = os.Remove(lockPath)
+				return Event{}, closeErr
+			}
+			defer os.Remove(lockPath)
+			return fn()
+		}
+		if !os.IsExist(err) {
+			return Event{}, err
+		}
+		if time.Now().After(deadline) {
+			return Event{}, fmt.Errorf("timed out waiting for ledger lock: %s", lockPath)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func appendLedgerLine(path string, event Event) (Event, error) {
+	line, err := json.Marshal(event)
+	if err != nil {
+		return Event{}, err
+	}
+	var f *os.File
+	if _, err := os.Lstat(path); err == nil {
+		if err := checkRegularFile(path); err != nil {
+			return Event{}, err
+		}
+		f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return Event{}, err
+		}
+	} else if os.IsNotExist(err) {
+		f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			return Event{}, err
+		}
+	} else {
+		return Event{}, err
+	}
+	defer f.Close()
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		return Event{}, err
+	}
+	return event, nil
+}
+
 func AppendEvent(stateDir string, event Event) (Event, error) {
 	root, err := explicitStateDir(stateDir)
 	if err != nil {
 		return Event{}, err
 	}
 	lay := stateLayout(root)
-	if err := os.MkdirAll(filepath.Dir(lay.ledgerPath), 0o755); err != nil {
-		return Event{}, err
-	}
-	prior, err := lastEventID(lay.ledgerPath)
-	if err != nil {
-		return Event{}, err
-	}
 	event.SchemaVersion = SchemaVersion
-	event.PriorEventID = prior
 	event.ObjectDigests = append([]string(nil), event.ObjectDigests...)
 	sort.Strings(event.ObjectDigests)
 	if event.Time == "" {
@@ -291,20 +362,18 @@ func AppendEvent(stateDir string, event Event) (Event, error) {
 			return Event{}, err
 		}
 	}
-	event.EventID = eventID(event)
-	line, err := json.Marshal(event)
-	if err != nil {
+	if err := ensureStateSubdir(root); err != nil {
 		return Event{}, err
 	}
-	f, err := os.OpenFile(lay.ledgerPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return Event{}, err
-	}
-	defer f.Close()
-	if _, err := f.Write(append(line, '\n')); err != nil {
-		return Event{}, err
-	}
-	return event, nil
+	return withLedgerLock(root, func() (Event, error) {
+		prior, err := lastEventID(lay.ledgerPath)
+		if err != nil {
+			return Event{}, err
+		}
+		event.PriorEventID = prior
+		event.EventID = eventID(event)
+		return appendLedgerLine(lay.ledgerPath, event)
+	})
 }
 
 func Validate(stateDir string) ValidationResult {
@@ -324,8 +393,18 @@ func Validate(stateDir string) ValidationResult {
 		result.addError("missing_ledger", lay.ledgerPath, 0, "ledger.jsonl is missing")
 		return result.finalize()
 	}
+	manifestPath := filepath.Join(lay.manifestsDir, "state.json")
+	var referenced []string
+	if !fileExists(manifestPath) {
+		result.addError("missing_manifest", manifestPath, 0, "manifests/state.json is missing")
+	} else {
+		referenced = append(referenced, validateManifestFile(manifestPath, &result)...)
+	}
 	result.ObjectCount = validateObjectFiles(lay, &result)
-	referenced := validateLedger(lay, &result)
+	referenced = append(referenced, validateLedger(lay, &result)...)
+	if result.EventCount == 0 {
+		result.addError("empty_ledger", lay.ledgerPath, 0, "ledger has no events")
+	}
 	store := Store{root: root}
 	for _, digest := range referenced {
 		if _, err := store.Read(digest); err != nil {
@@ -361,6 +440,10 @@ func validateObjectFiles(lay layout, result *ValidationResult) int {
 			result.addError("invalid_object_path", path, 0, "object path does not encode a sha256 digest")
 			return nil
 		}
+		if err := checkRegularFile(path); err != nil {
+			result.addError("object_not_regular", path, 0, err.Error())
+			return nil
+		}
 		body, err := os.ReadFile(path)
 		if err != nil {
 			result.addError("object_read_failed", path, 0, err.Error())
@@ -376,6 +459,10 @@ func validateObjectFiles(lay layout, result *ValidationResult) int {
 }
 
 func validateLedger(lay layout, result *ValidationResult) []string {
+	if err := checkRegularFile(lay.ledgerPath); err != nil {
+		result.addError("ledger_not_regular", lay.ledgerPath, 0, err.Error())
+		return nil
+	}
 	f, err := os.Open(lay.ledgerPath)
 	if err != nil {
 		result.addError("ledger_open_failed", lay.ledgerPath, 0, err.Error())
@@ -428,6 +515,38 @@ func validateLedger(lay layout, result *ValidationResult) []string {
 		result.addError("ledger_read_failed", lay.ledgerPath, lineNo, err.Error())
 	}
 	return referenced
+}
+
+func validateManifestFile(path string, result *ValidationResult) []string {
+	if err := checkRegularFile(path); err != nil {
+		result.addError("manifest_not_regular", path, 0, err.Error())
+		return nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		result.addError("manifest_read_failed", path, 0, err.Error())
+		return nil
+	}
+	var manifest struct {
+		SchemaVersion int       `json:"schema_version"`
+		Manifest      ObjectRef `json:"manifest"`
+	}
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		result.addError("malformed_manifest", path, 0, err.Error())
+		return nil
+	}
+	if manifest.SchemaVersion != SchemaVersion {
+		result.addError("unsupported_manifest_schema", path, 0, fmt.Sprintf("manifest schema_version=%d", manifest.SchemaVersion))
+	}
+	if manifest.Manifest.Digest == "" {
+		result.addError("missing_manifest_digest", path, 0, "manifest object digest is required")
+		return nil
+	}
+	if err := validateDigest(manifest.Manifest.Digest); err != nil {
+		result.addError("invalid_manifest_digest", path, 0, err.Error())
+		return nil
+	}
+	return []string{manifest.Manifest.Digest}
 }
 
 func eventID(event Event) string {
@@ -543,6 +662,12 @@ func digestBytes(body []byte) string {
 }
 
 func lastEventID(path string) (string, error) {
+	if err := checkRegularFile(path); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -575,7 +700,7 @@ func ledgerHasContent(path string) bool {
 }
 
 func writeJSONFileExclusive(path string, value any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := ensureRealDirPath(filepath.Dir(path)); err != nil {
 		return err
 	}
 	body, err := json.MarshalIndent(value, "", "  ")
@@ -614,6 +739,38 @@ func hasHiddenComponent(path string) bool {
 		}
 	}
 	return false
+}
+
+func ensureStateSubdir(root string, parts ...string) error {
+	path := root
+	for _, part := range parts {
+		path = filepath.Join(path, part)
+	}
+	return ensureRealDirPath(path)
+}
+
+func ensureRealDirPath(path string) error {
+	clean := filepath.Clean(path)
+	info, err := os.Lstat(clean)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("state layout path is a symlink: %s", clean)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("state layout path is not a directory: %s", clean)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	parent := filepath.Dir(clean)
+	if parent != clean {
+		if err := ensureRealDirPath(parent); err != nil {
+			return err
+		}
+	}
+	return os.Mkdir(clean, 0o755)
 }
 
 func resolveExistingParent(path string) (string, error) {

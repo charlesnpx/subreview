@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -94,6 +95,27 @@ func TestInitDoesNotOverwriteExistingManifest(t *testing.T) {
 	}
 }
 
+func TestInitRejectsSymlinkedLayoutDirs(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	hidden := filepath.Join(root, ".objects")
+	if err := os.Mkdir(hidden, 0o755); err != nil {
+		t.Fatalf("mkdir hidden target: %v", err)
+	}
+	if err := os.Mkdir(stateDir, 0o755); err != nil {
+		t.Fatalf("mkdir state root: %v", err)
+	}
+	if err := os.Symlink(hidden, filepath.Join(stateDir, "objects")); err != nil {
+		t.Fatalf("symlink objects dir: %v", err)
+	}
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root}); err == nil {
+		t.Fatal("expected symlinked layout directory error")
+	}
+	if entries, err := os.ReadDir(hidden); err != nil || len(entries) != 0 {
+		t.Fatalf("hidden symlink target should remain untouched, entries=%v err=%v", entries, err)
+	}
+}
+
 func TestCASRoundTripsAndDetectsDigestMismatch(t *testing.T) {
 	store := Store{root: t.TempDir()}
 	text, err := store.PutText("hello")
@@ -133,6 +155,44 @@ func TestCASRoundTripsAndDetectsDigestMismatch(t *testing.T) {
 	}
 }
 
+func TestCASRejectsSymlinkObject(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	store := Store{root: stateDir}
+	text, err := store.PutText("hello")
+	if err != nil {
+		t.Fatalf("PutText: %v", err)
+	}
+	path, err := objectPath(store.root, text.Digest)
+	if err != nil {
+		t.Fatalf("objectPath: %v", err)
+	}
+	external := filepath.Join(t.TempDir(), "external")
+	if err := os.WriteFile(external, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write external object: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove object: %v", err)
+	}
+	if err := os.Symlink(external, path); err != nil {
+		t.Fatalf("symlink object: %v", err)
+	}
+	if _, err := store.Read(text.Digest); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("expected symlink read rejection, got %v", err)
+	}
+	if _, err := store.PutText("hello"); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("expected symlink put rejection, got %v", err)
+	}
+	validation := Validate(stateDir)
+	if validation.OK {
+		t.Fatal("expected symlink object validation failure")
+	}
+	requireIssue(t, validation, "object_not_regular")
+}
+
 func TestLedgerAppendsPriorEventLinkage(t *testing.T) {
 	stateDir := t.TempDir()
 	store := Store{root: stateDir}
@@ -165,6 +225,38 @@ func TestLedgerAppendsPriorEventLinkage(t *testing.T) {
 	}
 	if len(events) != 2 || events[1].PriorEventID != events[0].EventID {
 		t.Fatalf("ledger order mismatch: %+v", events)
+	}
+}
+
+func TestLedgerConcurrentAppendsRemainLinked(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 20)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := AppendEvent(stateDir, Event{Type: "concurrent"})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("AppendEvent concurrent: %v", err)
+		}
+	}
+	validation := Validate(stateDir)
+	if !validation.OK {
+		t.Fatalf("state should validate after concurrent appends: %+v", validation.Errors)
+	}
+	if validation.EventCount != 21 {
+		t.Fatalf("unexpected event count after concurrent appends: %+v", validation)
 	}
 }
 
@@ -239,6 +331,25 @@ func TestValidateReportsMissingReferencedObject(t *testing.T) {
 		t.Fatalf("expected missing object validation failure")
 	}
 	requireIssue(t, validation, "object_read_failed")
+}
+
+func TestValidateReportsUninitializedState(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(filepath.Join(stateDir, "objects", "sha256"), 0o755); err != nil {
+		t.Fatalf("mkdir objects: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(stateDir, "manifests"), 0o755); err != nil {
+		t.Fatalf("mkdir manifests: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "ledger.jsonl"), nil, 0o644); err != nil {
+		t.Fatalf("write empty ledger: %v", err)
+	}
+	validation := Validate(stateDir)
+	if validation.OK {
+		t.Fatal("expected uninitialized state validation failure")
+	}
+	requireIssue(t, validation, "missing_manifest")
+	requireIssue(t, validation, "empty_ledger")
 }
 
 func TestValidateReportsInvalidEventTime(t *testing.T) {
