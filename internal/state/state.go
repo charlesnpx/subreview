@@ -310,9 +310,16 @@ func appendLedgerLine(path string, event Event) (Event, error) {
 		return Event{}, err
 	}
 	var f *os.File
-	if _, err := os.Lstat(path); err == nil {
-		if err := checkRegularFile(path); err != nil {
-			return Event{}, err
+	needsSeparator := false
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return Event{}, fmt.Errorf("path is not a regular file: %s", path)
+		}
+		if info.Size() > 0 {
+			needsSeparator, err = ledgerNeedsSeparator(path, info.Size())
+			if err != nil {
+				return Event{}, err
+			}
 		}
 		f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
@@ -326,7 +333,12 @@ func appendLedgerLine(path string, event Event) (Event, error) {
 	} else {
 		return Event{}, err
 	}
-	if _, err := f.Write(append(line, '\n')); err != nil {
+	body := append([]byte(nil), line...)
+	body = append(body, '\n')
+	if needsSeparator {
+		body = append([]byte{'\n'}, body...)
+	}
+	if _, err := f.Write(body); err != nil {
 		_ = f.Close()
 		return Event{}, err
 	}
@@ -334,6 +346,23 @@ func appendLedgerLine(path string, event Event) (Event, error) {
 		return Event{}, err
 	}
 	return event, nil
+}
+
+func ledgerNeedsSeparator(path string, size int64) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	var last [1]byte
+	_, readErr := f.ReadAt(last[:], size-1)
+	closeErr := f.Close()
+	if readErr != nil {
+		return false, readErr
+	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return last[0] != '\n', nil
 }
 
 func AppendEvent(stateDir string, event Event) (Event, error) {
@@ -833,6 +862,12 @@ func ensureStateSubdir(root string, parts ...string) error {
 			return err
 		}
 		if err := os.Mkdir(path, 0o755); err != nil {
+			if os.IsExist(err) {
+				if err := requireExistingRealDir(path); err != nil {
+					return err
+				}
+				continue
+			}
 			return err
 		}
 	}
@@ -860,7 +895,13 @@ func ensureStateRoot(root string) error {
 			return err
 		}
 	}
-	return os.Mkdir(clean, 0o755)
+	if err := os.Mkdir(clean, 0o755); err != nil {
+		if os.IsExist(err) {
+			return requireExistingRealDir(clean)
+		}
+		return err
+	}
+	return nil
 }
 
 func ensureRealDirPath(path string) error {
@@ -884,7 +925,13 @@ func ensureRealDirPath(path string) error {
 			return err
 		}
 	}
-	return os.Mkdir(clean, 0o755)
+	if err := os.Mkdir(clean, 0o755); err != nil {
+		if os.IsExist(err) {
+			return requireExistingRealDir(clean)
+		}
+		return err
+	}
+	return nil
 }
 
 func requireExistingStateSubdir(root string, parts ...string) error {

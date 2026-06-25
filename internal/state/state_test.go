@@ -282,6 +282,32 @@ func TestCASRejectsSymlinkObject(t *testing.T) {
 	requireIssue(t, validation, "object_not_regular")
 }
 
+func TestEnsureStateSubdirToleratesConcurrentCreation(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	errs := make(chan error, 100)
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- ensureStateSubdir(root, "objects", "sha256", "aa")
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("ensureStateSubdir concurrent: %v", err)
+		}
+	}
+	if err := requireExistingRealDir(filepath.Join(root, "objects", "sha256", "aa")); err != nil {
+		t.Fatalf("expected shard directory: %v", err)
+	}
+}
+
 func TestLedgerAppendsPriorEventLinkage(t *testing.T) {
 	stateDir := t.TempDir()
 	store := Store{root: stateDir}
@@ -314,6 +340,46 @@ func TestLedgerAppendsPriorEventLinkage(t *testing.T) {
 	}
 	if len(events) != 2 || events[1].PriorEventID != events[0].EventID {
 		t.Fatalf("ledger order mismatch: %+v", events)
+	}
+}
+
+func TestLedgerAppendPreservesLedgerWithoutTrailingNewline(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	ledgerPath := filepath.Join(stateDir, "ledger.jsonl")
+	body, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	if !strings.HasSuffix(string(body), "\n") {
+		t.Fatalf("expected initialized ledger to end with newline")
+	}
+	if err := os.WriteFile(ledgerPath, []byte(strings.TrimSuffix(string(body), "\n")), 0o644); err != nil {
+		t.Fatalf("strip ledger newline: %v", err)
+	}
+	if _, err := AppendEvent(stateDir, Event{Time: time.Unix(101, 0).UTC().Format(time.RFC3339Nano), Type: "second"}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	validation := Validate(stateDir)
+	if !validation.OK {
+		t.Fatalf("state should validate after appending to no-newline ledger: %+v", validation.Errors)
+	}
+	body, err = os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatalf("read appended ledger: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected two ledger lines, got %d: %q", len(lines), body)
+	}
+	for _, line := range lines {
+		var event Event
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("unmarshal ledger line %q: %v", line, err)
+		}
 	}
 }
 
