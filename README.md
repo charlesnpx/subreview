@@ -62,4 +62,4 @@ The installed skills are intentionally thin. They tell agents to invoke the CLI,
 
 `subreview close` evaluates final-state closure from the latest ledger evidence and the requested bound policy profile. It persists a `closure.evaluated` report object and reports closure facts, blockers, gates, findings, discovery runs, verification runs, measured discovery/verification tokens, estimated full-cycle tokens when telemetry is available, and anti-thrash scheduler status. Closure succeeds only when the obligation engine has satisfied required gates, coverage obligations, context requests, active finding lifecycle requirements, and policy-triggered final review predicates; a clean primary reviewer response alone is not sufficient.
 
-The existing `research/` corpus and `scripts/` utilities are research inputs for policy design and evaluation. They are separate from the v1 runtime CLI and are not imported or executed by `subreview` commands.
+Generated/private research corpora and replay artifacts are intentionally not included in this public runtime repository. The generated corpus path is ignored so local research outputs are not tracked accidentally.
