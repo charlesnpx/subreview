@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/charlesnpx/subreview/internal/gate"
+	reviewresult "github.com/charlesnpx/subreview/internal/result"
 )
 
 func TestStateInitAndValidateCLI(t *testing.T) {
@@ -656,6 +657,168 @@ func TestSnapshotCaptureRestoreAndDiffCLI(t *testing.T) {
 	}
 }
 
+func TestResultImportCLI(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "subreview")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build subreview: %v\n%s", err, out)
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initCLIGitRepo(t, repo)
+	writeCLIFile(t, repo, "alpha.txt", "one\n")
+	runCLIGit(t, repo, "add", ".")
+	runCLIGit(t, repo, "commit", "-m", "initial")
+	policyPath := filepath.Join(root, "policy.json")
+	if err := os.WriteFile(policyPath, []byte(`{
+  "schema_version": 1,
+  "policy_id": "v1-default",
+  "profiles": {
+    "default": {
+      "gate_requirements": [],
+      "route_limits": {"primary_semantic_reviews": 1, "targeted_verifications": 1, "fresh_final_reviews": 0, "context_expansion_rounds": 1},
+      "required_evidence_facts": ["primary_review_completed", "blocking_findings_verified", "coverage_obligations_satisfied", "policy_bound"],
+      "risk_routing": [],
+      "closure_basis": {"allowed_basis": ["clean", "fixed", "deterministic_refutation"], "require_basis_for_unresolved": true}
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write policy config: %v", err)
+	}
+	if out, err := exec.Command(bin, "state", "init", "--state", stateDir, "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("state init failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "policy", "bind", "--state", stateDir, "--config", policyPath, "--profile", "default", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("policy bind failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "base", "--repo", repo, "--ref", "HEAD", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("snapshot base failed: %v\n%s", err, out)
+	}
+	writeCLIFile(t, repo, "alpha.txt", "one\ntwo\n")
+	if out, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "proposal", "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("snapshot proposal failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "proposal", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("diff base->proposal failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "final", "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("snapshot final failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "final", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("diff base->final failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "obligations", "build", "--state", stateDir, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("obligations build failed: %v\n%s", err, out)
+	}
+	packetOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "primary", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("packet build failed: %v\n%s", err, packetOut)
+	}
+	var packetResult struct {
+		Packet struct {
+			Digest string `json:"digest"`
+		} `json:"packet"`
+	}
+	if err := json.Unmarshal(packetOut, &packetResult); err != nil {
+		t.Fatalf("packet output is not json: %v\n%s", err, packetOut)
+	}
+	if packetResult.Packet.Digest == "" {
+		t.Fatalf("packet digest missing: %s", packetOut)
+	}
+
+	cleanOut, err := exec.Command(bin, "result", "import", "--state", stateDir, "--packet", packetResult.Packet.Digest, "--result", writeCLIWorkerResult(t, reviewresult.WorkerResult{
+		SchemaVersion: reviewresult.SchemaVersion,
+		Packet:        packetResult.Packet.Digest,
+		RunKind:       reviewresult.RunKindDiscovery,
+		Route:         reviewresult.RoutePrimaryReview,
+		Outcome:       reviewresult.OutcomeClean,
+		Summary:       "No actionable findings.",
+	}), "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("result import clean failed: %v\n%s", err, cleanOut)
+	}
+	var cleanResult struct {
+		Outcome               string `json:"outcome"`
+		PrimaryReviewEvidence bool   `json:"primary_review_evidence"`
+		Result                struct {
+			Digest string `json:"digest"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(cleanOut, &cleanResult); err != nil {
+		t.Fatalf("clean result output is not json: %v\n%s", err, cleanOut)
+	}
+	if cleanResult.Outcome != reviewresult.OutcomeClean || !cleanResult.PrimaryReviewEvidence || cleanResult.Result.Digest == "" {
+		t.Fatalf("bad clean result import: %s", cleanOut)
+	}
+
+	findingOut, err := exec.Command(bin, "result", "import", "--state", stateDir, "--packet", packetResult.Packet.Digest, "--result", writeCLIWorkerResult(t, reviewresult.WorkerResult{
+		SchemaVersion: reviewresult.SchemaVersion,
+		Packet:        packetResult.Packet.Digest,
+		RunKind:       reviewresult.RunKindDiscovery,
+		Route:         reviewresult.RoutePrimaryReview,
+		Outcome:       reviewresult.OutcomeFindings,
+		Findings: []reviewresult.FindingInput{{
+			ID:              "finding-cli",
+			Severity:        "high",
+			Class:           "correctness",
+			Claim:           "alpha.txt can hide the newly added line from downstream readers.",
+			FailureScenario: "A consumer that expects the proposal's second line reads only the original content.",
+			Citations:       []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 2}},
+			Anchors:         []reviewresult.AnchorRef{{Kind: "hunk", Path: "alpha.txt", StartLine: 1, EndLine: 2}},
+		}},
+	}), "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("result import finding failed: %v\n%s", err, findingOut)
+	}
+	var findingResult struct {
+		FindingCount         int `json:"finding_count"`
+		AcceptedFindingCount int `json:"accepted_finding_count"`
+	}
+	if err := json.Unmarshal(findingOut, &findingResult); err != nil {
+		t.Fatalf("finding result output is not json: %v\n%s", err, findingOut)
+	}
+	if findingResult.FindingCount != 1 || findingResult.AcceptedFindingCount != 1 {
+		t.Fatalf("bad finding result import: %s", findingOut)
+	}
+
+	needsContextOut, err := exec.Command(bin, "result", "import", "--state", stateDir, "--packet", packetResult.Packet.Digest, "--result", writeCLIWorkerResult(t, reviewresult.WorkerResult{
+		SchemaVersion: reviewresult.SchemaVersion,
+		Packet:        packetResult.Packet.Digest,
+		RunKind:       reviewresult.RunKindDiscovery,
+		Route:         reviewresult.RoutePrimaryReview,
+		Outcome:       reviewresult.OutcomeNeedsContext,
+		NeedsContext: []reviewresult.ContextRequest{{
+			Question: "Please include alpha_test.txt for follow-up review.",
+			Reason:   "The reviewer needs nearby test coverage.",
+			Paths:    []string{"alpha_test.txt"},
+		}},
+	}), "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("result import needs-context failed: %v\n%s", err, needsContextOut)
+	}
+	var needsContextResult struct {
+		Outcome           string `json:"outcome"`
+		NeedsContextCount int    `json:"needs_context_count"`
+	}
+	if err := json.Unmarshal(needsContextOut, &needsContextResult); err != nil {
+		t.Fatalf("needs-context result output is not json: %v\n%s", err, needsContextOut)
+	}
+	if needsContextResult.Outcome != reviewresult.OutcomeNeedsContext || needsContextResult.NeedsContextCount != 1 {
+		t.Fatalf("bad needs-context result import: %s", needsContextOut)
+	}
+
+	malformedPath := filepath.Join(root, "malformed-result.json")
+	if err := os.WriteFile(malformedPath, []byte(`{"schema_version": 1,`), 0o644); err != nil {
+		t.Fatalf("write malformed result: %v", err)
+	}
+	if out, err := exec.Command(bin, "result", "import", "--state", stateDir, "--packet", packetResult.Packet.Digest, "--result", malformedPath, "--json").CombinedOutput(); err == nil {
+		t.Fatalf("malformed result import should fail: %s", out)
+	}
+	if out, err := exec.Command(bin, "state", "validate", "--state", stateDir, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("state validate failed after result imports: %v\n%s", err, out)
+	}
+}
+
 func initCLIGitRepo(t *testing.T, repo string) {
 	t.Helper()
 	if err := os.MkdirAll(repo, 0o755); err != nil {
@@ -700,6 +863,19 @@ func writeCLIGateCatalog(t *testing.T, path string, command gate.CommandDefiniti
 	if err := os.WriteFile(path, append(body, '\n'), 0o644); err != nil {
 		t.Fatalf("write gate catalog: %v", err)
 	}
+}
+
+func writeCLIWorkerResult(t *testing.T, value reviewresult.WorkerResult) string {
+	t.Helper()
+	body, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal worker result: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "worker-result.json")
+	if err := os.WriteFile(path, append(body, '\n'), 0o644); err != nil {
+		t.Fatalf("write worker result: %v", err)
+	}
+	return path
 }
 
 func writeCLIFile(t *testing.T, root, rel, body string) {

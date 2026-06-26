@@ -17,6 +17,7 @@ import (
 	"github.com/charlesnpx/subreview/internal/anchor"
 	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/policy"
+	reviewresult "github.com/charlesnpx/subreview/internal/result"
 	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
 )
@@ -333,6 +334,19 @@ func Status(opts StatusOptions) (StatusResult, error) {
 	if err != nil {
 		return StatusResult{}, err
 	}
+	resultEvidence, err := reviewresult.Observations(store, events, binding.Repo)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	primaryReviewEvidence, hasPrimaryReviewEvidence := reviewresult.LatestPrimaryReviewForManifest(resultEvidence, manifestRef.Digest)
+	independentFinalEvidence, hasIndependentFinalEvidence := reviewresult.LatestIndependentFinalReviewForManifest(resultEvidence, manifestRef.Digest)
+	for _, finding := range reviewresult.ActiveFindingBlockers(resultEvidence, manifestRef.Digest) {
+		blockers = append(blockers, Blocker{
+			Code:    "open_finding",
+			Message: "blocking finding remains " + finding.State + ": " + finding.Claim,
+			Status:  finding.State,
+		})
+	}
 
 	statuses := make([]ObligationStatus, 0, len(manifest.Obligations))
 	unsatisfiedKinds := map[string]struct{}{}
@@ -384,20 +398,30 @@ func Status(opts StatusOptions) (StatusResult, error) {
 			}
 		}
 		if isCoverageObligation(obligation) && obligation.Required {
-			status.Blockers = append(status.Blockers, Blocker{
-				Code:         "unsatisfied_coverage",
-				Message:      "coverage obligation has no primary review, verification, deterministic refutation, or valid carry-forward evidence",
-				ObligationID: obligation.ID,
-				Transition:   obligation.Transition,
-				Path:         obligation.Path,
-			})
+			if hasPrimaryReviewEvidence {
+				markStatusSatisfied(&status, SatisfactionPrimaryReviewEvidence, primaryReviewEvidence.EventID, primaryReviewEvidence.Digest)
+			} else if refutations := reviewresult.DeterministicRefutationsForObligation(resultEvidence, manifestRef.Digest, obligation.ID); len(refutations) > 0 {
+				markStatusSatisfied(&status, SatisfactionDeterministicRefute, refutations[0].EventID, refutations[0].Digest)
+			} else {
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "unsatisfied_coverage",
+					Message:      "coverage obligation has no primary review, verification, deterministic refutation, or valid carry-forward evidence",
+					ObligationID: obligation.ID,
+					Transition:   obligation.Transition,
+					Path:         obligation.Path,
+				})
+			}
 		}
 		if obligation.Kind == KindPolicyFinalReview && obligation.Required {
-			status.Blockers = append(status.Blockers, Blocker{
-				Code:         "unsatisfied_policy_final_review",
-				Message:      "policy-triggered final review evidence is not recorded yet",
-				ObligationID: obligation.ID,
-			})
+			if hasIndependentFinalEvidence {
+				markStatusSatisfied(&status, SatisfactionPrimaryReviewEvidence, independentFinalEvidence.EventID, independentFinalEvidence.Digest)
+			} else {
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "unsatisfied_policy_final_review",
+					Message:      "policy-triggered final review evidence is not recorded yet",
+					ObligationID: obligation.ID,
+				})
+			}
 		}
 		if status.Satisfied {
 			satisfied++
@@ -482,6 +506,12 @@ func removeString(values []string, remove string) []string {
 		}
 	}
 	return filtered
+}
+
+func markStatusSatisfied(status *ObligationStatus, kind, eventID, digest string) {
+	status.Satisfied = true
+	status.SatisfiedBy = append(status.SatisfiedBy, EvidenceRef{Kind: kind, EventID: eventID, Digest: digest})
+	status.UnsatisfiedSatisfactionKinds = []string{}
 }
 
 func transitionDiff(binding diffBinding) TransitionDiff {
