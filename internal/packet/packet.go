@@ -346,8 +346,8 @@ func Build(opts BuildOptions) (BuildResult, error) {
 	volatile := renderVolatileSuffix(binding.State, now)
 	stableDigest := digestString(stable)
 	volatileDigest := digestString(volatile)
-	promptDigest := digestString(stable + "\n" + volatile)
 	markdown := stable + "\n\n" + volatile + "\n"
+	promptDigest := digestString(markdown)
 	leakage := CheckLeakage(markdown)
 	if !leakage.OK {
 		return BuildResult{}, fmt.Errorf("packet leakage check failed: %s", strings.Join(leakage.ForbiddenTerms, ", "))

@@ -28,6 +28,9 @@ func TestBuildPrimaryPacketStableDigestAndDedupeIgnoreVolatileTime(t *testing.T)
 	if first.StableDigest == "" || first.Packet.Digest == "" || first.Markdown.Digest == "" || first.Context.EntryCount == 0 {
 		t.Fatalf("bad packet result: %+v", first)
 	}
+	if first.PromptDigest != first.Markdown.Digest {
+		t.Fatalf("prompt digest should match stored markdown bytes: prompt=%s markdown=%s", first.PromptDigest, first.Markdown.Digest)
+	}
 	if first.StableDigest != second.StableDigest {
 		t.Fatalf("stable digest should ignore generated time: %s != %s", first.StableDigest, second.StableDigest)
 	}
