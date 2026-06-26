@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -561,6 +562,10 @@ func captureGitTree(store state.Store, repo, treeSHA string) ([]TreeEntry, error
 }
 
 func captureWorkingTree(store state.Store, repo string) ([]TreeEntry, error) {
+	indexModes, err := gitIndexModes(repo)
+	if err != nil {
+		return nil, err
+	}
 	out, err := runGit(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
 	if err != nil {
 		return nil, err
@@ -580,6 +585,14 @@ func captureWorkingTree(store state.Store, repo string) ([]TreeEntry, error) {
 			continue
 		}
 		seen[rel] = struct{}{}
+		if mode := indexModes[rel]; mode != "" {
+			if mode == "160000" {
+				return nil, fmt.Errorf("unsupported working tree gitlink entry: %s", rel)
+			}
+			if mode != "100644" && mode != "100755" {
+				return nil, fmt.Errorf("unsupported working tree index mode %s: %s", mode, rel)
+			}
+		}
 		path := filepath.Join(repo, filepath.FromSlash(rel))
 		info, err := os.Lstat(path)
 		if err != nil {
@@ -609,6 +622,33 @@ func captureWorkingTree(store state.Store, repo string) ([]TreeEntry, error) {
 		entries = append(entries, TreeEntry{Path: rel, Mode: mode, Digest: ref.Digest, Size: ref.Size})
 	}
 	return entries, nil
+}
+
+func gitIndexModes(repo string) (map[string]string, error) {
+	out, err := runGit(repo, "ls-files", "-s", "-z")
+	if err != nil {
+		return nil, err
+	}
+	modes := map[string]string{}
+	for _, raw := range bytes.Split(out, []byte{0}) {
+		if len(raw) == 0 {
+			continue
+		}
+		meta, path, ok := bytes.Cut(raw, []byte{'\t'})
+		if !ok {
+			return nil, fmt.Errorf("unexpected git ls-files record: %q", raw)
+		}
+		fields := strings.Fields(string(meta))
+		if len(fields) < 3 {
+			return nil, fmt.Errorf("unexpected git ls-files metadata: %q", meta)
+		}
+		rel, err := cleanRepoPath(string(path))
+		if err != nil {
+			return nil, err
+		}
+		modes[rel] = fields[0]
+	}
+	return modes, nil
 }
 
 func latestSnapshotBinding(stateDir, kind string) (snapshotBinding, error) {
@@ -873,12 +913,35 @@ func rejectSymlinkedNearestOutputParent(path string) error {
 		if !info.IsDir() {
 			return fmt.Errorf("output parent path is not a directory: %s", dir)
 		}
+		absDir, err := filepath.Abs(dir)
+		if err != nil {
+			return err
+		}
+		realDir, err := filepath.EvalSymlinks(absDir)
+		if err != nil {
+			return err
+		}
+		if !sameOutputParentPath(absDir, realDir) {
+			return fmt.Errorf("output parent path must not contain a symlink: %s", dir)
+		}
 		return nil
 	}
 }
 
+func sameOutputParentPath(absDir, realDir string) bool {
+	absDir = filepath.Clean(absDir)
+	realDir = filepath.Clean(realDir)
+	if absDir == realDir {
+		return true
+	}
+	if runtime.GOOS == "darwin" && realDir == filepath.Clean("/private"+absDir) {
+		return true
+	}
+	return false
+}
+
 func gitNoIndexDiff(workdir string) ([]byte, error) {
-	cmd := exec.Command("git", "diff", "--no-index", "--binary", "--src-prefix=from/", "--dst-prefix=to/", "from", "to")
+	cmd := exec.Command("git", "diff", "--no-index", "--binary", "--no-prefix", "from", "to")
 	cmd.Dir = workdir
 	out, err := cmd.CombinedOutput()
 	if err == nil {

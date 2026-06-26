@@ -81,6 +81,11 @@ func TestCaptureRestoreAndDiffCommittedAndUncommittedSnapshots(t *testing.T) {
 			t.Fatalf("patch missing %q:\n%s", want, patch)
 		}
 	}
+	for _, bad := range []string{"from/from/", "to/to/", "from/to/", "to/from/"} {
+		if strings.Contains(string(patch), bad) {
+			t.Fatalf("patch contains doubled prefix %q:\n%s", bad, patch)
+		}
+	}
 	writeFile(t, repo, "alpha.txt", "three\n")
 	writeFile(t, repo, "new.txt", "new\n")
 	writeFile(t, repo, "done.txt", "done\n")
@@ -294,8 +299,27 @@ func TestCaptureWorkingTreeRejectsGitlinkDirectory(t *testing.T) {
 		t.Fatalf("mkdir gitlink path: %v", err)
 	}
 	_, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"})
-	if err == nil || !strings.Contains(err.Error(), "unsupported working tree directory entry") {
+	if err == nil || !strings.Contains(err.Error(), "unsupported working tree gitlink entry") {
 		t.Fatalf("expected gitlink directory capture error, got %v", err)
+	}
+}
+
+func TestCaptureWorkingTreeRejectsMissingGitlink(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "seed.txt", "seed\n")
+	git(t, repo, "add", "seed.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	head := gitOutput(t, repo, "rev-parse", "HEAD")
+	git(t, repo, "update-index", "--add", "--cacheinfo", "160000,"+head+",vendor/missing")
+	_, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported working tree gitlink entry") {
+		t.Fatalf("expected missing gitlink capture error, got %v", err)
 	}
 }
 
@@ -358,6 +382,37 @@ func TestRestoreRejectsSymlinkedOutputParent(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(external, "restore")); !os.IsNotExist(statErr) {
 		t.Fatalf("restore should not create output through symlink parent, stat err=%v", statErr)
+	}
+}
+
+func TestRestoreRejectsNestedSymlinkedOutputParent(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	external := filepath.Join(root, "external")
+	if err := os.MkdirAll(filepath.Join(external, "child"), 0o755); err != nil {
+		t.Fatalf("mkdir external child: %v", err)
+	}
+	linkParent := filepath.Join(root, "link-parent")
+	if err := os.Symlink(external, linkParent); err != nil {
+		t.Fatalf("symlink parent: %v", err)
+	}
+	_, err := Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: filepath.Join(linkParent, "child", "restore")})
+	if err == nil || !strings.Contains(err.Error(), "output parent path must not contain a symlink") {
+		t.Fatalf("expected nested symlink parent error, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(external, "child", "restore")); !os.IsNotExist(statErr) {
+		t.Fatalf("restore should not create output through nested symlink parent, stat err=%v", statErr)
 	}
 }
 
