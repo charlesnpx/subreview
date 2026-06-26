@@ -335,6 +335,84 @@ func TestImportRejectsObligationRefutationOnTargetedVerificationPacket(t *testin
 	}
 }
 
+func TestImportRejectsNonVerificationOutcomeOnTargetedPacket(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("finding-one")},
+		}),
+		Now: time.Unix(234, 6),
+	}); err != nil {
+		t.Fatalf("Import finding: %v", err)
+	}
+	verificationPacket := buildVerificationResultPacket(t, stateDir, "finding-one")
+	cases := []struct {
+		name   string
+		result reviewresult.WorkerResult
+	}{
+		{
+			name: "clean",
+			result: reviewresult.WorkerResult{
+				SchemaVersion: reviewresult.SchemaVersion,
+				Packet:        verificationPacket.Packet.Digest,
+				RunKind:       reviewresult.RunKindVerification,
+				Route:         reviewresult.RouteTargetedVerification,
+				Outcome:       reviewresult.OutcomeClean,
+				Summary:       "No actionable findings.",
+			},
+		},
+		{
+			name: "findings",
+			result: reviewresult.WorkerResult{
+				SchemaVersion: reviewresult.SchemaVersion,
+				Packet:        verificationPacket.Packet.Digest,
+				RunKind:       reviewresult.RunKindVerification,
+				Route:         reviewresult.RouteTargetedVerification,
+				Outcome:       reviewresult.OutcomeFindings,
+				Findings:      []reviewresult.FindingInput{validFinding("new-finding")},
+			},
+		},
+		{
+			name: "needs_context",
+			result: reviewresult.WorkerResult{
+				SchemaVersion: reviewresult.SchemaVersion,
+				Packet:        verificationPacket.Packet.Digest,
+				RunKind:       reviewresult.RunKindVerification,
+				Route:         reviewresult.RouteTargetedVerification,
+				Outcome:       reviewresult.OutcomeNeedsContext,
+				NeedsContext: []reviewresult.ContextRequest{{
+					Question: "What extra file is needed?",
+					Reason:   "The targeted verification packet should not request result-level context.",
+					Paths:    []string{"alpha.txt"},
+				}},
+			},
+		},
+	}
+	before := readEvents(t, stateDir)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := reviewresult.Import(reviewresult.ImportOptions{
+				StateDir:   stateDir,
+				PacketID:   verificationPacket.Packet.Digest,
+				ResultPath: writeWorkerResult(t, tc.result),
+				Now:        time.Unix(234, 7),
+			}); err == nil {
+				t.Fatalf("targeted verification packet should reject %s outcome", tc.name)
+			}
+			if after := readEvents(t, stateDir); len(after) != len(before) {
+				t.Fatalf("%s targeted outcome should not append ledger event: before=%d after=%d", tc.name, len(before), len(after))
+			}
+		})
+	}
+}
+
 func TestImportRejectsDiscoverySelfVerification(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	before := readEvents(t, stateDir)

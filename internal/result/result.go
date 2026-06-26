@@ -617,6 +617,13 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 	if runKind == RunKindDiscovery && (packet.RunKind != runKind || packet.Route != route) {
 		return ResultRecord{}, fmt.Errorf("discovery result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
 	}
+	outcome := strings.TrimSpace(input.Outcome)
+	if outcome == "" {
+		outcome = inferOutcome(input)
+	}
+	if !validOutcome(outcome) {
+		return ResultRecord{}, fmt.Errorf("invalid outcome: %s", input.Outcome)
+	}
 	hasFindingRefutation := false
 	for _, refutation := range input.DeterministicRefutations {
 		if strings.TrimSpace(refutation.FindingID) != "" {
@@ -625,6 +632,9 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 		}
 	}
 	isTargetedVerificationPacket := packet.RunKind == RunKindVerification && packet.Route == RouteTargetedVerification
+	if isTargetedVerificationPacket && outcome != OutcomeVerification {
+		return ResultRecord{}, errors.New("targeted verification packet requires verification outcome")
+	}
 	if len(input.VerifierOutcomes) > 0 || hasFindingRefutation || isTargetedVerificationPacket {
 		if packet.RunKind != runKind || packet.Route != route {
 			return ResultRecord{}, fmt.Errorf("verification result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
@@ -654,13 +664,6 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 				return ResultRecord{}, fmt.Errorf("deterministic refutation finding_id %q does not match packet finding_id %q", refutation.FindingID, packet.VerificationFindingID)
 			}
 		}
-	}
-	outcome := strings.TrimSpace(input.Outcome)
-	if outcome == "" {
-		outcome = inferOutcome(input)
-	}
-	if !validOutcome(outcome) {
-		return ResultRecord{}, fmt.Errorf("invalid outcome: %s", input.Outcome)
 	}
 	if len(input.Findings) > maxFindings {
 		return ResultRecord{}, fmt.Errorf("worker result has too many findings: %d > %d", len(input.Findings), maxFindings)
