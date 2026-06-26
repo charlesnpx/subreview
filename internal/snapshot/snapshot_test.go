@@ -41,6 +41,14 @@ func TestCaptureRestoreAndDiffCommittedAndUncommittedSnapshots(t *testing.T) {
 	if !proposal.Dirty || proposal.CommitSHA != "" || proposal.HeadCommitSHA == "" || proposal.EntryCount != 2 {
 		t.Fatalf("bad proposal snapshot: %+v", proposal)
 	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	proposalRecord := readSnapshotRecordForTest(t, store, proposal.Snapshot.Digest)
+	if proposalRecord.Provenance.CommitPresent {
+		t.Fatalf("dirty proposal should not claim committed snapshot provenance: %+v", proposalRecord.Provenance)
+	}
 
 	restoreDir := filepath.Join(root, "restore")
 	restored, err := Restore(RestoreOptions{StateDir: stateDir, Kind: "proposal", Output: restoreDir})
@@ -64,10 +72,6 @@ func TestCaptureRestoreAndDiffCommittedAndUncommittedSnapshots(t *testing.T) {
 	if !diff.HasChanges || diff.FromSnapshot != base.Snapshot.Digest || diff.ToSnapshot != proposal.Snapshot.Digest {
 		t.Fatalf("bad diff result: %+v", diff)
 	}
-	store, err := state.Open(stateDir)
-	if err != nil {
-		t.Fatalf("Open state: %v", err)
-	}
 	patch, err := store.Read(diff.Patch.Digest)
 	if err != nil {
 		t.Fatalf("Read patch: %v", err)
@@ -86,6 +90,10 @@ func TestCaptureRestoreAndDiffCommittedAndUncommittedSnapshots(t *testing.T) {
 	}
 	if !final.Dirty || final.CommitSHA != "" || final.EntryCount != 3 || final.Snapshot.Digest == "" {
 		t.Fatalf("bad final snapshot: %+v", final)
+	}
+	finalRecord := readSnapshotRecordForTest(t, store, final.Snapshot.Digest)
+	if finalRecord.Provenance.CommitPresent {
+		t.Fatalf("dirty final should not claim committed snapshot provenance: %+v", finalRecord.Provenance)
 	}
 	proposalToFinal, err := CreateDiff(DiffOptions{StateDir: stateDir, FromKind: "proposal", ToKind: "final"})
 	if err != nil {
@@ -351,6 +359,7 @@ func TestRestoreRejectsMalformedTreeTopologyBeforeWriting(t *testing.T) {
 		"file_parent_first":       {"a", "a/b.txt"},
 		"file_parent_second":      {"a/b.txt", "a"},
 		"nested_file_parent_late": {"a/b/c.txt", "a/b"},
+		"nul_path":                {"valid.txt", "bad\x00path.txt"},
 	}
 	for name, paths := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -367,7 +376,7 @@ func TestRestoreRejectsMalformedTreeTopologyBeforeWriting(t *testing.T) {
 			appendMalformedSnapshot(t, stateDir, repo, "base", paths)
 			restoreDir := filepath.Join(root, "restore")
 			_, err := Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: restoreDir})
-			if err == nil || !strings.Contains(err.Error(), "tree entry path") && !strings.Contains(err.Error(), "duplicate tree entry") {
+			if err == nil || !strings.Contains(err.Error(), "tree entry path") && !strings.Contains(err.Error(), "duplicate tree entry") && !strings.Contains(err.Error(), "invalid repository-relative path") {
 				t.Fatalf("expected tree topology error, got %v", err)
 			}
 			if _, statErr := os.Stat(restoreDir); !os.IsNotExist(statErr) {
@@ -439,6 +448,19 @@ func readFile(t *testing.T, root, rel string) string {
 		t.Fatalf("read %s: %v", rel, err)
 	}
 	return string(body)
+}
+
+func readSnapshotRecordForTest(t *testing.T, store state.Store, digest string) SnapshotRecord {
+	t.Helper()
+	body, err := store.Read(digest)
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	var record SnapshotRecord
+	if err := decodeStrict(body, &record); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	return record
 }
 
 func appendMalformedSnapshot(t *testing.T, stateDir, repo, kind string, paths []string) {

@@ -168,9 +168,6 @@ func Capture(opts CaptureOptions) (CaptureResult, error) {
 		Kind:          opts.Kind,
 		Repo:          repo,
 		HeadCommitSHA: git.HeadCommitSHA,
-		Provenance: SnapshotProvenance{
-			CommitPresent: git.HeadCommitSHA != "",
-		},
 	}
 	if strings.TrimSpace(opts.Ref) != "" {
 		record.Source = "git_ref"
@@ -199,6 +196,7 @@ func Capture(opts CaptureOptions) (CaptureResult, error) {
 			return CaptureResult{}, err
 		}
 	}
+	record.Provenance.CommitPresent = record.CommitSHA != ""
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 	tree, err := store.PutJSON(TreeManifest{SchemaVersion: SchemaVersion, Entries: entries}, "application/vnd.subreview.snapshot-tree+json")
 	if err != nil {
@@ -872,6 +870,9 @@ func gitNoIndexDiff(workdir string) ([]byte, error) {
 func cleanRepoPath(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", errors.New("empty repository path")
+	}
+	if strings.ContainsRune(path, '\x00') {
+		return "", fmt.Errorf("invalid repository-relative path: %q", path)
 	}
 	slash := filepath.ToSlash(path)
 	clean := filepath.Clean(slash)
