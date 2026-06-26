@@ -513,6 +513,9 @@ func policyFactBlockers(effective policy.EffectivePolicy, facts Facts) []Blocker
 }
 
 func closureBasisBlockers(basis policy.ClosureBasis, facts Facts) []Blocker {
+	if !basis.RequireBasisForUnresolved {
+		return nil
+	}
 	allowed := map[string]struct{}{}
 	for _, item := range basis.AllowedBasis {
 		allowed[strings.TrimSpace(item)] = struct{}{}
@@ -772,8 +775,12 @@ func preferredGross(primary, fallback int) int {
 }
 
 func schedulerFacts(effective policy.EffectivePolicy, runs RunFacts) SchedulerFacts {
+	primarySemanticReviews := runs.PrimaryRuns - runs.ContextExpansionRounds
+	if primarySemanticReviews < 0 {
+		primarySemanticReviews = 0
+	}
 	observed := SchedulerObserved{
-		PrimarySemanticReviews: runs.PrimaryRuns,
+		PrimarySemanticReviews: primarySemanticReviews,
 		TargetedVerifications:  runs.TargetedVerifications,
 		FreshFinalReviews:      runs.IndependentFinalRuns,
 		ContextExpansionRounds: runs.ContextExpansionRounds,
