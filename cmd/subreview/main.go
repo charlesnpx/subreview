@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/charlesnpx/subreview/internal/install"
+	"github.com/charlesnpx/subreview/internal/policy"
 	"github.com/charlesnpx/subreview/internal/state"
 )
 
@@ -22,6 +23,8 @@ func main() {
 	switch os.Args[1] {
 	case "install-skills":
 		err = installSkills(os.Args[2:])
+	case "policy":
+		err = policyCommand(os.Args[2:])
 	case "state":
 		err = stateCommand(os.Args[2:])
 	case "version":
@@ -40,6 +43,9 @@ func main() {
 func usage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   subreview install-skills [--plan|--install|--uninstall] [--target tools|claude|codex|all] [--json] [--install-root <dir>]
+  subreview policy check --config <path> --repo <path> [--json]
+  subreview policy bind --state <dir> --config <path> --profile <name> [--json]
+  subreview policy explain --state <dir> --profile <name> [--json]
   subreview state init --state <dir> --repo <path> [--json]
   subreview state validate --state <dir> [--json]
   subreview version`)
@@ -108,6 +114,136 @@ Delegated installer operations:
   --target     tools, codex, claude, or all
 
 The installer stages the subreview CLI tool. Codex and Claude targets also install thin early-stage skill scaffolds.`)
+}
+
+func policyCommand(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("policy requires subcommand: check, bind, or explain")
+	}
+	if isHelpCommand(args[0]) {
+		usagePolicy(os.Stdout)
+		return nil
+	}
+	switch args[0] {
+	case "check":
+		return policyCheck(args[1:])
+	case "bind":
+		return policyBind(args[1:])
+	case "explain":
+		return policyExplain(args[1:])
+	default:
+		return fmt.Errorf("policy requires subcommand: check, bind, or explain")
+	}
+}
+
+func policyCheck(args []string) error {
+	if hasHelpFlag(args) {
+		usagePolicyCheck(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("policy check", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	configPath := fs.String("config", "", "Trusted policy config path")
+	repoPath := fs.String("repo", "", "Repository path")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("policy check does not accept positional arguments")
+	}
+	result, err := policy.Check(policy.CheckOptions{ConfigPath: *configPath, RepoPath: *repoPath})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("policy valid: %s (%d profiles)\n", result.PolicyID, len(result.Profiles))
+	return nil
+}
+
+func policyBind(args []string) error {
+	if hasHelpFlag(args) {
+		usagePolicyBind(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("policy bind", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	configPath := fs.String("config", "", "Trusted policy config path")
+	profile := fs.String("profile", "", "Policy profile name")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("policy bind does not accept positional arguments")
+	}
+	result, err := policy.Bind(policy.BindOptions{StateDir: *stateDir, ConfigPath: *configPath, Profile: *profile})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("policy bound: %s %s\n", result.Profile, result.Policy.Digest)
+	return nil
+}
+
+func policyExplain(args []string) error {
+	if hasHelpFlag(args) {
+		usagePolicyExplain(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("policy explain", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	profile := fs.String("profile", "", "Policy profile name")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("policy explain does not accept positional arguments")
+	}
+	result, err := policy.Explain(policy.ExplainOptions{StateDir: *stateDir, Profile: *profile})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("policy profile: %s (%d closure predicates)\n", result.Profile, len(result.ClosurePredicates))
+	return nil
+}
+
+func usagePolicy(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview policy check --config <path> --repo <path> [--json]
+  subreview policy bind --state <dir> --config <path> --profile <name> [--json]
+  subreview policy explain --state <dir> --profile <name> [--json]`)
+}
+
+func usagePolicyCheck(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview policy check --config <path> --repo <path> [--json]
+
+Validates trusted control-plane policy config without writing state.`)
+}
+
+func usagePolicyBind(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview policy bind --state <dir> --config <path> --profile <name> [--json]
+
+Normalizes a policy profile, stores it in state CAS, and appends a policy.bound ledger event.`)
+}
+
+func usagePolicyExplain(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview policy explain --state <dir> --profile <name> [--json]
+
+Reports closure predicates as required evidence facts for a bound policy profile.`)
 }
 
 func stateCommand(args []string) error {

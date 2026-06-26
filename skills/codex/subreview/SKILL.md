@@ -13,6 +13,9 @@ Available now:
 subreview version
 subreview state init --state <dir> --repo <path> --json
 subreview state validate --state <dir> --json
+subreview policy check --config <path> --repo <path> --json
+subreview policy bind --state <dir> --config <path> --profile <name> --json
+subreview policy explain --state <dir> --profile <name> --json
 subreview install-skills --plan --target all --json
 ```
 
