@@ -11,6 +11,10 @@ subreview state validate --state /tmp/subreview-state --json
 subreview policy check --config /tmp/subreview-policy.json --repo . --json
 subreview policy bind --state /tmp/subreview-state --config /tmp/subreview-policy.json --profile default --json
 subreview policy explain --state /tmp/subreview-state --profile default --json
+subreview snapshot capture --state /tmp/subreview-state --kind base --repo . --ref HEAD --json
+subreview snapshot capture --state /tmp/subreview-state --kind proposal --repo . --json
+subreview snapshot restore --state /tmp/subreview-state --kind proposal --output /tmp/subreview-restore --json
+subreview diff create --state /tmp/subreview-state --from base --to proposal --json
 subreview install-skills --plan --target all --json
 subreview install-skills --install --target all --json --install-root /tmp/subreview-stage
 subreview install-skills --uninstall --target all --json --install-root /tmp/subreview-stage
@@ -33,5 +37,7 @@ The installed skills are intentionally thin. They tell agents to invoke the CLI,
 `subreview state init` creates local state only at the supplied non-hidden `--state` path. The state layout contains `objects/sha256/`, `manifests/`, and `ledger.jsonl`. `subreview state validate` checks ledger JSONL, event linkage, referenced CAS objects, and digest integrity.
 
 `subreview policy check` validates strict JSON control-plane policy config without writing state. `subreview policy bind` normalizes a profile, stores it in state CAS, and records a `policy.bound` ledger event. `subreview policy explain` reads the bound profile and reports closure predicates as required evidence facts rather than scalar assurance grades.
+
+`subreview snapshot capture` records base, proposal, or final snapshots as reconstructable CAS tree manifests and file blobs. Captures from `--ref` record commit/tree metadata when available; working-tree captures explicitly record dirty state and omit `commit_sha` when the snapshot is not committed. `subreview snapshot restore` reconstructs the latest captured snapshot of a kind from CAS into an empty output directory. `subreview diff create` stores transition diff objects for captured snapshot pairs such as base to proposal, proposal to final, and base to final.
 
 The existing `research/` corpus and `scripts/` utilities are research inputs for policy design and evaluation. They are separate from the v1 runtime CLI and are not imported or executed by `subreview` commands.
