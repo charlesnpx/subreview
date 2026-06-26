@@ -20,6 +20,12 @@ subreview snapshot capture --state <dir> --kind <base|proposal|final> --repo <pa
 subreview snapshot restore --state <dir> --kind <base|proposal|final> --output <dir> --json
 subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> --json
 subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> --anchors <path> --json
+subreview gates check-catalog --catalog <path> --repo <path> --json
+subreview gates run --state <dir> --catalog <path> --command-id <id> --snapshot <base|proposal|final> --json
+subreview gates record --state <dir> --catalog <path> --command-id <id> --snapshot <base|proposal|final> --outcome <pass|fail|error> --json
+subreview obligations build --state <dir> --json
+subreview obligations status --state <dir> --json
+subreview packet build --state <dir> --kind primary --json
 subreview install-skills --plan --target all --json
 ```
 

@@ -591,6 +591,44 @@ func TestSnapshotCaptureRestoreAndDiffCLI(t *testing.T) {
 			t.Fatalf("obligations status missing blocker %s: %s", want, statusOut)
 		}
 	}
+	packetOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "primary", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("packet build failed: %v\n%s", err, packetOut)
+	}
+	var packetResult struct {
+		Kind           string `json:"kind"`
+		RunKind        string `json:"run_kind"`
+		StableDigest   string `json:"stable_digest"`
+		VolatileDigest string `json:"volatile_digest"`
+		Packet         struct {
+			Digest string `json:"digest"`
+			Path   string `json:"path"`
+		} `json:"packet"`
+		Markdown struct {
+			Digest string `json:"digest"`
+			Path   string `json:"path"`
+		} `json:"markdown"`
+		SemanticDedupeKey struct {
+			Digest string `json:"digest"`
+		} `json:"semantic_dedupe_key"`
+		Leakage struct {
+			OK bool `json:"ok"`
+		} `json:"leakage"`
+		Context struct {
+			EntryCount int `json:"entry_count"`
+		} `json:"context"`
+	}
+	if err := json.Unmarshal(packetOut, &packetResult); err != nil {
+		t.Fatalf("packet output is not json: %v\n%s", err, packetOut)
+	}
+	if packetResult.Kind != "primary" || packetResult.RunKind != "discovery" || packetResult.StableDigest == "" || packetResult.VolatileDigest == "" || packetResult.Packet.Digest == "" || packetResult.Markdown.Digest == "" || packetResult.SemanticDedupeKey.Digest == "" || !packetResult.Leakage.OK || packetResult.Context.EntryCount == 0 {
+		t.Fatalf("bad packet output: %s", packetOut)
+	}
+	for _, path := range []string{packetResult.Packet.Path, packetResult.Markdown.Path} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("packet object path should exist %s: %v\n%s", path, err, packetOut)
+		}
+	}
 
 	restoreDir := filepath.Join(root, "restore")
 	restoreOut, err := exec.Command(bin, "snapshot", "restore", "--state", stateDir, "--kind", "proposal", "--output", restoreDir, "--json").CombinedOutput()
