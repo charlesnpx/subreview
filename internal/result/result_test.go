@@ -583,6 +583,124 @@ func TestTopLevelNeedsContextCanBeResolvedByLaterDiscovery(t *testing.T) {
 	}
 }
 
+func TestCarriedProposalPrimaryOnlySatisfiesProposalCoverage(t *testing.T) {
+	repo, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "The proposal diff has no actionable findings.",
+		}),
+		Now: time.Unix(240, 0),
+	}); err != nil {
+		t.Fatalf("Import proposal clean result: %v", err)
+	}
+	writeFile(t, repo, "alpha.txt", "one\ntwo\nfinal-only\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final-only state: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build final obligations: %v", err)
+	}
+	status, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Closed {
+		t.Fatalf("final-only coverage should keep status open: %+v", status)
+	}
+	foundProposalCoverage := false
+	foundFinalCoverage := false
+	for _, item := range status.Obligations {
+		if !isCoverageStatus(item) {
+			continue
+		}
+		switch item.Obligation.Transition {
+		case "base->proposal":
+			foundProposalCoverage = true
+			if !item.Satisfied || !satisfiedByKind(item, obligation.SatisfactionCarriedForward) {
+				t.Fatalf("base->proposal coverage should be carried by proposal review: %+v", item)
+			}
+		case "base->final":
+			foundFinalCoverage = true
+			if item.Satisfied {
+				t.Fatalf("base->final coverage should not be satisfied by carried proposal review: %+v", item)
+			}
+		}
+	}
+	if !foundProposalCoverage || !foundFinalCoverage {
+		t.Fatalf("expected proposal and final coverage obligations: %+v", status.Obligations)
+	}
+}
+
+func TestLatestProposalNeedsContextBlocksCarriedReview(t *testing.T) {
+	repo, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "The proposal diff has no actionable findings.",
+		}),
+		Now: time.Unix(240, 0),
+	}); err != nil {
+		t.Fatalf("Import proposal clean result: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeNeedsContext,
+			NeedsContext: []reviewresult.ContextRequest{{
+				Question: "Please include the integration test for alpha.txt.",
+				Reason:   "The later review could not close without more context.",
+				Paths:    []string{"alpha_test.txt"},
+			}},
+		}),
+		Now: time.Unix(241, 0),
+	}); err != nil {
+		t.Fatalf("Import later needs-context result: %v", err)
+	}
+	writeFile(t, repo, "alpha.txt", "one\ntwo\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final state: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build final obligations: %v", err)
+	}
+	_, manifest := readLatestCoverageManifest(t, stateDir)
+	observations := readObservations(t, stateDir)
+	if _, ok := reviewresult.LatestPrimaryReviewForTargetState(observations, proposalDigestFromManifest(t, manifest), manifest.Policy.Digest); ok {
+		t.Fatal("older clean proposal review should not carry past newer needs-context result")
+	}
+	status, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if !hasStatusBlocker(status, "needs_context") {
+		t.Fatalf("latest proposal needs-context should block final closure: %+v", status.Blockers)
+	}
+}
+
 func TestCarriedPrimaryReviewMustMatchPolicy(t *testing.T) {
 	repo, stateDir, built, _ := initializedResultState(t)
 	if _, err := reviewresult.Import(reviewresult.ImportOptions{
@@ -655,6 +773,34 @@ func TestClosureFindingCarryForwardMustMatchPolicy(t *testing.T) {
 	}
 	if hasStatusBlocker(status, "open_finding") {
 		t.Fatalf("replacement policy should not inherit old-policy finding blocker: %+v", status.Blockers)
+	}
+}
+
+func TestVerificationPacketDoesNotCarryFindingAcrossPolicy(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("old-policy-finding")},
+		}),
+		Now: time.Unix(242, 0),
+	}); err != nil {
+		t.Fatalf("Import original-policy finding result: %v", err)
+	}
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfigWithID(t, t.TempDir(), "replacement-policy"), Profile: "default"}); err != nil {
+		t.Fatalf("Bind replacement policy: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build replacement-policy obligations: %v", err)
+	}
+	if _, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindVerification, FindingID: "old-policy-finding"}); err == nil {
+		t.Fatal("verification packet should not carry finding from a different policy")
 	}
 }
 
@@ -1415,6 +1561,24 @@ func proposalDigestFromManifest(t *testing.T, manifest obligation.CoverageManife
 	}
 	t.Fatalf("manifest has no base->proposal transition: %+v", manifest.SourceDiffs)
 	return ""
+}
+
+func isCoverageStatus(status obligation.ObligationStatus) bool {
+	switch status.Obligation.Kind {
+	case obligation.KindChangedPath, obligation.KindChangedFile, obligation.KindChangedHunk:
+		return true
+	default:
+		return false
+	}
+}
+
+func satisfiedByKind(status obligation.ObligationStatus, kind string) bool {
+	for _, evidence := range status.SatisfiedBy {
+		if evidence.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func firstCoverageObligationID(t *testing.T, manifest obligation.CoverageManifest) string {

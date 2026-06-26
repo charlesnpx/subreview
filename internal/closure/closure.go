@@ -396,7 +396,7 @@ func factsFromEvidence(status obligation.StatusResult, manifest obligation.Cover
 		PrimaryReviewCompleted:         hasPrimary,
 		BlockingFindingsVerified:       findings.OpenBlockingCount == 0,
 		CoverageObligationsSatisfied:   coverageSatisfied(status),
-		ContextRequestsResolved:        contextRequestsResolved(observations, manifestDigest),
+		ContextRequestsResolved:        contextRequestsResolved(observations, manifestDigest, proposalDigest, policyDigest),
 		IndependentFinalCompleted:      hasFinal,
 		FreshBlindedReview:             evidence.FreshBlindedReview,
 		CLIWitnessed:                   evidence.CLIWitnessed,
@@ -409,13 +409,20 @@ func factsFromEvidence(status obligation.StatusResult, manifest obligation.Cover
 	return facts
 }
 
-func contextRequestsResolved(observations []reviewresult.EvidenceObservation, manifestDigest string) bool {
+func contextRequestsResolved(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string) bool {
 	for _, observation := range observations {
 		record := observation.Record
 		if record.Packet.CoverageManifest.Digest != manifestDigest || record.RunKind != reviewresult.RunKindDiscovery {
 			continue
 		}
 		return record.Outcome != reviewresult.OutcomeNeedsContext && len(record.NeedsContext) == 0
+	}
+	if proposalDigest != "" {
+		observation, ok := reviewresult.LatestDiscoveryForTargetState(observations, proposalDigest, policyDigest)
+		if ok {
+			record := observation.Record
+			return record.Outcome != reviewresult.OutcomeNeedsContext && len(record.NeedsContext) == 0
+		}
 	}
 	return true
 }

@@ -517,11 +517,20 @@ func buildVerification(opts BuildOptions) (BuildResult, error) {
 	if err := validateManifestFreshness(store, events, binding.State, binding.Repo, manifest, policyBinding); err != nil {
 		return BuildResult{}, err
 	}
-	finding, err := latestFindingForVerification(store, events, binding.Repo, manifestRef.Digest, opts.FindingID)
+	var policyRef *PolicyRef
+	policyID := ""
+	policyDigest := ""
+	if manifest.Policy != nil {
+		ref := PolicyRef{Profile: manifest.Policy.Profile, PolicyID: manifest.Policy.PolicyID, Digest: manifest.Policy.Digest}
+		policyRef = &ref
+		policyID = ref.PolicyID
+		policyDigest = ref.Digest
+	}
+	proposal, err := snapshotForManifestTransition(store, events, binding.Repo, manifest, "base", "proposal")
 	if err != nil {
 		return BuildResult{}, err
 	}
-	proposal, err := snapshotForManifestTransition(store, events, binding.Repo, manifest, "base", "proposal")
+	finding, err := latestFindingForVerification(store, events, binding.Repo, manifestRef.Digest, proposal.Digest, policyDigest, opts.FindingID)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -558,15 +567,6 @@ func buildVerification(opts BuildOptions) (BuildResult, error) {
 	}
 	contentBundleHash := digestJSON(verificationContentBundleDigestMaterial([]SourceDiff{proposalFinal}, final, context.AllowedContextDigest, gates, finding))
 	context.ContentBundleHash = contentBundleHash
-	var policyRef *PolicyRef
-	policyID := ""
-	policyDigest := ""
-	if manifest.Policy != nil {
-		ref := PolicyRef{Profile: manifest.Policy.Profile, PolicyID: manifest.Policy.PolicyID, Digest: manifest.Policy.Digest}
-		policyRef = &ref
-		policyID = ref.PolicyID
-		policyDigest = ref.Digest
-	}
 	dedupe := NewSemanticDedupeKey(SemanticDedupeFields{
 		PolicyID:             policyID,
 		PolicyDigest:         policyDigest,
@@ -1795,7 +1795,7 @@ func snapshotForManifestTransition(store state.Store, events []state.Event, repo
 	return SnapshotRef{}, fmt.Errorf("%s->%s diff is required for verification packet", fromKind, toKind)
 }
 
-func latestFindingForVerification(store state.Store, events []state.Event, repo, manifestDigest, findingID string) (reviewresult.FindingRecord, error) {
+func latestFindingForVerification(store state.Store, events []state.Event, repo, manifestDigest, proposalDigest, policyDigest, findingID string) (reviewresult.FindingRecord, error) {
 	findingID = strings.TrimSpace(findingID)
 	if findingID == "" {
 		return reviewresult.FindingRecord{}, errors.New("--finding is required for verification packets")
@@ -1805,6 +1805,10 @@ func latestFindingForVerification(store state.Store, events []state.Event, repo,
 		return reviewresult.FindingRecord{}, err
 	}
 	var carried *reviewresult.FindingRecord
+	carriedEventID := ""
+	if latestProposal, ok := reviewresult.LatestPrimaryReviewForTargetState(observations, proposalDigest, policyDigest); ok {
+		carriedEventID = latestProposal.EventID
+	}
 	for _, observation := range observations {
 		for _, finding := range observation.Record.Findings {
 			if finding.ID != findingID || !finding.Accepted {
@@ -1813,7 +1817,7 @@ func latestFindingForVerification(store state.Store, events []state.Event, repo,
 			if observation.Record.Packet.CoverageManifest.Digest == manifestDigest {
 				return finding, nil
 			}
-			if carried == nil {
+			if carried == nil && observation.EventID == carriedEventID && carriedFindingRecordApplies(observation.Record, proposalDigest, policyDigest) {
 				value := finding
 				carried = &value
 			}
@@ -1823,6 +1827,22 @@ func latestFindingForVerification(store state.Store, events []state.Event, repo,
 		return *carried, nil
 	}
 	return reviewresult.FindingRecord{}, fmt.Errorf("accepted finding not found for verification: %s", findingID)
+}
+
+func carriedFindingRecordApplies(record reviewresult.ResultRecord, proposalDigest, policyDigest string) bool {
+	return record.Evidence.PrimaryReviewEvidence &&
+		proposalDigest != "" &&
+		record.Packet.TargetState.Kind == "proposal" &&
+		record.Packet.TargetState.Digest == proposalDigest &&
+		resultPacketPolicyMatches(record.Packet.Policy, policyDigest)
+}
+
+func resultPacketPolicyMatches(policy *reviewresult.PolicyRef, policyDigest string) bool {
+	policyDigest = strings.TrimSpace(policyDigest)
+	if policyDigest == "" {
+		return policy == nil || strings.TrimSpace(policy.Digest) == ""
+	}
+	return policy != nil && policy.Digest == policyDigest
 }
 
 func proposalFinalSourceDiff(store state.Store, events []state.Event, stateDir, repo, proposalDigest, finalDigest string) (SourceDiff, error) {

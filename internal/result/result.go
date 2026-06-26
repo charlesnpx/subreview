@@ -505,14 +505,26 @@ func LatestPrimaryReviewForManifest(observations []EvidenceObservation, manifest
 }
 
 func LatestPrimaryReviewForTargetState(observations []EvidenceObservation, targetDigest, policyDigest string) (EvidenceObservation, bool) {
+	observation, ok := LatestDiscoveryForTargetState(observations, targetDigest, policyDigest)
+	if !ok || !observation.Record.Evidence.PrimaryReviewEvidence {
+		return EvidenceObservation{}, false
+	}
+	return observation, true
+}
+
+func LatestDiscoveryForTargetState(observations []EvidenceObservation, targetDigest, policyDigest string) (EvidenceObservation, bool) {
 	for _, observation := range observations {
 		record := observation.Record
-		if record.Packet.TargetState.Digest != targetDigest {
+		if record.RunKind != RunKindDiscovery || record.Route != RoutePrimaryReview {
 			continue
 		}
-		if record.Evidence.PrimaryReviewEvidence && packetPolicyMatches(record.Packet.Policy, policyDigest) {
-			return observation, true
+		if record.Packet.TargetState.Kind != "proposal" || record.Packet.TargetState.Digest != targetDigest {
+			continue
 		}
+		if !packetPolicyMatches(record.Packet.Policy, policyDigest) {
+			continue
+		}
+		return observation, true
 	}
 	return EvidenceObservation{}, false
 }
