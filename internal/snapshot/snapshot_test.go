@@ -437,6 +437,55 @@ func TestCaptureWorkingTreeRejectsMissingGitlink(t *testing.T) {
 	}
 }
 
+func TestCaptureWorkingTreeHandlesTrackedFileReplacedByDirectory(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "a", "old\n")
+	git(t, repo, "add", "a")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := os.Remove(filepath.Join(repo, "a")); err != nil {
+		t.Fatalf("remove tracked file: %v", err)
+	}
+	writeFile(t, repo, "a/b.txt", "child\n")
+	captured, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"})
+	if err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if captured.EntryCount != 1 {
+		t.Fatalf("expected only replacement child entry, got %+v", captured)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	treeBody, err := store.Read(captured.Tree.Digest)
+	if err != nil {
+		t.Fatalf("read tree: %v", err)
+	}
+	var tree TreeManifest
+	if err := decodeStrict(treeBody, &tree); err != nil {
+		t.Fatalf("decode tree: %v", err)
+	}
+	if len(tree.Entries) != 1 || tree.Entries[0].Path != "a/b.txt" {
+		t.Fatalf("unexpected tree entries: %+v", tree.Entries)
+	}
+	restoreDir := filepath.Join(root, "restore")
+	if _, err := Restore(RestoreOptions{StateDir: stateDir, Kind: "proposal", Output: restoreDir}); err != nil {
+		t.Fatalf("Restore proposal: %v", err)
+	}
+	if got := readFile(t, restoreDir, "a/b.txt"); got != "child\n" {
+		t.Fatalf("restored child mismatch: %q", got)
+	}
+	if _, err := os.ReadFile(filepath.Join(restoreDir, "a")); err == nil {
+		t.Fatal("restore should not recreate tracked file a")
+	}
+}
+
 func TestRestoreRejectsSymlinkedOutputPath(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")

@@ -600,6 +600,9 @@ func captureWorkingTree(store state.Store, repo string) ([]TreeEntry, error) {
 			return nil, err
 		}
 		if info.IsDir() {
+			if _, indexed := indexModes[rel]; indexed {
+				continue
+			}
 			return nil, fmt.Errorf("unsupported working tree directory entry, possible gitlink/submodule: %s", rel)
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
