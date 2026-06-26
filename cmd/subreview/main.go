@@ -13,6 +13,7 @@ import (
 	"github.com/charlesnpx/subreview/internal/obligation"
 	"github.com/charlesnpx/subreview/internal/packet"
 	"github.com/charlesnpx/subreview/internal/policy"
+	reviewresult "github.com/charlesnpx/subreview/internal/result"
 	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
 )
@@ -40,6 +41,8 @@ func main() {
 		err = packetCommand(os.Args[2:])
 	case "policy":
 		err = policyCommand(os.Args[2:])
+	case "result":
+		err = resultCommand(os.Args[2:])
 	case "snapshot":
 		err = snapshotCommand(os.Args[2:])
 	case "state":
@@ -71,6 +74,7 @@ func usage(w io.Writer) {
   subreview policy check --config <path> --repo <path> [--json]
   subreview policy bind --state <dir> --config <path> --profile <name> [--json]
   subreview policy explain --state <dir> --profile <name> [--json]
+  subreview result import --state <dir> --packet <id> --result <file> [--json]
   subreview snapshot capture --state <dir> --kind <base|proposal|final> --repo <path> [--ref <ref>] [--json]
   subreview snapshot restore --state <dir> --kind <base|proposal|final> --output <dir> [--json]
   subreview state init --state <dir> --repo <path> [--json]
@@ -131,6 +135,62 @@ func usagePacketBuild(w io.Writer) {
   subreview packet build --state <dir> --kind primary [--json]
 
 Builds a canonical primary review packet with stable and volatile prompt sections.`)
+}
+
+func resultCommand(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("result requires subcommand: import")
+	}
+	if isHelpCommand(args[0]) {
+		usageResult(os.Stdout)
+		return nil
+	}
+	switch args[0] {
+	case "import":
+		return resultImport(args[1:])
+	default:
+		return fmt.Errorf("result requires subcommand: import")
+	}
+}
+
+func resultImport(args []string) error {
+	if hasHelpFlag(args) {
+		usageResultImport(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("result import", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	packetID := fs.String("packet", "", "Packet digest, semantic dedupe digest, or packet event id")
+	resultPath := fs.String("result", "", "Structured worker result JSON file")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("result import does not accept positional arguments")
+	}
+	imported, err := reviewresult.Import(reviewresult.ImportOptions{StateDir: *stateDir, PacketID: *packetID, ResultPath: *resultPath})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(imported)
+	}
+	fmt.Printf("result imported: %s outcome=%s findings=%d accepted=%d\n", imported.Result.Digest, imported.Outcome, imported.FindingCount, imported.AcceptedFindingCount)
+	return nil
+}
+
+func usageResult(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview result import --state <dir> --packet <id> --result <file> [--json]`)
+}
+
+func usageResultImport(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview result import --state <dir> --packet <id> --result <file> [--json]
+
+Imports a bounded structured worker result, normalizes findings, records lifecycle evidence, and appends one ledger event.`)
 }
 
 func gatesCommand(args []string) error {
