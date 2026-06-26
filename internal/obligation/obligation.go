@@ -329,7 +329,7 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		return StatusResult{}, err
 	}
 	blockers = append(blockers, anchorBlockers...)
-	gateEvidence, err := gate.LatestEvidenceByCommand(store, events, binding.Repo)
+	gateEvidence, err := gate.EvidenceByCommand(store, events, binding.Repo)
 	if err != nil {
 		return StatusResult{}, err
 	}
@@ -350,26 +350,20 @@ func Status(opts StatusOptions) (StatusResult, error) {
 			status.UnsatisfiedSatisfactionKinds = []string{}
 		}
 		if obligation.Kind == KindGateRequirement && obligation.Required {
-			evidence, ok := gateEvidence[obligation.CommandID]
+			evidence, ok, sawStale := latestGateEvidenceForManifest(gateEvidence[obligation.CommandID], manifest)
 			switch {
+			case !ok && sawStale:
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "stale_gate_evidence",
+					Message:      "gate evidence does not match this coverage manifest",
+					ObligationID: obligation.ID,
+				})
 			case !ok:
 				status.Blockers = append(status.Blockers, Blocker{
 					Code:         "unsatisfied_required_check",
 					Message:      "required gate evidence is not recorded yet",
 					ObligationID: obligation.ID,
 					Path:         obligation.Path,
-				})
-			case !gateEvidenceMatchesSnapshot(evidence.Record, manifest):
-				status.Blockers = append(status.Blockers, Blocker{
-					Code:         "stale_gate_evidence",
-					Message:      "gate evidence snapshot does not match this coverage manifest",
-					ObligationID: obligation.ID,
-				})
-			case !gateEvidenceMatchesPolicy(evidence.Record, manifest.Policy):
-				status.Blockers = append(status.Blockers, Blocker{
-					Code:         "stale_gate_evidence",
-					Message:      "gate evidence policy does not match this coverage manifest",
-					ObligationID: obligation.ID,
 				})
 			case evidence.Record.Outcome == gate.OutcomePass:
 				status.Satisfied = true
@@ -428,6 +422,18 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		Blockers:                     blockers,
 		Obligations:                  statuses,
 	}, nil
+}
+
+func latestGateEvidenceForManifest(observations []gate.EvidenceObservation, manifest CoverageManifest) (gate.EvidenceObservation, bool, bool) {
+	sawStale := false
+	for _, observation := range observations {
+		if !gateEvidenceMatchesSnapshot(observation.Record, manifest) || !gateEvidenceMatchesPolicy(observation.Record, manifest.Policy) {
+			sawStale = true
+			continue
+		}
+		return observation, true, sawStale
+	}
+	return gate.EvidenceObservation{}, false, sawStale
 }
 
 func gateEvidenceMatchesSnapshot(evidence gate.EvidenceRecord, manifest CoverageManifest) bool {

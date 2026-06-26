@@ -240,7 +240,7 @@ func Run(opts RunOptions) (EvidenceResult, error) {
 	if err != nil {
 		return EvidenceResult{}, err
 	}
-	policyRef, err := latestPolicyBinding(events, store, binding.Repo)
+	policyRef, err := requiredPolicyBinding(events, store, binding.Repo)
 	if err != nil {
 		return EvidenceResult{}, err
 	}
@@ -313,7 +313,7 @@ func Record(opts RecordOptions) (EvidenceResult, error) {
 	if err != nil {
 		return EvidenceResult{}, err
 	}
-	policyRef, err := latestPolicyBinding(events, store, binding.Repo)
+	policyRef, err := requiredPolicyBinding(events, store, binding.Repo)
 	if err != nil {
 		return EvidenceResult{}, err
 	}
@@ -362,43 +362,62 @@ func LoadCatalog(path string) (string, Catalog, error) {
 }
 
 func LatestEvidenceByCommand(store state.Store, events []state.Event, repo string) (map[string]EvidenceObservation, error) {
+	observations, err := EvidenceByCommand(store, events, repo)
+	if err != nil {
+		return nil, err
+	}
 	result := map[string]EvidenceObservation{}
+	for commandID, commandObservations := range observations {
+		if len(commandObservations) > 0 {
+			result[commandID] = commandObservations[0]
+		}
+	}
+	return result, nil
+}
+
+func EvidenceByCommand(store state.Store, events []state.Event, repo string) (map[string][]EvidenceObservation, error) {
+	result := map[string][]EvidenceObservation{}
 	for i := len(events) - 1; i >= 0; i-- {
 		event := events[i]
 		if event.Type != EventTypeEvidenceRecorded {
 			continue
 		}
-		if event.Repo != repo {
-			return nil, errors.New("malformed gate.evidence_recorded event: repo mismatch")
-		}
-		commandID := event.Details["command_id"]
-		if strings.TrimSpace(commandID) == "" {
-			return nil, errors.New("malformed gate.evidence_recorded event: missing command_id")
-		}
-		if _, exists := result[commandID]; exists {
-			continue
-		}
-		digest := event.Details["evidence"]
-		if strings.TrimSpace(digest) == "" {
-			return nil, errors.New("malformed gate.evidence_recorded event: missing evidence")
-		}
-		if !containsDigest(event.ObjectDigests, digest) {
-			return nil, errors.New("malformed gate.evidence_recorded event: object_digests missing evidence")
-		}
-		body, err := store.Read(digest)
+		commandID, observation, err := evidenceObservationFromEvent(store, event, repo)
 		if err != nil {
 			return nil, err
 		}
-		var record EvidenceRecord
-		if err := decodeStrict(body, &record); err != nil {
-			return nil, err
-		}
-		if err := validateEvidenceRecord(record, repo, commandID); err != nil {
-			return nil, err
-		}
-		result[commandID] = EvidenceObservation{Record: record, Digest: digest, EventID: event.EventID}
+		result[commandID] = append(result[commandID], observation)
 	}
 	return result, nil
+}
+
+func evidenceObservationFromEvent(store state.Store, event state.Event, repo string) (string, EvidenceObservation, error) {
+	if event.Repo != repo {
+		return "", EvidenceObservation{}, errors.New("malformed gate.evidence_recorded event: repo mismatch")
+	}
+	commandID := event.Details["command_id"]
+	if strings.TrimSpace(commandID) == "" {
+		return "", EvidenceObservation{}, errors.New("malformed gate.evidence_recorded event: missing command_id")
+	}
+	digest := event.Details["evidence"]
+	if strings.TrimSpace(digest) == "" {
+		return "", EvidenceObservation{}, errors.New("malformed gate.evidence_recorded event: missing evidence")
+	}
+	if !containsDigest(event.ObjectDigests, digest) {
+		return "", EvidenceObservation{}, errors.New("malformed gate.evidence_recorded event: object_digests missing evidence")
+	}
+	body, err := store.Read(digest)
+	if err != nil {
+		return "", EvidenceObservation{}, err
+	}
+	var record EvidenceRecord
+	if err := decodeStrict(body, &record); err != nil {
+		return "", EvidenceObservation{}, err
+	}
+	if err := validateEvidenceRecord(record, repo, commandID); err != nil {
+		return "", EvidenceObservation{}, err
+	}
+	return commandID, EvidenceObservation{Record: record, Digest: digest, EventID: event.EventID}, nil
 }
 
 func normalizeCatalog(catalog Catalog) (Catalog, error) {
@@ -558,6 +577,9 @@ func executeCommand(repo string, command CommandDefinition, startedAt time.Time)
 		endedAt := time.Now().UTC()
 		return commandRun{Outcome: OutcomeError, Summary: truncateDiagnostic(err.Error()), EndedAt: endedAt}
 	}
+	defer func() {
+		_ = terminateCommandProcess(cmd)
+	}()
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- cmd.Wait()
@@ -774,6 +796,17 @@ func latestPolicyBinding(events []state.Event, store state.Store, repo string) (
 		return &PolicyRef{Profile: profile, PolicyID: policyID, Digest: digest}, nil
 	}
 	return nil, nil
+}
+
+func requiredPolicyBinding(events []state.Event, store state.Store, repo string) (*PolicyRef, error) {
+	ref, err := latestPolicyBinding(events, store, repo)
+	if err != nil {
+		return nil, err
+	}
+	if ref == nil {
+		return nil, errors.New("policy is not bound in state; run policy bind first")
+	}
+	return ref, nil
 }
 
 func validateEvidenceRecord(record EvidenceRecord, repo, commandID string) error {

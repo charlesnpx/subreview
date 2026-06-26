@@ -128,6 +128,31 @@ func TestRunExecutesRestoredSnapshotNotDirtyWorkingTree(t *testing.T) {
 	}
 }
 
+func TestRunAndRecordRequireBoundPolicy(t *testing.T) {
+	_, stateDir := initializedGateStateWithoutPolicy(t)
+	catalogPath := writeCatalog(t, t.TempDir(), Catalog{
+		SchemaVersion: SchemaVersion,
+		Commands: []CommandDefinition{
+			testCommand("go_test_all", []string{"/bin/sh", "-c", "printf ok"}),
+		},
+	})
+	if _, err := Run(RunOptions{StateDir: stateDir, CatalogPath: catalogPath, CommandID: "go_test_all", SnapshotKind: "proposal", Now: time.Unix(260, 0)}); err == nil || !strings.Contains(err.Error(), "policy is not bound") {
+		t.Fatalf("Run should require policy binding, got %v", err)
+	}
+	if _, err := Record(RecordOptions{
+		StateDir:     stateDir,
+		CatalogPath:  catalogPath,
+		CommandID:    "go_test_all",
+		SnapshotKind: "proposal",
+		Outcome:      OutcomePass,
+		Provenance:   ProvenanceExternalAsserted,
+		Diagnostic:   "external pass",
+		Now:          time.Unix(261, 0),
+	}); err == nil || !strings.Contains(err.Error(), "policy is not bound") {
+		t.Fatalf("Record should require policy binding, got %v", err)
+	}
+}
+
 func TestRecordStoresExternalAssertedGateEvidence(t *testing.T) {
 	_, stateDir := initializedGateState(t)
 	catalogPath := writeCatalog(t, t.TempDir(), Catalog{
@@ -249,6 +274,20 @@ func TestExecuteCommandTimeoutKillsShellChildren(t *testing.T) {
 	}
 }
 
+func TestExecuteCommandCleansUpBackgroundChildrenAfterSuccess(t *testing.T) {
+	root := t.TempDir()
+	command := testCommand("go_test_all", []string{"/bin/sh", "-c", "(/bin/sleep 1; : > escaped-child) >/dev/null 2>&1 &"})
+	command.AllowedExitCodes = []int{0}
+	result := executeCommand(root, command, time.Now().UTC())
+	if result.Outcome != OutcomePass {
+		t.Fatalf("backgrounding gate should exit successfully, got %+v", result)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(root, "escaped-child")); !os.IsNotExist(err) {
+		t.Fatalf("background child should have been killed before writing marker, stat err=%v", err)
+	}
+}
+
 func initializedGateState(t *testing.T) (string, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -263,6 +302,24 @@ func initializedGateState(t *testing.T) (string, string) {
 	}
 	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfig(t, root), Profile: "default"}); err != nil {
 		t.Fatalf("Bind policy: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	return repo, stateDir
+}
+
+func initializedGateStateWithoutPolicy(t *testing.T) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
 	}
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal", Ref: "HEAD"}); err != nil {
 		t.Fatalf("Capture proposal: %v", err)

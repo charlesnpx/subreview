@@ -147,6 +147,47 @@ func TestGateEvidenceMustMatchManifestSnapshot(t *testing.T) {
 	}
 }
 
+func TestGateEvidenceUsesLatestManifestMatchingRecord(t *testing.T) {
+	_, stateDir := initializedStateWithBuiltObligations(t)
+	catalogPath := writeGateCatalog(t, t.TempDir(), "go_test_all")
+	finalEvidence, err := gate.Record(gate.RecordOptions{
+		StateDir:     stateDir,
+		CatalogPath:  catalogPath,
+		CommandID:    "go_test_all",
+		SnapshotKind: "final",
+		Outcome:      gate.OutcomePass,
+		Provenance:   gate.ProvenanceExternalAsserted,
+		Diagnostic:   "external pass on final",
+		Now:          time.Unix(200, 0),
+	})
+	if err != nil {
+		t.Fatalf("Record final gate pass: %v", err)
+	}
+	if _, err := gate.Record(gate.RecordOptions{
+		StateDir:     stateDir,
+		CatalogPath:  catalogPath,
+		CommandID:    "go_test_all",
+		SnapshotKind: "proposal",
+		Outcome:      gate.OutcomePass,
+		Provenance:   gate.ProvenanceExternalAsserted,
+		Diagnostic:   "later external pass on proposal",
+		Now:          time.Unix(300, 0),
+	}); err != nil {
+		t.Fatalf("Record later proposal gate pass: %v", err)
+	}
+	status, err := Status(StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	gateStatus := gateObligationStatus(t, status, "go_test_all")
+	if !gateStatus.Satisfied || len(gateStatus.SatisfiedBy) != 1 || gateStatus.SatisfiedBy[0].Digest != finalEvidence.Evidence.Digest {
+		t.Fatalf("gate obligation should use latest manifest-matching evidence: %+v", gateStatus)
+	}
+	if hasBlocker(status.Blockers, "stale_gate_evidence") {
+		t.Fatalf("later stale evidence should not mask matching final evidence: %+v", status.Blockers)
+	}
+}
+
 func TestGateFailureBlocksReview(t *testing.T) {
 	_, stateDir := initializedStateWithBuiltObligations(t)
 	catalogPath := writeGateCatalog(t, t.TempDir(), "go_test_all")
