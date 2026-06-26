@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/subreview/internal/anchor"
+	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/policy"
 	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
@@ -328,6 +329,10 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		return StatusResult{}, err
 	}
 	blockers = append(blockers, anchorBlockers...)
+	gateEvidence, err := gate.LatestEvidenceByCommand(store, events, binding.Repo)
+	if err != nil {
+		return StatusResult{}, err
+	}
 
 	statuses := make([]ObligationStatus, 0, len(manifest.Obligations))
 	unsatisfiedKinds := map[string]struct{}{}
@@ -345,12 +350,38 @@ func Status(opts StatusOptions) (StatusResult, error) {
 			status.UnsatisfiedSatisfactionKinds = []string{}
 		}
 		if obligation.Kind == KindGateRequirement && obligation.Required {
-			status.Blockers = append(status.Blockers, Blocker{
-				Code:         "unsatisfied_required_check",
-				Message:      "required gate evidence is not recorded yet",
-				ObligationID: obligation.ID,
-				Path:         obligation.Path,
-			})
+			evidence, ok := gateEvidence[obligation.CommandID]
+			switch {
+			case !ok:
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "unsatisfied_required_check",
+					Message:      "required gate evidence is not recorded yet",
+					ObligationID: obligation.ID,
+					Path:         obligation.Path,
+				})
+			case !gateEvidenceMatchesPolicy(evidence.Record, manifest.Policy):
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "stale_gate_evidence",
+					Message:      "gate evidence policy does not match this coverage manifest",
+					ObligationID: obligation.ID,
+				})
+			case evidence.Record.Outcome == gate.OutcomePass:
+				status.Satisfied = true
+				status.SatisfiedBy = append(status.SatisfiedBy, EvidenceRef{Kind: SatisfactionGateEvidence, EventID: evidence.EventID, Digest: evidence.Digest})
+				status.UnsatisfiedSatisfactionKinds = removeString(status.UnsatisfiedSatisfactionKinds, SatisfactionGateEvidence)
+			case evidence.Record.Outcome == gate.OutcomeFail:
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "gate_failed_blocks_review",
+					Message:      "required gate failed: " + evidence.Record.Diagnostics.Summary,
+					ObligationID: obligation.ID,
+				})
+			default:
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "gate_error_blocks_review",
+					Message:      "required gate errored: " + evidence.Record.Diagnostics.Summary,
+					ObligationID: obligation.ID,
+				})
+			}
 		}
 		if isCoverageObligation(obligation) && obligation.Required {
 			status.Blockers = append(status.Blockers, Blocker{
@@ -391,6 +422,23 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		Blockers:                     blockers,
 		Obligations:                  statuses,
 	}, nil
+}
+
+func gateEvidenceMatchesPolicy(evidence gate.EvidenceRecord, manifestPolicy *PolicyRef) bool {
+	if manifestPolicy == nil {
+		return evidence.Policy == nil
+	}
+	return evidence.Policy != nil && evidence.Policy.Digest == manifestPolicy.Digest
+}
+
+func removeString(values []string, remove string) []string {
+	filtered := values[:0]
+	for _, value := range values {
+		if value != remove {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
 }
 
 func transitionDiff(binding diffBinding) TransitionDiff {

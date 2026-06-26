@@ -166,6 +166,141 @@ func TestPolicyCheckBindAndExplainCLI(t *testing.T) {
 	}
 }
 
+func TestGatesCheckRunAndRecordCLI(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "subreview")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build subreview: %v\n%s", err, out)
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initCLIGitRepo(t, repo)
+	writeCLIFile(t, repo, "alpha.txt", "one\n")
+	runCLIGit(t, repo, "add", ".")
+	runCLIGit(t, repo, "commit", "-m", "initial")
+	policyPath := filepath.Join(root, "policy.json")
+	if err := os.WriteFile(policyPath, []byte(`{
+  "schema_version": 1,
+  "policy_id": "v1-default",
+  "profiles": {
+    "default": {
+      "gate_requirements": [
+        {"command_id": "go_test_all", "required": true}
+      ],
+      "route_limits": {
+        "primary_semantic_reviews": 1,
+        "targeted_verifications": 1,
+        "fresh_final_reviews": 0,
+        "context_expansion_rounds": 1
+      },
+      "required_evidence_facts": [
+        "required_gates_satisfied",
+        "primary_review_completed",
+        "blocking_findings_verified",
+        "coverage_obligations_satisfied",
+        "policy_bound"
+      ],
+      "risk_routing": [],
+      "closure_basis": {
+        "allowed_basis": ["clean", "fixed", "deterministic_refutation"],
+        "require_basis_for_unresolved": true
+      }
+    }
+  }
+}
+`), 0o644); err != nil {
+		t.Fatalf("write policy config: %v", err)
+	}
+	catalogPath := filepath.Join(root, "gate-catalog.json")
+	if err := os.WriteFile(catalogPath, []byte(`{
+  "schema_version": 1,
+  "commands": [
+    {
+      "id": "go_test_all",
+      "argv": ["/bin/sh", "-c", "printf gate-ok"],
+      "working_dir": ".",
+      "replay_class": "environment_bound",
+      "environment_pinned": true,
+      "executes_repo_code": true,
+      "side_effects": "none",
+      "timeout_seconds": 5
+    }
+  ]
+}
+`), 0o644); err != nil {
+		t.Fatalf("write gate catalog: %v", err)
+	}
+	checkOut, err := exec.Command(bin, "gates", "check-catalog", "--catalog", catalogPath, "--repo", repo, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("gates check-catalog failed: %v\n%s", err, checkOut)
+	}
+	var check struct {
+		OK       bool `json:"ok"`
+		Commands []struct {
+			ID            string `json:"id"`
+			CommandDigest string `json:"command_digest"`
+		} `json:"commands"`
+	}
+	if err := json.Unmarshal(checkOut, &check); err != nil {
+		t.Fatalf("check-catalog output is not json: %v\n%s", err, checkOut)
+	}
+	if !check.OK || len(check.Commands) != 1 || check.Commands[0].ID != "go_test_all" || check.Commands[0].CommandDigest == "" {
+		t.Fatalf("bad check-catalog output: %s", checkOut)
+	}
+	if out, err := exec.Command(bin, "state", "init", "--state", stateDir, "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("state init failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "policy", "bind", "--state", stateDir, "--config", policyPath, "--profile", "default", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("policy bind failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "proposal", "--repo", repo, "--ref", "HEAD", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("snapshot proposal failed: %v\n%s", err, out)
+	}
+	runOut, err := exec.Command(bin, "gates", "run", "--state", stateDir, "--catalog", catalogPath, "--command-id", "go_test_all", "--snapshot", "proposal", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("gates run failed: %v\n%s", err, runOut)
+	}
+	var run struct {
+		CommandID  string `json:"command_id"`
+		Outcome    string `json:"outcome"`
+		Provenance string `json:"provenance"`
+		Evidence   struct {
+			Digest string `json:"digest"`
+			Path   string `json:"path"`
+		} `json:"evidence"`
+	}
+	if err := json.Unmarshal(runOut, &run); err != nil {
+		t.Fatalf("gates run output is not json: %v\n%s", err, runOut)
+	}
+	if run.CommandID != "go_test_all" || run.Outcome != "pass" || run.Provenance != "cli_witnessed" || run.Evidence.Digest == "" {
+		t.Fatalf("bad gates run output: %s", runOut)
+	}
+	if _, err := os.Stat(run.Evidence.Path); err != nil {
+		t.Fatalf("gate evidence object should exist %s: %v\n%s", run.Evidence.Path, err, runOut)
+	}
+	recordOut, err := exec.Command(bin, "gates", "record", "--state", stateDir, "--catalog", catalogPath, "--command-id", "go_test_all", "--snapshot", "proposal", "--outcome", "fail", "--diagnostic", "external failed", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("gates record failed: %v\n%s", err, recordOut)
+	}
+	var record struct {
+		Outcome    string `json:"outcome"`
+		Provenance string `json:"provenance"`
+		Evidence   struct {
+			Digest string `json:"digest"`
+		} `json:"evidence"`
+	}
+	if err := json.Unmarshal(recordOut, &record); err != nil {
+		t.Fatalf("gates record output is not json: %v\n%s", err, recordOut)
+	}
+	if record.Outcome != "fail" || record.Provenance != "external_asserted" || record.Evidence.Digest == "" {
+		t.Fatalf("bad gates record output: %s", recordOut)
+	}
+	validateOut, err := exec.Command(bin, "state", "validate", "--state", stateDir, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("state validate failed: %v\n%s", err, validateOut)
+	}
+}
+
 func TestSnapshotCaptureRestoreAndDiffCLI(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "subreview")
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {

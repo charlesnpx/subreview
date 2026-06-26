@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/subreview/internal/anchor"
+	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/policy"
 	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
@@ -87,6 +88,62 @@ func TestBuildAndStatusReportUnsatisfiedEvidenceSlots(t *testing.T) {
 	}
 	if validation := state.Validate(stateDir); !validation.OK {
 		t.Fatalf("state should validate: %+v", validation.Errors)
+	}
+}
+
+func TestGateEvidenceSatisfiesGateRequirementObligation(t *testing.T) {
+	repo, stateDir := initializedStateWithBuiltObligations(t)
+	catalogPath := writeGateCatalog(t, t.TempDir(), "go_test_all")
+	if _, err := gate.Record(gate.RecordOptions{
+		StateDir:     stateDir,
+		CatalogPath:  catalogPath,
+		CommandID:    "go_test_all",
+		SnapshotKind: "proposal",
+		Outcome:      gate.OutcomePass,
+		Provenance:   gate.ProvenanceExternalAsserted,
+		Diagnostic:   "external pass",
+		Now:          time.Unix(200, 0),
+	}); err != nil {
+		t.Fatalf("Record gate pass for repo %s: %v", repo, err)
+	}
+	status, err := Status(StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	gateStatus := gateObligationStatus(t, status, "go_test_all")
+	if !gateStatus.Satisfied || len(gateStatus.SatisfiedBy) != 1 || gateStatus.UnsatisfiedSatisfactionKinds != nil && containsString(gateStatus.UnsatisfiedSatisfactionKinds, SatisfactionGateEvidence) {
+		t.Fatalf("gate obligation should be satisfied by evidence: %+v", gateStatus)
+	}
+	if hasBlocker(status.Blockers, "unsatisfied_required_check") {
+		t.Fatalf("gate evidence should remove unsatisfied required-check blocker: %+v", status.Blockers)
+	}
+}
+
+func TestGateFailureBlocksReview(t *testing.T) {
+	_, stateDir := initializedStateWithBuiltObligations(t)
+	catalogPath := writeGateCatalog(t, t.TempDir(), "go_test_all")
+	if _, err := gate.Record(gate.RecordOptions{
+		StateDir:     stateDir,
+		CatalogPath:  catalogPath,
+		CommandID:    "go_test_all",
+		SnapshotKind: "proposal",
+		Outcome:      gate.OutcomeFail,
+		Provenance:   gate.ProvenanceExternalAsserted,
+		Diagnostic:   "external failure",
+		Now:          time.Unix(200, 0),
+	}); err != nil {
+		t.Fatalf("Record gate failure: %v", err)
+	}
+	status, err := Status(StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if !hasBlocker(status.Blockers, "gate_failed_blocks_review") {
+		t.Fatalf("gate failure should block review: %+v", status.Blockers)
+	}
+	gateStatus := gateObligationStatus(t, status, "go_test_all")
+	if gateStatus.Satisfied {
+		t.Fatalf("failed gate should not satisfy obligation: %+v", gateStatus)
 	}
 }
 
@@ -427,6 +484,71 @@ func TestBuildRejectsStaleDiffAfterNewerSnapshot(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "does not match latest snapshots") {
 		t.Fatalf("expected stale diff error, got %v", err)
 	}
+}
+
+func initializedStateWithBuiltObligations(t *testing.T) (string, string) {
+	t.Helper()
+	repo, stateDir := initializedReviewState(t)
+	writeObligationFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	bindDefaultPolicy(t, stateDir, repo, false)
+	writeObligationFile(t, repo, "alpha.txt", "two\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if _, err := Build(BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return repo, stateDir
+}
+
+func writeGateCatalog(t *testing.T, root, commandID string) string {
+	t.Helper()
+	body := []byte(`{
+  "schema_version": 1,
+  "commands": [
+    {
+      "id": "` + commandID + `",
+      "argv": ["/bin/sh", "-c", "printf ok"],
+      "working_dir": ".",
+      "replay_class": "environment_bound",
+      "environment_pinned": true,
+      "executes_repo_code": true,
+      "side_effects": "none",
+      "timeout_seconds": 5
+    }
+  ]
+}
+`)
+	path := filepath.Join(root, "gate-catalog.json")
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatalf("write gate catalog: %v", err)
+	}
+	return path
+}
+
+func gateObligationStatus(t *testing.T, status StatusResult, commandID string) ObligationStatus {
+	t.Helper()
+	for _, obligationStatus := range status.Obligations {
+		if obligationStatus.Obligation.Kind == KindGateRequirement && obligationStatus.Obligation.CommandID == commandID {
+			return obligationStatus
+		}
+	}
+	t.Fatalf("missing gate obligation for %s: %+v", commandID, status.Obligations)
+	return ObligationStatus{}
 }
 
 func initializedReviewState(t *testing.T) (string, string) {

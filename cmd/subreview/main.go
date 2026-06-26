@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/charlesnpx/subreview/internal/anchor"
+	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/install"
 	"github.com/charlesnpx/subreview/internal/obligation"
 	"github.com/charlesnpx/subreview/internal/policy"
@@ -28,6 +29,8 @@ func main() {
 		err = anchorsCommand(os.Args[2:])
 	case "diff":
 		err = diffCommand(os.Args[2:])
+	case "gates":
+		err = gatesCommand(os.Args[2:])
 	case "install-skills":
 		err = installSkills(os.Args[2:])
 	case "obligations":
@@ -55,6 +58,9 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> --anchors <path> [--json]
   subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--json]
+  subreview gates check-catalog --catalog <path> --repo <path> [--json]
+  subreview gates run --state <dir> --catalog <path> --command-id <id> --snapshot <base|proposal|final> [--json]
+  subreview gates record --state <dir> --catalog <path> --command-id <id> --snapshot <base|proposal|final> --outcome <pass|fail|error> [--diagnostic <text>] [--provenance external_asserted] [--json]
   subreview install-skills [--plan|--install|--uninstall] [--target tools|claude|codex|all] [--json] [--install-root <dir>]
   subreview obligations build --state <dir> [--json]
   subreview obligations status --state <dir> [--json]
@@ -66,6 +72,147 @@ func usage(w io.Writer) {
   subreview state init --state <dir> --repo <path> [--json]
   subreview state validate --state <dir> [--json]
   subreview version`)
+}
+
+func gatesCommand(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("gates requires subcommand: check-catalog, run, or record")
+	}
+	if isHelpCommand(args[0]) {
+		usageGates(os.Stdout)
+		return nil
+	}
+	switch args[0] {
+	case "check-catalog":
+		return gatesCheckCatalog(args[1:])
+	case "run":
+		return gatesRun(args[1:])
+	case "record":
+		return gatesRecord(args[1:])
+	default:
+		return fmt.Errorf("gates requires subcommand: check-catalog, run, or record")
+	}
+}
+
+func gatesCheckCatalog(args []string) error {
+	if hasHelpFlag(args) {
+		usageGatesCheckCatalog(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("gates check-catalog", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	catalogPath := fs.String("catalog", "", "Trusted gate catalog path")
+	repoPath := fs.String("repo", "", "Repository path")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("gates check-catalog does not accept positional arguments")
+	}
+	result, err := gate.CheckCatalog(gate.CheckOptions{CatalogPath: *catalogPath, RepoPath: *repoPath})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("gate catalog valid: %s (%d commands)\n", result.Catalog, len(result.Commands))
+	return nil
+}
+
+func gatesRun(args []string) error {
+	if hasHelpFlag(args) {
+		usageGatesRun(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("gates run", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	catalogPath := fs.String("catalog", "", "Trusted gate catalog path")
+	commandID := fs.String("command-id", "", "Gate catalog command id")
+	snapshotKind := fs.String("snapshot", "", "Input snapshot kind")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("gates run does not accept positional arguments")
+	}
+	result, err := gate.Run(gate.RunOptions{StateDir: *stateDir, CatalogPath: *catalogPath, CommandID: *commandID, SnapshotKind: *snapshotKind})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("gate recorded: %s %s (%s)\n", result.CommandID, result.Evidence.Digest, result.Outcome)
+	return nil
+}
+
+func gatesRecord(args []string) error {
+	if hasHelpFlag(args) {
+		usageGatesRecord(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("gates record", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	catalogPath := fs.String("catalog", "", "Trusted gate catalog path")
+	commandID := fs.String("command-id", "", "Gate catalog command id")
+	snapshotKind := fs.String("snapshot", "", "Input snapshot kind")
+	outcome := fs.String("outcome", "", "Gate outcome: pass, fail, or error")
+	provenance := fs.String("provenance", "external_asserted", "Evidence provenance")
+	diagnostic := fs.String("diagnostic", "", "Concise diagnostic summary")
+	exitCode := fs.Int("exit-code", -1, "Optional exit code")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("gates record does not accept positional arguments")
+	}
+	var exitCodePtr *int
+	if *exitCode >= 0 {
+		exitCodePtr = exitCode
+	}
+	result, err := gate.Record(gate.RecordOptions{StateDir: *stateDir, CatalogPath: *catalogPath, CommandID: *commandID, SnapshotKind: *snapshotKind, Outcome: *outcome, Provenance: *provenance, Diagnostic: *diagnostic, ExitCode: exitCodePtr})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("gate recorded: %s %s (%s)\n", result.CommandID, result.Evidence.Digest, result.Outcome)
+	return nil
+}
+
+func usageGates(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview gates check-catalog --catalog <path> --repo <path> [--json]
+  subreview gates run --state <dir> --catalog <path> --command-id <id> --snapshot <base|proposal|final> [--json]
+  subreview gates record --state <dir> --catalog <path> --command-id <id> --snapshot <base|proposal|final> --outcome <pass|fail|error> [--diagnostic <text>] [--provenance external_asserted] [--json]`)
+}
+
+func usageGatesCheckCatalog(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview gates check-catalog --catalog <path> --repo <path> [--json]
+
+Validates an operator-authored trusted gate catalog without executing commands.`)
+}
+
+func usageGatesRun(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview gates run --state <dir> --catalog <path> --command-id <id> --snapshot <base|proposal|final> [--json]
+
+Runs a catalog command by id, stores CLI-witnessed gate evidence, and never executes reviewer prose.`)
+}
+
+func usageGatesRecord(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview gates record --state <dir> --catalog <path> --command-id <id> --snapshot <base|proposal|final> --outcome <pass|fail|error> [--diagnostic <text>] [--provenance external_asserted] [--json]
+
+Records externally asserted gate evidence for a catalog command id without executing it.`)
 }
 
 func obligationsCommand(args []string) error {
