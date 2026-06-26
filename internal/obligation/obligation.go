@@ -324,7 +324,6 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		return StatusResult{}, err
 	}
 	blockers = append(blockers, freshnessBlockers...)
-	blockers = append(blockers, contextBlockers(events)...)
 	anchorBlockers, err := unresolvedAnchorBlockers(store, events, binding.Repo, manifest.SourceDiffs)
 	if err != nil {
 		return StatusResult{}, err
@@ -339,8 +338,16 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		return StatusResult{}, err
 	}
 	primaryReviewEvidence, hasPrimaryReviewEvidence := reviewresult.LatestPrimaryReviewForManifest(resultEvidence, manifestRef.Digest)
+	proposalDigest := proposalTargetDigest(manifest)
+	activePolicyDigest := policyDigest(manifest.Policy)
+	var carriedProposalReview reviewresult.EvidenceObservation
+	var hasCarriedProposalReview bool
+	if proposalDigest != "" {
+		carriedProposalReview, hasCarriedProposalReview = reviewresult.LatestPrimaryReviewForTargetState(resultEvidence, proposalDigest, activePolicyDigest)
+	}
 	independentFinalEvidence, hasIndependentFinalEvidence := reviewresult.LatestIndependentFinalReviewForManifest(resultEvidence, manifestRef.Digest)
-	for _, finding := range reviewresult.ActiveFindingBlockers(resultEvidence, manifestRef.Digest) {
+	blockers = append(blockers, contextBlockers(resultEvidence, manifestRef.Digest, proposalDigest, activePolicyDigest)...)
+	for _, finding := range reviewresult.ClosureFindingBlockers(resultEvidence, manifestRef.Digest, proposalDigest, activePolicyDigest) {
 		blockers = append(blockers, Blocker{
 			Code:    "open_finding",
 			Message: "blocking finding remains " + finding.State + ": " + finding.Claim,
@@ -400,6 +407,10 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		if isCoverageObligation(obligation) && obligation.Required {
 			if hasPrimaryReviewEvidence {
 				markStatusSatisfied(&status, SatisfactionPrimaryReviewEvidence, primaryReviewEvidence.EventID, primaryReviewEvidence.Digest)
+			} else if obligation.Transition == "base->proposal" && hasCarriedProposalReview {
+				markStatusSatisfied(&status, SatisfactionCarriedForward, carriedProposalReview.EventID, carriedProposalReview.Digest)
+			} else if verification, ok := verificationCoversObligation(resultEvidence, manifestRef.Digest, proposalDigest, activePolicyDigest, obligation); ok {
+				markStatusSatisfied(&status, SatisfactionVerificationEvidence, verification.EventID, verification.Digest)
 			} else if refutations := reviewresult.DeterministicRefutationsForObligation(resultEvidence, manifestRef.Digest, obligation.ID); len(refutations) > 0 {
 				markStatusSatisfied(&status, SatisfactionDeterministicRefute, refutations[0].EventID, refutations[0].Digest)
 			} else {
@@ -491,6 +502,22 @@ func requiredGateSnapshot(manifest CoverageManifest) (string, string) {
 	return "", ""
 }
 
+func proposalTargetDigest(manifest CoverageManifest) string {
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == "base" && diff.ToKind == "proposal" {
+			return diff.ToSnapshot
+		}
+	}
+	return ""
+}
+
+func policyDigest(policy *PolicyRef) string {
+	if policy == nil {
+		return ""
+	}
+	return policy.Digest
+}
+
 func gateEvidenceMatchesPolicy(evidence gate.EvidenceRecord, manifestPolicy *PolicyRef) bool {
 	if manifestPolicy == nil {
 		return evidence.Policy == nil
@@ -512,6 +539,129 @@ func markStatusSatisfied(status *ObligationStatus, kind, eventID, digest string)
 	status.Satisfied = true
 	status.SatisfiedBy = append(status.SatisfiedBy, EvidenceRef{Kind: kind, EventID: eventID, Digest: digest})
 	status.UnsatisfiedSatisfactionKinds = []string{}
+}
+
+func verificationCoversObligation(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string, obligation Obligation) (reviewresult.EvidenceObservation, bool) {
+	for _, observation := range observations {
+		record := observation.Record
+		if record.Packet.CoverageManifest.Digest != manifestDigest || record.RunKind != reviewresult.RunKindVerification {
+			continue
+		}
+		if !hasPositiveFixVerification(record) {
+			continue
+		}
+		findingID := strings.TrimSpace(record.Packet.VerificationFindingID)
+		if findingID == "" {
+			findingID = firstVerifiedFindingID(record)
+		}
+		if findingID == "" {
+			continue
+		}
+		finding, ok := acceptedFindingForVerification(observations, manifestDigest, proposalDigest, policyDigest, findingID)
+		if !ok || !findingCoversObligation(finding, obligation) {
+			continue
+		}
+		return observation, true
+	}
+	return reviewresult.EvidenceObservation{}, false
+}
+
+func hasPositiveFixVerification(record reviewresult.ResultRecord) bool {
+	for _, outcome := range record.VerifierOutcomes {
+		if outcome.Basis != reviewresult.BasisFixVerification {
+			continue
+		}
+		if outcome.State == reviewresult.StateVerified || outcome.State == reviewresult.StateResolved {
+			return true
+		}
+	}
+	return false
+}
+
+func firstVerifiedFindingID(record reviewresult.ResultRecord) string {
+	for _, outcome := range record.VerifierOutcomes {
+		if outcome.Basis != reviewresult.BasisFixVerification {
+			continue
+		}
+		if outcome.State == reviewresult.StateVerified || outcome.State == reviewresult.StateResolved {
+			return strings.TrimSpace(outcome.FindingID)
+		}
+	}
+	return ""
+}
+
+func acceptedFindingForVerification(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest, findingID string) (reviewresult.FindingRecord, bool) {
+	for _, observation := range observations {
+		record := observation.Record
+		if record.Packet.CoverageManifest.Digest != manifestDigest && !carriedProposalRecordApplies(record, proposalDigest, policyDigest) {
+			continue
+		}
+		for _, finding := range record.Findings {
+			if finding.ID == findingID && finding.Accepted {
+				return finding, true
+			}
+		}
+	}
+	return reviewresult.FindingRecord{}, false
+}
+
+func carriedProposalRecordApplies(record reviewresult.ResultRecord, proposalDigest, policyDigest string) bool {
+	return record.Evidence.PrimaryReviewEvidence &&
+		proposalDigest != "" &&
+		record.Packet.TargetState.Kind == "proposal" &&
+		record.Packet.TargetState.Digest == proposalDigest &&
+		resultPacketPolicyMatches(record.Packet.Policy, policyDigest)
+}
+
+func resultPacketPolicyMatches(policy *reviewresult.PolicyRef, policyDigest string) bool {
+	policyDigest = strings.TrimSpace(policyDigest)
+	if policyDigest == "" {
+		return policy == nil || strings.TrimSpace(policy.Digest) == ""
+	}
+	return policy != nil && policy.Digest == policyDigest
+}
+
+func findingCoversObligation(finding reviewresult.FindingRecord, obligation Obligation) bool {
+	for _, surface := range finding.ExpectedFixSurface {
+		if referenceCoversObligation(surface.Path, surface.StartLine, surface.EndLine, obligation) {
+			return true
+		}
+	}
+	for _, anchorRef := range finding.Anchors {
+		if referenceCoversObligation(anchorRef.Path, anchorRef.StartLine, anchorRef.EndLine, obligation) {
+			return true
+		}
+	}
+	for _, citation := range finding.Citations {
+		if referenceCoversObligation(citation.Path, citation.StartLine, citation.EndLine, obligation) {
+			return true
+		}
+	}
+	return false
+}
+
+func referenceCoversObligation(path string, startLine, endLine int, obligation Obligation) bool {
+	if !pathMatchesObligation(path, obligation) {
+		return false
+	}
+	if obligation.StartLine <= 0 || startLine <= 0 {
+		return true
+	}
+	if obligation.EndLine <= 0 {
+		obligation.EndLine = obligation.StartLine
+	}
+	if endLine <= 0 {
+		endLine = startLine
+	}
+	return startLine <= obligation.EndLine && obligation.StartLine <= endLine
+}
+
+func pathMatchesObligation(path string, obligation Obligation) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	return path == obligation.Path || path == obligation.OldPath
 }
 
 func transitionDiff(binding diffBinding) TransitionDiff {
@@ -1226,17 +1376,31 @@ func transitionKey(fromKind, toKind, fromSnapshot, toSnapshot string) string {
 	return fromKind + "\x00" + toKind + "\x00" + fromSnapshot + "\x00" + toSnapshot
 }
 
-func contextBlockers(events []state.Event) []Blocker {
-	blockers := []Blocker{}
-	for _, event := range events {
-		if event.Type == "context.requested" || event.Type == "review.needs_context" || event.Details["needs_context"] == "true" {
-			blockers = append(blockers, Blocker{
-				Code:    "needs_context",
-				Message: "a context request is recorded and must be resolved before closure",
-			})
+func contextBlockers(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string) []Blocker {
+	for _, observation := range observations {
+		record := observation.Record
+		if record.Packet.CoverageManifest.Digest != manifestDigest || record.RunKind != reviewresult.RunKindDiscovery {
+			continue
+		}
+		return contextBlockerForRecord(record)
+	}
+	if proposalDigest != "" {
+		observation, ok := reviewresult.LatestDiscoveryForTargetState(observations, proposalDigest, policyDigest)
+		if ok {
+			return contextBlockerForRecord(observation.Record)
 		}
 	}
-	return blockers
+	return nil
+}
+
+func contextBlockerForRecord(record reviewresult.ResultRecord) []Blocker {
+	if record.Outcome != reviewresult.OutcomeNeedsContext && len(record.NeedsContext) == 0 {
+		return nil
+	}
+	return []Blocker{{
+		Code:    "needs_context",
+		Message: "latest discovery review requested context and must be resolved before closure",
+	}}
 }
 
 func stateBindingFromState(stateDir string) (stateBinding, error) {

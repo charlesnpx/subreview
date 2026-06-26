@@ -845,6 +845,253 @@ func TestResultImportCLI(t *testing.T) {
 	}
 }
 
+func TestCloseCLIEndToEndSmoke(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "subreview")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build subreview: %v\n%s", err, out)
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initCLIGitRepo(t, repo)
+	writeCLIFile(t, repo, "alpha.txt", "one\n")
+	runCLIGit(t, repo, "add", ".")
+	runCLIGit(t, repo, "commit", "-m", "initial")
+
+	passCommand := cliGateCommand("go_test_all", "test -f alpha.txt")
+	catalogPath := filepath.Join(root, "gate-catalog.json")
+	writeCLIGateCatalog(t, catalogPath, passCommand)
+	policyPath := filepath.Join(root, "policy.json")
+	if err := os.WriteFile(policyPath, []byte(`{
+  "schema_version": 1,
+  "policy_id": "v1-default",
+  "profiles": {
+    "default": {
+      "gate_requirements": [
+        {"command_id": "go_test_all", "command_digest": "`+gate.CommandDigest(passCommand)+`", "required": true}
+      ],
+      "route_limits": {
+        "primary_semantic_reviews": 1,
+        "targeted_verifications": 1,
+        "fresh_final_reviews": 0,
+        "context_expansion_rounds": 1
+      },
+      "required_evidence_facts": [
+        "required_gates_satisfied",
+        "primary_review_completed",
+        "blocking_findings_verified",
+        "coverage_obligations_satisfied",
+        "context_requests_resolved",
+        "basis_fixed",
+        "policy_bound"
+      ],
+      "risk_routing": [],
+      "closure_basis": {
+        "allowed_basis": ["clean", "fixed", "deterministic_refutation"],
+        "require_basis_for_unresolved": true
+      }
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write policy config: %v", err)
+	}
+	if out, err := exec.Command(bin, "state", "init", "--state", stateDir, "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("state init failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "policy", "bind", "--state", stateDir, "--config", policyPath, "--profile", "default", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("policy bind failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "base", "--repo", repo, "--ref", "HEAD", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("snapshot base failed: %v\n%s", err, out)
+	}
+	writeCLIFile(t, repo, "alpha.txt", "one\nbug\n")
+	if out, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "proposal", "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("snapshot proposal failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "proposal", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("diff base->proposal failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "obligations", "build", "--state", stateDir, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("proposal obligations build failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "gates", "run", "--state", stateDir, "--catalog", catalogPath, "--command-id", "go_test_all", "--snapshot", "proposal", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("proposal gate run failed: %v\n%s", err, out)
+	}
+	packetOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "primary", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("primary packet build failed: %v\n%s", err, packetOut)
+	}
+	var primary struct {
+		Packet struct {
+			Digest string `json:"digest"`
+		} `json:"packet"`
+	}
+	if err := json.Unmarshal(packetOut, &primary); err != nil {
+		t.Fatalf("primary packet output is not json: %v\n%s", err, packetOut)
+	}
+	if primary.Packet.Digest == "" {
+		t.Fatalf("missing primary packet digest: %s", packetOut)
+	}
+	findingOut, err := exec.Command(bin, "result", "import", "--state", stateDir, "--packet", primary.Packet.Digest, "--result", writeCLIWorkerResult(t, reviewresult.WorkerResult{
+		SchemaVersion: reviewresult.SchemaVersion,
+		Packet:        primary.Packet.Digest,
+		RunKind:       reviewresult.RunKindDiscovery,
+		Route:         reviewresult.RoutePrimaryReview,
+		Outcome:       reviewresult.OutcomeFindings,
+		Summary:       "The proposal has one actionable finding.",
+		Findings: []reviewresult.FindingInput{{
+			ID:              "finding-close",
+			Severity:        "high",
+			Class:           "correctness",
+			Claim:           "alpha.txt keeps the bug marker in the proposed final content.",
+			FailureScenario: "A caller that reads alpha.txt observes the bug marker instead of the fixed value.",
+			Citations:       []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 2}},
+			Anchors:         []reviewresult.AnchorRef{{Kind: "hunk", Path: "alpha.txt", StartLine: 1, EndLine: 2}},
+		}},
+		Telemetry: reviewresult.TokenTelemetry{
+			GrossDiscoveryTokens:       210,
+			IncrementalDiscoveryTokens: 180,
+			OutputTokens:               30,
+		},
+	}), "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("finding result import failed: %v\n%s", err, findingOut)
+	}
+	writeCLIFile(t, repo, "alpha.txt", "one\nfixed\n")
+	if out, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "final", "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("snapshot final failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "final", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("diff base->final failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "proposal", "--to", "final", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("diff proposal->final failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "obligations", "build", "--state", stateDir, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("final obligations build failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "gates", "run", "--state", stateDir, "--catalog", catalogPath, "--command-id", "go_test_all", "--snapshot", "final", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("final gate run failed: %v\n%s", err, out)
+	}
+	verificationOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "verification", "--finding", "finding-close", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("verification packet build failed: %v\n%s", err, verificationOut)
+	}
+	var verification struct {
+		Packet struct {
+			Digest string `json:"digest"`
+		} `json:"packet"`
+		Verification struct {
+			FindingID          string `json:"finding_id"`
+			ProposalFinalPatch string `json:"proposal_final_patch"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal(verificationOut, &verification); err != nil {
+		t.Fatalf("verification packet output is not json: %v\n%s", err, verificationOut)
+	}
+	if verification.Packet.Digest == "" || verification.Verification.FindingID != "finding-close" || verification.Verification.ProposalFinalPatch == "" {
+		t.Fatalf("bad verification packet output: %s", verificationOut)
+	}
+	if out, err := exec.Command(bin, "result", "import", "--state", stateDir, "--packet", verification.Packet.Digest, "--result", writeCLIWorkerResult(t, reviewresult.WorkerResult{
+		SchemaVersion: reviewresult.SchemaVersion,
+		Packet:        verification.Packet.Digest,
+		RunKind:       reviewresult.RunKindVerification,
+		Route:         reviewresult.RouteTargetedVerification,
+		Outcome:       reviewresult.OutcomeVerification,
+		Summary:       "The finding is fixed in the final state.",
+		VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
+			FindingID:        "finding-close",
+			Outcome:          reviewresult.VerificationResolved,
+			State:            reviewresult.StateVerified,
+			Basis:            reviewresult.BasisFixVerification,
+			Summary:          "alpha.txt now contains fixed rather than bug.",
+			VerifierRelation: reviewresult.RelationFreshBlinded,
+			RelationEvidence: reviewresult.RelationEvidenceCLIWitnessed,
+		}},
+		Telemetry: reviewresult.TokenTelemetry{
+			GrossVerificationTokens:       130,
+			IncrementalVerificationTokens: 95,
+			OutputTokens:                  18,
+		},
+	}), "--json").CombinedOutput(); err != nil {
+		t.Fatalf("verification result import failed: %v\n%s", err, out)
+	}
+	closeOut, err := exec.Command(bin, "close", "--state", stateDir, "--policy-profile", "default", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("close failed: %v\n%s", err, closeOut)
+	}
+	var closeResult struct {
+		Closed bool `json:"closed"`
+		Report struct {
+			Digest string `json:"digest"`
+			Path   string `json:"path"`
+		} `json:"report"`
+		Facts struct {
+			RequiredGatesSatisfied       bool `json:"required_gates_satisfied"`
+			PrimaryReviewCompleted       bool `json:"primary_review_completed"`
+			BlockingFindingsVerified     bool `json:"blocking_findings_verified"`
+			CoverageObligationsSatisfied bool `json:"coverage_obligations_satisfied"`
+			ContextRequestsResolved      bool `json:"context_requests_resolved"`
+			BasisFixed                   bool `json:"basis_fixed"`
+			FreshBlindedReview           bool `json:"fresh_blinded_review"`
+			CLIWitnessed                 bool `json:"cli_witnessed"`
+		} `json:"facts"`
+		Gates struct {
+			RequiredCount int `json:"required_count"`
+			PassCount     int `json:"pass_count"`
+		} `json:"gates"`
+		Findings struct {
+			AcceptedCount     int `json:"accepted_count"`
+			OpenBlockingCount int `json:"open_blocking_count"`
+		} `json:"findings"`
+		Runs struct {
+			DiscoveryRuns         int `json:"discovery_runs"`
+			VerificationRuns      int `json:"verification_runs"`
+			PrimaryRuns           int `json:"primary_runs"`
+			TargetedVerifications int `json:"targeted_verifications"`
+		} `json:"runs"`
+		Tokens struct {
+			FullCycle struct {
+				Available         bool `json:"available"`
+				IncrementalTokens int  `json:"incremental_tokens"`
+			} `json:"full_cycle_estimate"`
+		} `json:"tokens"`
+		Scheduler struct {
+			AntiThrashOK bool `json:"anti_thrash_ok"`
+		} `json:"scheduler"`
+		Blockers []struct {
+			Code string `json:"code"`
+		} `json:"blockers"`
+	}
+	if err := json.Unmarshal(closeOut, &closeResult); err != nil {
+		t.Fatalf("close output is not json: %v\n%s", err, closeOut)
+	}
+	if !closeResult.Closed || len(closeResult.Blockers) != 0 {
+		t.Fatalf("expected closure success: %s", closeOut)
+	}
+	if !closeResult.Facts.RequiredGatesSatisfied || !closeResult.Facts.PrimaryReviewCompleted || !closeResult.Facts.BlockingFindingsVerified || !closeResult.Facts.CoverageObligationsSatisfied || !closeResult.Facts.ContextRequestsResolved || !closeResult.Facts.BasisFixed || !closeResult.Facts.FreshBlindedReview || !closeResult.Facts.CLIWitnessed {
+		t.Fatalf("closure facts incomplete: %s", closeOut)
+	}
+	if closeResult.Gates.RequiredCount != 1 || closeResult.Gates.PassCount != 2 || closeResult.Findings.AcceptedCount != 1 || closeResult.Findings.OpenBlockingCount != 0 {
+		t.Fatalf("bad gate/finding report: %s", closeOut)
+	}
+	if closeResult.Runs.DiscoveryRuns != 1 || closeResult.Runs.VerificationRuns != 1 || closeResult.Runs.PrimaryRuns != 1 || closeResult.Runs.TargetedVerifications != 1 {
+		t.Fatalf("bad run report: %s", closeOut)
+	}
+	if !closeResult.Tokens.FullCycle.Available || closeResult.Tokens.FullCycle.IncrementalTokens != 275 || !closeResult.Scheduler.AntiThrashOK {
+		t.Fatalf("bad token or scheduler report: %s", closeOut)
+	}
+	if closeResult.Report.Digest == "" || closeResult.Report.Path == "" {
+		t.Fatalf("closure report object missing: %s", closeOut)
+	}
+	if _, err := os.Stat(closeResult.Report.Path); err != nil {
+		t.Fatalf("closure report path should exist %s: %v", closeResult.Report.Path, err)
+	}
+	if out, err := exec.Command(bin, "state", "validate", "--state", stateDir, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("state validate failed after closure: %v\n%s", err, out)
+	}
+}
+
 func initCLIGitRepo(t *testing.T, repo string) {
 	t.Helper()
 	if err := os.MkdirAll(repo, 0o755); err != nil {

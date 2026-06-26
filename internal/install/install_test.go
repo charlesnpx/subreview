@@ -94,7 +94,7 @@ func TestRunInstallStagedAllTargets(t *testing.T) {
 		for _, want := range []string{
 			"subreview version",
 			"subreview install-skills --plan --target all --json",
-			"V1 workflow commands are being implemented across later stories",
+			"subreview close --state <dir> --policy-profile <name> --json",
 			"Do not simulate unsupported `subreview` commands in prose",
 			"explicit `--state <dir>` path",
 			"Do not create hidden default state directories",
