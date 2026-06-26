@@ -48,6 +48,15 @@
     "blocks_closure": false
   },
   {
+    "id": "hunk_copied_elsewhere",
+    "status": "ambiguous",
+    "candidates": [
+      "copy-source.txt:1-1",
+      "copy-dest.txt:1-1"
+    ],
+    "blocks_closure": true
+  },
+  {
     "id": "file_unresolved",
     "status": "unresolved",
     "blocks_closure": true

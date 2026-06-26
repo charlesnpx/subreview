@@ -359,22 +359,11 @@ func migrateHunkAnchor(anchor Anchor, from, to snapshotView) AnchorResult {
 		return result
 	}
 	samePath, samePathExists := to.Files[anchor.Path]
+	samePathMatches := []AnchorLocation{}
 	if samePathExists {
-		occurrences := findTextOccurrences(samePath.Body, fromText, anchor.Path, samePath.Digest)
-		if len(occurrences) == 1 {
-			status := StatusMoved
-			reason := "hunk moved within the same file"
-			if occurrences[0].StartLine == anchor.StartLine && occurrences[0].EndLine == anchor.EndLine {
-				status = StatusUnchanged
-				reason = "hunk text remains at the same location"
-			}
-			return AnchorResult{Anchor: anchor, Status: status, From: fromLoc, To: &occurrences[0], Reason: reason}
-		}
-		if len(occurrences) > 1 {
-			return blocker(AnchorResult{Anchor: anchor, Status: StatusAmbiguous, From: fromLoc, Candidates: occurrences, Reason: "hunk text appears multiple times in target file"})
-		}
+		samePathMatches = findTextOccurrences(samePath.Body, fromText, anchor.Path, samePath.Digest)
 	}
-	allMatches := []AnchorLocation{}
+	allMatches := append([]AnchorLocation(nil), samePathMatches...)
 	for _, file := range sortedFiles(to.Files) {
 		if samePathExists && file.Path == anchor.Path {
 			continue
@@ -394,9 +383,18 @@ func migrateHunkAnchor(anchor Anchor, from, to snapshotView) AnchorResult {
 		}
 		return AnchorResult{Anchor: anchor, Status: StatusDeleted, From: fromLoc, Reason: "hunk path and text are absent from target snapshot"}
 	case 1:
+		if samePathExists && allMatches[0].Path == anchor.Path {
+			status := StatusMoved
+			reason := "hunk moved within the same file"
+			if allMatches[0].StartLine == anchor.StartLine && allMatches[0].EndLine == anchor.EndLine {
+				status = StatusUnchanged
+				reason = "hunk text remains at the same location"
+			}
+			return AnchorResult{Anchor: anchor, Status: status, From: fromLoc, To: &allMatches[0], Reason: reason}
+		}
 		return AnchorResult{Anchor: anchor, Status: StatusMoved, From: fromLoc, To: &allMatches[0], Reason: "hunk moved to unique target path"}
 	default:
-		return blocker(AnchorResult{Anchor: anchor, Status: StatusAmbiguous, From: fromLoc, Candidates: allMatches, Reason: "hunk text appears at multiple target paths"})
+		return blocker(AnchorResult{Anchor: anchor, Status: StatusAmbiguous, From: fromLoc, Candidates: allMatches, Reason: "hunk text appears at multiple target locations"})
 	}
 }
 

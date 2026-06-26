@@ -36,6 +36,7 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 	writeFile(t, repo, "rename-old.txt", "same\n")
 	writeFile(t, repo, "ambiguous.txt", "dup\n")
 	writeFile(t, repo, "source.txt", "move-me\nstay\n")
+	writeFile(t, repo, "copy-source.txt", "copy-me\n")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-m", "initial")
 	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
@@ -56,6 +57,7 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 	writeFile(t, repo, "ambiguous.txt", "dup\nmiddle\ndup\n")
 	writeFile(t, repo, "source.txt", "stay\n")
 	writeFile(t, repo, "dest.txt", "move-me\n")
+	writeFile(t, repo, "copy-dest.txt", "copy-me\n")
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
 		t.Fatalf("Capture proposal: %v", err)
 	}
@@ -75,6 +77,7 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 			{ID: "file_renamed", Kind: KindFile, Path: "rename-old.txt"},
 			{ID: "hunk_ambiguous", Kind: KindHunk, Path: "ambiguous.txt", StartLine: 1, EndLine: 1, Text: "dup\n"},
 			{ID: "hunk_moved_to_other_file", Kind: KindHunk, Path: "source.txt", StartLine: 1, EndLine: 1, Text: "move-me\n"},
+			{ID: "hunk_copied_elsewhere", Kind: KindHunk, Path: "copy-source.txt", StartLine: 1, EndLine: 1, Text: "copy-me\n"},
 			{ID: "file_unresolved", Kind: KindFile, Path: "missing.txt"},
 		},
 	})
@@ -84,7 +87,7 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 	if result.EventID == "" || result.Migration.Digest == "" || result.AnchorManifest.Digest == "" {
 		t.Fatalf("expected migration ledger and CAS refs: %+v", result)
 	}
-	if len(result.ClosureBlockers) != 2 {
+	if len(result.ClosureBlockers) != 3 {
 		t.Fatalf("expected ambiguous and unresolved closure blockers, got %+v", result.ClosureBlockers)
 	}
 	for _, blocker := range result.ClosureBlockers {
