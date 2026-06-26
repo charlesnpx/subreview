@@ -360,7 +360,7 @@ func writePolicyConfig(t *testing.T, root string) string {
   "policy_id": "test-policy",
   "profiles": {
     "default": {
-      "gate_requirements": [{"command_id": "go_test_all", "required": true}],
+      "gate_requirements": [{"command_id": "go_test_all", "command_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "required": true}],
       "route_limits": {"primary_semantic_reviews": 1, "targeted_verifications": 1, "fresh_final_reviews": 0, "context_expansion_rounds": 1},
       "required_evidence_facts": ["required_gates_satisfied", "primary_review_completed", "blocking_findings_verified", "coverage_obligations_satisfied", "policy_bound"],
       "risk_routing": [],

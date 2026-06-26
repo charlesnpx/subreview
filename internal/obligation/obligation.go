@@ -350,7 +350,7 @@ func Status(opts StatusOptions) (StatusResult, error) {
 			status.UnsatisfiedSatisfactionKinds = []string{}
 		}
 		if obligation.Kind == KindGateRequirement && obligation.Required {
-			evidence, ok, sawStale := latestGateEvidenceForManifest(gateEvidence[obligation.CommandID], manifest)
+			evidence, ok, sawStale := latestGateEvidenceForManifest(gateEvidence[obligation.CommandID], manifest, expectedGateCommandDigest(obligation))
 			switch {
 			case !ok && sawStale:
 				status.Blockers = append(status.Blockers, Blocker{
@@ -424,16 +424,23 @@ func Status(opts StatusOptions) (StatusResult, error) {
 	}, nil
 }
 
-func latestGateEvidenceForManifest(observations []gate.EvidenceObservation, manifest CoverageManifest) (gate.EvidenceObservation, bool, bool) {
+func latestGateEvidenceForManifest(observations []gate.EvidenceObservation, manifest CoverageManifest, expectedCommandDigest string) (gate.EvidenceObservation, bool, bool) {
 	sawStale := false
 	for _, observation := range observations {
-		if !gateEvidenceMatchesSnapshot(observation.Record, manifest) || !gateEvidenceMatchesPolicy(observation.Record, manifest.Policy) {
+		if expectedCommandDigest == "" || observation.Record.CommandDigest != expectedCommandDigest || !gateEvidenceMatchesSnapshot(observation.Record, manifest) || !gateEvidenceMatchesPolicy(observation.Record, manifest.Policy) {
 			sawStale = true
 			continue
 		}
 		return observation, true, sawStale
 	}
 	return gate.EvidenceObservation{}, false, sawStale
+}
+
+func expectedGateCommandDigest(obligation Obligation) string {
+	if obligation.Metadata == nil {
+		return ""
+	}
+	return obligation.Metadata["command_digest"]
 }
 
 func gateEvidenceMatchesSnapshot(evidence gate.EvidenceRecord, manifest CoverageManifest) bool {
@@ -572,6 +579,9 @@ func policyObligations(effective policy.EffectivePolicy) []Obligation {
 			CommandID:                 gate.CommandID,
 			Fact:                      "required_gates_satisfied",
 			RequiredSatisfactionKinds: []string{SatisfactionGateEvidence},
+			Metadata: map[string]string{
+				"command_digest": gate.CommandDigest,
+			},
 		})
 	}
 	if policyRequiresIndependentFinal(effective) {

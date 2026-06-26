@@ -79,8 +79,8 @@ func TestPolicyCheckBindAndExplainCLI(t *testing.T) {
   "profiles": {
     "default": {
       "gate_requirements": [
-        {"command_id": "go_test_all", "required": true},
-        {"command_id": "subreview_state_validate", "required": true}
+        {"command_id": "go_test_all", "command_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "required": true},
+        {"command_id": "subreview_state_validate", "command_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "required": true}
       ],
       "route_limits": {
         "primary_semantic_reviews": 1,
@@ -185,7 +185,7 @@ func TestGatesCheckRunAndRecordCLI(t *testing.T) {
   "profiles": {
     "default": {
       "gate_requirements": [
-        {"command_id": "go_test_all", "required": true}
+        {"command_id": "go_test_all", "command_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "required": true}
       ],
       "route_limits": {
         "primary_semantic_reviews": 1,
@@ -359,7 +359,7 @@ func TestSnapshotCaptureRestoreAndDiffCLI(t *testing.T) {
   "profiles": {
     "default": {
       "gate_requirements": [
-        {"command_id": "go_test_all", "required": true}
+        {"command_id": "go_test_all", "command_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "required": true}
       ],
       "route_limits": {
         "primary_semantic_reviews": 1,

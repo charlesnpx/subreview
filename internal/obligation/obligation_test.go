@@ -60,6 +60,9 @@ func TestBuildAndStatusReportUnsatisfiedEvidenceSlots(t *testing.T) {
 	assertHasObligation(t, manifest.Obligations, KindChangedHunk, "base->proposal", "alpha.txt")
 	assertHasObligation(t, manifest.Obligations, KindChangedHunk, "base->final", "alpha.txt")
 	assertHasObligation(t, manifest.Obligations, KindGateRequirement, "", "")
+	if gateObligation := findGateObligation(t, manifest.Obligations, "go_test_all"); gateObligation.Metadata["command_digest"] != testGateCommandDigest("go_test_all") {
+		t.Fatalf("gate obligation should record command digest, got %+v", gateObligation)
+	}
 	assertHasObligation(t, manifest.Obligations, KindPolicyFinalReview, "", "")
 	assertHasObligation(t, manifest.Obligations, KindContextRequest, "", "")
 
@@ -185,6 +188,34 @@ func TestGateEvidenceUsesLatestManifestMatchingRecord(t *testing.T) {
 	}
 	if hasBlocker(status.Blockers, "stale_gate_evidence") {
 		t.Fatalf("later stale evidence should not mask matching final evidence: %+v", status.Blockers)
+	}
+}
+
+func TestGateEvidenceMustMatchPolicyCommandDigest(t *testing.T) {
+	_, stateDir := initializedStateWithBuiltObligations(t)
+	mismatchedCatalogPath := writeGateCatalogCommand(t, t.TempDir(), "go_test_all", "printf different")
+	if _, err := gate.Record(gate.RecordOptions{
+		StateDir:     stateDir,
+		CatalogPath:  mismatchedCatalogPath,
+		CommandID:    "go_test_all",
+		SnapshotKind: "final",
+		Outcome:      gate.OutcomePass,
+		Provenance:   gate.ProvenanceExternalAsserted,
+		Diagnostic:   "external pass from different catalog",
+		Now:          time.Unix(200, 0),
+	}); err != nil {
+		t.Fatalf("Record mismatched gate pass: %v", err)
+	}
+	status, err := Status(StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	gateStatus := gateObligationStatus(t, status, "go_test_all")
+	if gateStatus.Satisfied {
+		t.Fatalf("mismatched command digest should not satisfy obligation: %+v", gateStatus)
+	}
+	if !hasBlocker(status.Blockers, "stale_gate_evidence") {
+		t.Fatalf("mismatched command digest should be stale evidence: %+v", status.Blockers)
 	}
 }
 
@@ -586,27 +617,41 @@ func initializedStateWithBuiltObligations(t *testing.T) (string, string) {
 
 func writeGateCatalog(t *testing.T, root, commandID string) string {
 	t.Helper()
-	body := []byte(`{
-  "schema_version": 1,
-  "commands": [
-    {
-      "id": "` + commandID + `",
-      "argv": ["/bin/sh", "-c", "printf ok"],
-      "working_dir": ".",
-      "replay_class": "environment_bound",
-      "environment_pinned": true,
-      "executes_repo_code": true,
-      "side_effects": "none",
-      "timeout_seconds": 5
-    }
-  ]
+	return writeGateCatalogCommand(t, root, commandID, "printf ok")
 }
-`)
+
+func writeGateCatalogCommand(t *testing.T, root, commandID, script string) string {
+	t.Helper()
+	body, err := json.MarshalIndent(gate.Catalog{
+		SchemaVersion: gate.SchemaVersion,
+		Commands:      []gate.CommandDefinition{testGateCommand(commandID, script)},
+	}, "", "  ")
+	if err != nil {
+		t.Fatalf("Marshal gate catalog: %v", err)
+	}
 	path := filepath.Join(root, "gate-catalog.json")
-	if err := os.WriteFile(path, body, 0o644); err != nil {
+	if err := os.WriteFile(path, append(body, '\n'), 0o644); err != nil {
 		t.Fatalf("write gate catalog: %v", err)
 	}
 	return path
+}
+
+func testGateCommand(commandID, script string) gate.CommandDefinition {
+	return gate.CommandDefinition{
+		ID:                commandID,
+		Argv:              []string{"/bin/sh", "-c", script},
+		WorkingDir:        ".",
+		ReplayClass:       gate.ReplayEnvironmentBound,
+		EnvironmentPinned: true,
+		ExecutesRepoCode:  true,
+		SideEffects:       gate.SideEffectsNone,
+		TimeoutSeconds:    5,
+		AllowedExitCodes:  []int{0},
+	}
+}
+
+func testGateCommandDigest(commandID string) string {
+	return gate.CommandDigest(testGateCommand(commandID, "printf ok"))
 }
 
 func gateObligationStatus(t *testing.T, status StatusResult, commandID string) ObligationStatus {
@@ -618,6 +663,17 @@ func gateObligationStatus(t *testing.T, status StatusResult, commandID string) O
 	}
 	t.Fatalf("missing gate obligation for %s: %+v", commandID, status.Obligations)
 	return ObligationStatus{}
+}
+
+func findGateObligation(t *testing.T, obligations []Obligation, commandID string) Obligation {
+	t.Helper()
+	for _, obligation := range obligations {
+		if obligation.Kind == KindGateRequirement && obligation.CommandID == commandID {
+			return obligation
+		}
+	}
+	t.Fatalf("missing gate obligation for %s: %+v", commandID, obligations)
+	return Obligation{}
 }
 
 func initializedReviewState(t *testing.T) (string, string) {
@@ -652,7 +708,7 @@ func bindDefaultPolicy(t *testing.T, stateDir, repo string, independentFinal boo
 		Profiles: map[string]policy.Profile{
 			"default": {
 				GateRequirements: []policy.GateRequirement{
-					{CommandID: "go_test_all", Required: true},
+					{CommandID: "go_test_all", CommandDigest: testGateCommandDigest("go_test_all"), Required: true},
 				},
 				RouteLimits: policy.RouteLimits{
 					PrimarySemanticReviews: 1,
