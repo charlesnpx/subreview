@@ -161,6 +161,41 @@ func TestCreateDiffFailsWhenSnapshotIsMissing(t *testing.T) {
 	}
 }
 
+func TestGitNoIndexDiffIgnoresExternalDiff(t *testing.T) {
+	root := t.TempDir()
+	workdir := filepath.Join(root, "diff")
+	if err := os.MkdirAll(filepath.Join(workdir, "from"), 0o755); err != nil {
+		t.Fatalf("mkdir from: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workdir, "to"), 0o755); err != nil {
+		t.Fatalf("mkdir to: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "from", "alpha.txt"), []byte("one\n"), 0o644); err != nil {
+		t.Fatalf("write from: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "to", "alpha.txt"), []byte("two\n"), 0o644); err != nil {
+		t.Fatalf("write to: %v", err)
+	}
+	externalDiff := filepath.Join(root, "external-diff.sh")
+	if err := os.WriteFile(externalDiff, []byte("#!/bin/sh\necho EXTERNAL_DIFF_SHOULD_NOT_RUN\n"), 0o755); err != nil {
+		t.Fatalf("write external diff: %v", err)
+	}
+	t.Setenv("GIT_EXTERNAL_DIFF", externalDiff)
+
+	patch, err := gitNoIndexDiff(workdir)
+	if err != nil {
+		t.Fatalf("gitNoIndexDiff: %v", err)
+	}
+	if strings.Contains(string(patch), "EXTERNAL_DIFF_SHOULD_NOT_RUN") {
+		t.Fatalf("patch used external diff output:\n%s", patch)
+	}
+	for _, want := range []string{"diff --git from/alpha.txt to/alpha.txt", "-one", "+two"} {
+		if !strings.Contains(string(patch), want) {
+			t.Fatalf("patch missing %q:\n%s", want, patch)
+		}
+	}
+}
+
 func TestRestoreRejectsSnapshotEventTreeMismatch(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")

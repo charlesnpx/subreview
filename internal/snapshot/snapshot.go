@@ -945,9 +945,9 @@ func sameOutputParentPath(absDir, realDir string) bool {
 }
 
 func gitNoIndexDiff(workdir string) ([]byte, error) {
-	cmd := exec.Command("git", "diff", "--no-index", "--binary", "--no-prefix", "from", "to")
+	cmd := exec.Command("git", "diff", "--no-ext-diff", "--no-index", "--binary", "--no-prefix", "from", "to")
 	cmd.Dir = workdir
-	out, err := cmd.CombinedOutput()
+	out, err := cmd.Output()
 	if err == nil {
 		return out, nil
 	}
@@ -955,7 +955,10 @@ func gitNoIndexDiff(workdir string) ([]byte, error) {
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 		return out, nil
 	}
-	return nil, fmt.Errorf("git diff --no-index failed: %w\n%s", err, out)
+	if errors.As(err, &exitErr) {
+		return nil, fmt.Errorf("git diff --no-index failed: %w\n%s", err, exitErr.Stderr)
+	}
+	return nil, err
 }
 
 func cleanRepoPath(path string) (string, error) {
