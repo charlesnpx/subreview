@@ -244,17 +244,18 @@ type ResultRecord struct {
 }
 
 type PacketRef struct {
-	Digest               string          `json:"digest"`
-	EventID              string          `json:"event_id"`
-	Kind                 string          `json:"kind"`
-	RunKind              string          `json:"run_kind"`
-	Route                string          `json:"route"`
-	PromptDigest         string          `json:"prompt_digest"`
-	StableDigest         string          `json:"stable_digest"`
-	SemanticDedupeDigest string          `json:"semantic_dedupe_digest"`
-	CoverageManifest     state.ObjectRef `json:"coverage_manifest"`
-	TargetState          SnapshotRef     `json:"target_state"`
-	SourceCompleteness   string          `json:"source_completeness"`
+	Digest                string          `json:"digest"`
+	EventID               string          `json:"event_id"`
+	Kind                  string          `json:"kind"`
+	RunKind               string          `json:"run_kind"`
+	Route                 string          `json:"route"`
+	PromptDigest          string          `json:"prompt_digest"`
+	StableDigest          string          `json:"stable_digest"`
+	SemanticDedupeDigest  string          `json:"semantic_dedupe_digest"`
+	CoverageManifest      state.ObjectRef `json:"coverage_manifest"`
+	TargetState           SnapshotRef     `json:"target_state"`
+	SourceCompleteness    string          `json:"source_completeness"`
+	VerificationFindingID string          `json:"verification_finding_id,omitempty"`
 }
 
 type SnapshotRef struct {
@@ -339,6 +340,11 @@ type packetRecord struct {
 	SemanticDedupeKey struct {
 		Digest string `json:"digest"`
 	} `json:"semantic_dedupe_key"`
+	Verification struct {
+		Finding struct {
+			ID string `json:"id"`
+		} `json:"finding"`
+	} `json:"verification"`
 	SourceCompleteness string `json:"source_completeness"`
 }
 
@@ -611,8 +617,18 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 	if runKind == RunKindDiscovery && (packet.RunKind != runKind || packet.Route != route) {
 		return ResultRecord{}, fmt.Errorf("discovery result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
 	}
-	if len(input.VerifierOutcomes) > 0 && (packet.RunKind != runKind || packet.Route != route) {
-		return ResultRecord{}, fmt.Errorf("verification result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
+	if len(input.VerifierOutcomes) > 0 {
+		if packet.RunKind != runKind || packet.Route != route {
+			return ResultRecord{}, fmt.Errorf("verification result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
+		}
+		if packet.VerificationFindingID == "" {
+			return ResultRecord{}, errors.New("verification packet is missing targeted finding_id")
+		}
+		for _, outcome := range input.VerifierOutcomes {
+			if strings.TrimSpace(outcome.FindingID) != packet.VerificationFindingID {
+				return ResultRecord{}, fmt.Errorf("verifier outcome finding_id %q does not match packet finding_id %q", outcome.FindingID, packet.VerificationFindingID)
+			}
+		}
 	}
 	outcome := strings.TrimSpace(input.Outcome)
 	if outcome == "" {
@@ -976,15 +992,22 @@ func normalizeVerifierOutcomes(input []VerifierOutcomeInput) ([]VerifierOutcome,
 			return nil, fmt.Errorf("invalid verification outcome: %s", outcome.Outcome)
 		}
 		stateValue := strings.TrimSpace(outcome.State)
-		if stateValue == "" && outcomeValue != "" {
-			stateValue = stateForVerificationOutcome(outcomeValue)
+		basis := strings.TrimSpace(outcome.Basis)
+		if outcomeValue != "" {
+			expectedState := stateForVerificationOutcome(outcomeValue)
+			if stateValue == "" {
+				stateValue = expectedState
+			} else if stateValue != expectedState {
+				return nil, fmt.Errorf("verification outcome %s conflicts with state %s", outcomeValue, stateValue)
+			}
+			if basis == "" {
+				basis = basisForVerificationOutcome(outcomeValue)
+			} else if !basisAllowedForVerificationOutcome(outcomeValue, basis) {
+				return nil, fmt.Errorf("verification outcome %s conflicts with basis %s", outcomeValue, basis)
+			}
 		}
 		if !validLifecycleState(stateValue) || stateValue == StateOpen || stateValue == StateRejectedStructural || stateValue == StateDuplicate {
 			return nil, fmt.Errorf("invalid verifier outcome state: %s", outcome.State)
-		}
-		basis := strings.TrimSpace(outcome.Basis)
-		if basis == "" && outcomeValue != "" {
-			basis = basisForVerificationOutcome(outcomeValue)
 		}
 		if !validVerifierBasis(basis) {
 			return nil, fmt.Errorf("invalid verifier outcome basis: %s", outcome.Basis)
@@ -1250,14 +1273,15 @@ func resolvePacket(store state.Store, events []state.Event, stateDir, repo, pack
 			return PacketRef{}, errors.New("packet missing coverage_manifest or target_state")
 		}
 		return PacketRef{
-			Digest:               digest,
-			EventID:              event.EventID,
-			Kind:                 record.Kind,
-			RunKind:              record.RunKind,
-			Route:                record.Route,
-			PromptDigest:         record.PromptDigest,
-			StableDigest:         record.StableDigest,
-			SemanticDedupeDigest: record.SemanticDedupeKey.Digest,
+			Digest:                digest,
+			EventID:               event.EventID,
+			Kind:                  record.Kind,
+			RunKind:               record.RunKind,
+			Route:                 record.Route,
+			PromptDigest:          record.PromptDigest,
+			StableDigest:          record.StableDigest,
+			SemanticDedupeDigest:  record.SemanticDedupeKey.Digest,
+			VerificationFindingID: strings.TrimSpace(record.Verification.Finding.ID),
 			CoverageManifest: state.ObjectRef{
 				Digest:    record.CoverageManifest.Digest,
 				MediaType: record.CoverageManifest.MediaType,
@@ -1510,6 +1534,19 @@ func basisForVerificationOutcome(value string) string {
 		return BasisDeterministicRefutation
 	default:
 		return BasisFixVerification
+	}
+}
+
+func basisAllowedForVerificationOutcome(outcome, basis string) bool {
+	switch outcome {
+	case VerificationResolved, VerificationNotResolved, VerificationRegressionIntroduced, VerificationInsufficientContext, VerificationUnexpectedScope:
+		return basis == BasisFixVerification
+	case VerificationFindingInvalid:
+		return basis == BasisFreshSemantic
+	case VerificationDeterministicRefuted:
+		return basis == BasisDeterministicRefutation || basis == BasisExecutableRefutation
+	default:
+		return false
 	}
 }
 

@@ -125,6 +125,55 @@ func TestImportRejectsVerifierOutcomeOnPrimaryPacket(t *testing.T) {
 	}
 }
 
+func TestImportRejectsVerifierOutcomeForDifferentFindingThanPacket(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	secondFinding := validFinding("finding-two")
+	secondFinding.Claim = "alpha.txt can also expose a separate downstream ordering defect."
+	secondFinding.FailureScenario = "A consumer observes the second line before the first line is initialized."
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings: []reviewresult.FindingInput{
+				validFinding("finding-one"),
+				secondFinding,
+			},
+		}),
+		Now: time.Unix(231, 0),
+	}); err != nil {
+		t.Fatalf("Import findings: %v", err)
+	}
+	verificationPacket := buildVerificationResultPacket(t, stateDir, "finding-one")
+	before := readEvents(t, stateDir)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: verificationPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        verificationPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
+				FindingID: "finding-two",
+				Outcome:   reviewresult.VerificationResolved,
+				Summary:   "This attempts to use finding-one context to close finding-two.",
+			}},
+		}),
+		Now: time.Unix(232, 0),
+	}); err == nil {
+		t.Fatal("verification packet should reject outcomes for another finding")
+	}
+	if after := readEvents(t, stateDir); len(after) != len(before) {
+		t.Fatalf("mismatched finding import should not append ledger event: before=%d after=%d", len(before), len(after))
+	}
+}
+
 func TestImportRejectsDiscoverySelfVerification(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	before := readEvents(t, stateDir)
@@ -287,6 +336,73 @@ func TestVerificationOutcomeVocabularyMapsToLifecycle(t *testing.T) {
 	observations := readObservations(t, stateDir)
 	if blockers := reviewresult.ActiveFindingBlockers(observations, built.CoverageManifest.Digest); len(blockers) != 0 {
 		t.Fatalf("resolved outcome should clear finding blocker: %+v", blockers)
+	}
+}
+
+func TestVerificationOutcomeRejectsContradictoryStateAndBasis(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("finding-one")},
+		}),
+		Now: time.Unix(239, 0),
+	}); err != nil {
+		t.Fatalf("Import finding: %v", err)
+	}
+	verificationPacket := buildVerificationResultPacket(t, stateDir, "finding-one")
+	before := readEvents(t, stateDir)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: verificationPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        verificationPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
+				FindingID: "finding-one",
+				Outcome:   reviewresult.VerificationResolved,
+				State:     reviewresult.StateNeedsConfirmation,
+				Summary:   "The outcome text and lifecycle state disagree.",
+			}},
+		}),
+		Now: time.Unix(239, 1),
+	}); err == nil {
+		t.Fatal("verification outcome should reject contradictory lifecycle state")
+	}
+	if after := readEvents(t, stateDir); len(after) != len(before) {
+		t.Fatalf("contradictory state should not append ledger event: before=%d after=%d", len(before), len(after))
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: verificationPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        verificationPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
+				FindingID: "finding-one",
+				Outcome:   reviewresult.VerificationNotResolved,
+				Basis:     reviewresult.BasisFreshSemantic,
+				Summary:   "The outcome text and evidence basis disagree.",
+			}},
+		}),
+		Now: time.Unix(239, 2),
+	}); err == nil {
+		t.Fatal("verification outcome should reject contradictory basis")
+	}
+	if after := readEvents(t, stateDir); len(after) != len(before) {
+		t.Fatalf("contradictory basis should not append ledger event: before=%d after=%d", len(before), len(after))
 	}
 }
 
