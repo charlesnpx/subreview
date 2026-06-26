@@ -51,6 +51,20 @@ func TestStateInitAndValidateCLI(t *testing.T) {
 	}
 }
 
+func TestHelpLiteralIsAcceptedAsFlagValue(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "subreview")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build subreview: %v\n%s", err, out)
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "help")
+	stateDir := filepath.Join(root, "state")
+	initCLIGitRepo(t, repo)
+	if out, err := exec.Command(bin, "state", "init", "--state", stateDir, "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("state init should accept repo path ending in help: %v\n%s", err, out)
+	}
+}
+
 func TestPolicyCheckBindAndExplainCLI(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "subreview")
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {

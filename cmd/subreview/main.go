@@ -575,7 +575,7 @@ Validates ledger JSONL, prior-event linkage, referenced CAS objects, and object 
 
 func hasHelpFlag(args []string) bool {
 	for _, arg := range args {
-		if arg == "-h" || arg == "--help" || arg == "help" {
+		if arg == "-h" || arg == "--help" {
 			return true
 		}
 	}
