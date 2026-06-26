@@ -21,6 +21,7 @@ subreview gates run --state /tmp/subreview-state --catalog /tmp/subreview-gates.
 subreview gates record --state /tmp/subreview-state --catalog /tmp/subreview-gates.json --command-id go_test_all --snapshot proposal --outcome pass --diagnostic "external CI passed" --json
 subreview obligations build --state /tmp/subreview-state --json
 subreview obligations status --state /tmp/subreview-state --json
+subreview packet build --state /tmp/subreview-state --kind primary --json
 subreview install-skills --plan --target all --json
 subreview install-skills --install --target all --json --install-root /tmp/subreview-stage
 subreview install-skills --uninstall --target all --json --install-root /tmp/subreview-stage
@@ -51,5 +52,7 @@ The installed skills are intentionally thin. They tell agents to invoke the CLI,
 `subreview gates check-catalog` validates an operator-authored trusted gate catalog and reports each command digest. Required policy gate requirements include the expected `command_digest`, so `subreview obligations status` only accepts evidence from the trusted command definition. `subreview gates run` executes only catalog command ids and stores CLI-witnessed gate evidence bound to the current policy and input snapshot. `subreview gates record` stores externally asserted gate evidence without executing commands. Gate evidence records replay class, environment pinning, repo-code execution, side-effect class, provenance, command digest, snapshot digest, outcome, and concise diagnostics. `subreview obligations status` consumes passing gate evidence for gate-requirement obligations and reports failed required gates as review blockers.
 
 `subreview obligations build` creates a CAS-backed coverage manifest from captured base-to-proposal and base-to-final diffs plus the bound policy. The manifest records hunk, file, path, gate-requirement, context-request placeholder, and policy-final-review obligations. `subreview obligations status` reports unsatisfied evidence slots and explicit blockers for missing gate evidence, missing review evidence, unresolved context, unresolved anchors, hidden final-state scope, and unsatisfied required checks. Story 007 intentionally records future evidence slots without importing review, gate, verification, or refutation adapters yet.
+
+`subreview packet build --kind primary` creates a CAS-backed primary review packet and Markdown prompt from the latest coverage manifest. Packets separate stable prefix and volatile suffix digests, include semantic dedupe keys, run-kind and route metadata, leakage checks for replay/evaluation labels, compact selected context, explicit omissions, and token telemetry fields for later worker result import.
 
 The existing `research/` corpus and `scripts/` utilities are research inputs for policy design and evaluation. They are separate from the v1 runtime CLI and are not imported or executed by `subreview` commands.

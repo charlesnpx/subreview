@@ -11,6 +11,7 @@ import (
 	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/install"
 	"github.com/charlesnpx/subreview/internal/obligation"
+	"github.com/charlesnpx/subreview/internal/packet"
 	"github.com/charlesnpx/subreview/internal/policy"
 	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
@@ -35,6 +36,8 @@ func main() {
 		err = installSkills(os.Args[2:])
 	case "obligations":
 		err = obligationsCommand(os.Args[2:])
+	case "packet":
+		err = packetCommand(os.Args[2:])
 	case "policy":
 		err = policyCommand(os.Args[2:])
 	case "snapshot":
@@ -64,6 +67,7 @@ func usage(w io.Writer) {
   subreview install-skills [--plan|--install|--uninstall] [--target tools|claude|codex|all] [--json] [--install-root <dir>]
   subreview obligations build --state <dir> [--json]
   subreview obligations status --state <dir> [--json]
+  subreview packet build --state <dir> --kind primary [--json]
   subreview policy check --config <path> --repo <path> [--json]
   subreview policy bind --state <dir> --config <path> --profile <name> [--json]
   subreview policy explain --state <dir> --profile <name> [--json]
@@ -72,6 +76,61 @@ func usage(w io.Writer) {
   subreview state init --state <dir> --repo <path> [--json]
   subreview state validate --state <dir> [--json]
   subreview version`)
+}
+
+func packetCommand(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("packet requires subcommand: build")
+	}
+	if isHelpCommand(args[0]) {
+		usagePacket(os.Stdout)
+		return nil
+	}
+	switch args[0] {
+	case "build":
+		return packetBuild(args[1:])
+	default:
+		return fmt.Errorf("packet requires subcommand: build")
+	}
+}
+
+func packetBuild(args []string) error {
+	if hasHelpFlag(args) {
+		usagePacketBuild(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("packet build", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	kind := fs.String("kind", packet.KindPrimary, "Packet kind")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("packet build does not accept positional arguments")
+	}
+	result, err := packet.Build(packet.BuildOptions{StateDir: *stateDir, Kind: *kind})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("packet built: %s markdown=%s stable=%s volatile=%s\n", result.Packet.Digest, result.Markdown.Digest, result.StableDigest, result.VolatileDigest)
+	return nil
+}
+
+func usagePacket(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview packet build --state <dir> --kind primary [--json]`)
+}
+
+func usagePacketBuild(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview packet build --state <dir> --kind primary [--json]
+
+Builds a canonical primary review packet with stable and volatile prompt sections.`)
 }
 
 func gatesCommand(args []string) error {
