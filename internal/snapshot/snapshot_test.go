@@ -1,0 +1,206 @@
+package snapshot
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/charlesnpx/subreview/internal/state"
+)
+
+func TestCaptureRestoreAndDiffCommittedAndUncommittedSnapshots(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	base, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
+	if err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	if base.CommitSHA == "" || base.GitTreeSHA == "" || base.EntryCount != 1 || !base.Reconstructable {
+		t.Fatalf("bad base snapshot: %+v", base)
+	}
+
+	writeFile(t, repo, "alpha.txt", "two\n")
+	writeFile(t, repo, "new.txt", "new\n")
+	proposal, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"})
+	if err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if !proposal.Dirty || proposal.CommitSHA != "" || proposal.HeadCommitSHA == "" || proposal.EntryCount != 2 {
+		t.Fatalf("bad proposal snapshot: %+v", proposal)
+	}
+
+	restoreDir := filepath.Join(root, "restore")
+	restored, err := Restore(RestoreOptions{StateDir: stateDir, Kind: "proposal", Output: restoreDir})
+	if err != nil {
+		t.Fatalf("Restore proposal: %v", err)
+	}
+	if restored.RestoredFiles != 2 {
+		t.Fatalf("unexpected restored file count: %+v", restored)
+	}
+	if got := readFile(t, restoreDir, "alpha.txt"); got != "two\n" {
+		t.Fatalf("restored alpha mismatch: %q", got)
+	}
+	if got := readFile(t, restoreDir, "new.txt"); got != "new\n" {
+		t.Fatalf("restored new mismatch: %q", got)
+	}
+
+	diff, err := CreateDiff(DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"})
+	if err != nil {
+		t.Fatalf("CreateDiff: %v", err)
+	}
+	if !diff.HasChanges || diff.FromSnapshot != base.Snapshot.Digest || diff.ToSnapshot != proposal.Snapshot.Digest {
+		t.Fatalf("bad diff result: %+v", diff)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	patch, err := store.Read(diff.Patch.Digest)
+	if err != nil {
+		t.Fatalf("Read patch: %v", err)
+	}
+	for _, want := range []string{"from/alpha.txt", "to/alpha.txt", "+two", "to/new.txt"} {
+		if !strings.Contains(string(patch), want) {
+			t.Fatalf("patch missing %q:\n%s", want, patch)
+		}
+	}
+	validation := state.Validate(stateDir)
+	if !validation.OK {
+		t.Fatalf("state should validate: %+v", validation.Errors)
+	}
+}
+
+func TestCreateDiffFailsWhenSnapshotIsMissing(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	_, err := CreateDiff(DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"})
+	if err == nil || !strings.Contains(err.Error(), "proposal") {
+		t.Fatalf("expected missing proposal snapshot error, got %v", err)
+	}
+	restoreDir := filepath.Join(root, "missing-restore")
+	_, err = Restore(RestoreOptions{StateDir: stateDir, Kind: "proposal", Output: restoreDir})
+	if err == nil || !strings.Contains(err.Error(), "proposal") {
+		t.Fatalf("expected missing proposal restore error, got %v", err)
+	}
+	if _, statErr := os.Stat(restoreDir); !os.IsNotExist(statErr) {
+		t.Fatalf("restore should not create output after missing snapshot, stat err=%v", statErr)
+	}
+}
+
+func TestRestoreRejectsSnapshotEventTreeMismatch(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	captured, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
+	if err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	otherTree, err := store.PutJSON(TreeManifest{SchemaVersion: SchemaVersion}, "application/vnd.subreview.snapshot-tree+json")
+	if err != nil {
+		t.Fatalf("PutJSON other tree: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "snapshot.captured",
+		ObjectDigests: []string{captured.Snapshot.Digest, otherTree.Digest},
+		Repo:          repo,
+		Details: map[string]string{
+			"kind":     "base",
+			"snapshot": captured.Snapshot.Digest,
+			"tree":     otherTree.Digest,
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	_, err = Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: filepath.Join(root, "restore")})
+	if err == nil || !strings.Contains(err.Error(), "tree digest mismatch") {
+		t.Fatalf("expected tree digest mismatch error, got %v", err)
+	}
+}
+
+func TestCaptureRejectsStateInsideRepo(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	stateDir := filepath.Join(repo, "subreview-state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	_, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
+	if err == nil || !strings.Contains(err.Error(), "outside repo") {
+		t.Fatalf("expected state-inside-repo error, got %v", err)
+	}
+}
+
+func initGitRepo(t *testing.T, repo string) {
+	t.Helper()
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	git(t, repo, "init")
+	git(t, repo, "config", "user.email", "test@example.com")
+	git(t, repo, "config", "user.name", "Test User")
+}
+
+func git(t *testing.T, repo string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+func writeFile(t *testing.T, root, rel, body string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir parent: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
+	}
+}
+
+func readFile(t *testing.T, root, rel string) string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	return string(body)
+}

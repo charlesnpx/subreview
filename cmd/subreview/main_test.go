@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -149,4 +150,147 @@ func TestPolicyCheckBindAndExplainCLI(t *testing.T) {
 	if explainResult.Profile != "default" || explainResult.PolicyDigest != bindResult.Policy.Digest || len(explainResult.ClosurePredicates) == 0 {
 		t.Fatalf("bad explain output: %s", explainOut)
 	}
+}
+
+func TestSnapshotCaptureRestoreAndDiffCLI(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "subreview")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build subreview: %v\n%s", err, out)
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initCLIGitRepo(t, repo)
+	writeCLIFile(t, repo, "alpha.txt", "one\n")
+	runCLIGit(t, repo, "add", "alpha.txt")
+	runCLIGit(t, repo, "commit", "-m", "initial")
+	if out, err := exec.Command(bin, "state", "init", "--state", stateDir, "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("state init failed: %v\n%s", err, out)
+	}
+
+	baseOut, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "base", "--repo", repo, "--ref", "HEAD", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("snapshot base failed: %v\n%s", err, baseOut)
+	}
+	var base struct {
+		Kind            string `json:"kind"`
+		CommitSHA       string `json:"commit_sha"`
+		GitTreeSHA      string `json:"git_tree_sha"`
+		EntryCount      int    `json:"entry_count"`
+		Reconstructable bool   `json:"reconstructable"`
+		Snapshot        struct {
+			Digest string `json:"digest"`
+		} `json:"snapshot"`
+	}
+	if err := json.Unmarshal(baseOut, &base); err != nil {
+		t.Fatalf("base output is not json: %v\n%s", err, baseOut)
+	}
+	if base.Kind != "base" || base.CommitSHA == "" || base.GitTreeSHA == "" || base.EntryCount != 1 || !base.Reconstructable || base.Snapshot.Digest == "" {
+		t.Fatalf("bad base output: %s", baseOut)
+	}
+
+	writeCLIFile(t, repo, "alpha.txt", "two\n")
+	writeCLIFile(t, repo, "beta.txt", "beta\n")
+	proposalOut, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "proposal", "--repo", repo, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("snapshot proposal failed: %v\n%s", err, proposalOut)
+	}
+	var proposal struct {
+		Kind            string `json:"kind"`
+		CommitSHA       string `json:"commit_sha"`
+		Dirty           bool   `json:"dirty"`
+		EntryCount      int    `json:"entry_count"`
+		Reconstructable bool   `json:"reconstructable"`
+		Snapshot        struct {
+			Digest string `json:"digest"`
+		} `json:"snapshot"`
+	}
+	if err := json.Unmarshal(proposalOut, &proposal); err != nil {
+		t.Fatalf("proposal output is not json: %v\n%s", err, proposalOut)
+	}
+	if proposal.Kind != "proposal" || !proposal.Dirty || proposal.CommitSHA != "" || proposal.EntryCount != 2 || !proposal.Reconstructable || proposal.Snapshot.Digest == "" {
+		t.Fatalf("bad proposal output: %s", proposalOut)
+	}
+
+	diffOut, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "proposal", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("diff create failed: %v\n%s", err, diffOut)
+	}
+	var diff struct {
+		FromSnapshot string `json:"from_snapshot"`
+		ToSnapshot   string `json:"to_snapshot"`
+		HasChanges   bool   `json:"has_changes"`
+		Patch        struct {
+			Digest string `json:"digest"`
+		} `json:"patch"`
+	}
+	if err := json.Unmarshal(diffOut, &diff); err != nil {
+		t.Fatalf("diff output is not json: %v\n%s", err, diffOut)
+	}
+	if diff.FromSnapshot != base.Snapshot.Digest || diff.ToSnapshot != proposal.Snapshot.Digest || !diff.HasChanges || diff.Patch.Digest == "" {
+		t.Fatalf("bad diff output: %s", diffOut)
+	}
+
+	restoreDir := filepath.Join(root, "restore")
+	restoreOut, err := exec.Command(bin, "snapshot", "restore", "--state", stateDir, "--kind", "proposal", "--output", restoreDir, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("snapshot restore failed: %v\n%s", err, restoreOut)
+	}
+	if got := readCLIFile(t, restoreDir, "alpha.txt"); got != "two\n" {
+		t.Fatalf("restored alpha mismatch: %q", got)
+	}
+	if got := readCLIFile(t, restoreDir, "beta.txt"); got != "beta\n" {
+		t.Fatalf("restored beta mismatch: %q", got)
+	}
+	validateOut, err := exec.Command(bin, "state", "validate", "--state", stateDir, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("state validate failed: %v\n%s", err, validateOut)
+	}
+	var validation struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.Unmarshal(validateOut, &validation); err != nil {
+		t.Fatalf("validate output is not json: %v\n%s", err, validateOut)
+	}
+	if !validation.OK {
+		t.Fatalf("expected valid state: %s", validateOut)
+	}
+}
+
+func initCLIGitRepo(t *testing.T, repo string) {
+	t.Helper()
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	runCLIGit(t, repo, "init")
+	runCLIGit(t, repo, "config", "user.email", "test@example.com")
+	runCLIGit(t, repo, "config", "user.name", "Test User")
+}
+
+func runCLIGit(t *testing.T, repo string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+func writeCLIFile(t *testing.T, root, rel, body string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir parent: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
+	}
+}
+
+func readCLIFile(t *testing.T, root, rel string) string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	return string(body)
 }

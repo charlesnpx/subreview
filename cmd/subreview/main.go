@@ -9,6 +9,7 @@ import (
 
 	"github.com/charlesnpx/subreview/internal/install"
 	"github.com/charlesnpx/subreview/internal/policy"
+	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
 )
 
@@ -21,10 +22,14 @@ func main() {
 	}
 	var err error
 	switch os.Args[1] {
+	case "diff":
+		err = diffCommand(os.Args[2:])
 	case "install-skills":
 		err = installSkills(os.Args[2:])
 	case "policy":
 		err = policyCommand(os.Args[2:])
+	case "snapshot":
+		err = snapshotCommand(os.Args[2:])
 	case "state":
 		err = stateCommand(os.Args[2:])
 	case "version":
@@ -42,13 +47,72 @@ func main() {
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
+  subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--json]
   subreview install-skills [--plan|--install|--uninstall] [--target tools|claude|codex|all] [--json] [--install-root <dir>]
   subreview policy check --config <path> --repo <path> [--json]
   subreview policy bind --state <dir> --config <path> --profile <name> [--json]
   subreview policy explain --state <dir> --profile <name> [--json]
+  subreview snapshot capture --state <dir> --kind <base|proposal|final> --repo <path> [--ref <ref>] [--json]
+  subreview snapshot restore --state <dir> --kind <base|proposal|final> --output <dir> [--json]
   subreview state init --state <dir> --repo <path> [--json]
   subreview state validate --state <dir> [--json]
   subreview version`)
+}
+
+func diffCommand(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("diff requires subcommand: create")
+	}
+	if isHelpCommand(args[0]) {
+		usageDiff(os.Stdout)
+		return nil
+	}
+	switch args[0] {
+	case "create":
+		return diffCreate(args[1:])
+	default:
+		return fmt.Errorf("diff requires subcommand: create")
+	}
+}
+
+func diffCreate(args []string) error {
+	if hasHelpFlag(args) {
+		usageDiffCreate(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("diff create", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	fromKind := fs.String("from", "", "Snapshot kind to diff from")
+	toKind := fs.String("to", "", "Snapshot kind to diff to")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("diff create does not accept positional arguments")
+	}
+	result, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: *stateDir, FromKind: *fromKind, ToKind: *toKind})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("diff created: %s->%s %s\n", result.FromKind, result.ToKind, result.Diff.Digest)
+	return nil
+}
+
+func usageDiff(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--json]`)
+}
+
+func usageDiffCreate(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--json]
+
+Restores the latest captured snapshots from CAS and stores a transition diff object.`)
 }
 
 func installSkills(args []string) error {
@@ -244,6 +308,101 @@ func usagePolicyExplain(w io.Writer) {
   subreview policy explain --state <dir> --profile <name> [--json]
 
 Reports closure predicates as required evidence facts for a bound policy profile.`)
+}
+
+func snapshotCommand(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("snapshot requires subcommand: capture or restore")
+	}
+	if isHelpCommand(args[0]) {
+		usageSnapshot(os.Stdout)
+		return nil
+	}
+	switch args[0] {
+	case "capture":
+		return snapshotCapture(args[1:])
+	case "restore":
+		return snapshotRestore(args[1:])
+	default:
+		return fmt.Errorf("snapshot requires subcommand: capture or restore")
+	}
+}
+
+func snapshotCapture(args []string) error {
+	if hasHelpFlag(args) {
+		usageSnapshotCapture(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("snapshot capture", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	kind := fs.String("kind", "", "Snapshot kind: base, proposal, or final")
+	repoPath := fs.String("repo", "", "Repository path")
+	ref := fs.String("ref", "", "Optional git ref to capture")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("snapshot capture does not accept positional arguments")
+	}
+	result, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: *stateDir, Kind: *kind, RepoPath: *repoPath, Ref: *ref})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("snapshot captured: %s %s\n", result.Kind, result.Snapshot.Digest)
+	return nil
+}
+
+func snapshotRestore(args []string) error {
+	if hasHelpFlag(args) {
+		usageSnapshotRestore(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("snapshot restore", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	kind := fs.String("kind", "", "Snapshot kind: base, proposal, or final")
+	output := fs.String("output", "", "Empty output directory")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("snapshot restore does not accept positional arguments")
+	}
+	result, err := snapshot.Restore(snapshot.RestoreOptions{StateDir: *stateDir, Kind: *kind, Output: *output})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("snapshot restored: %s %s\n", result.Kind, result.Output)
+	return nil
+}
+
+func usageSnapshot(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview snapshot capture --state <dir> --kind <base|proposal|final> --repo <path> [--ref <ref>] [--json]
+  subreview snapshot restore --state <dir> --kind <base|proposal|final> --output <dir> [--json]`)
+}
+
+func usageSnapshotCapture(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview snapshot capture --state <dir> --kind <base|proposal|final> --repo <path> [--ref <ref>] [--json]
+
+Stores a reconstructable snapshot record, tree manifest, and file blobs in state CAS.`)
+}
+
+func usageSnapshotRestore(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview snapshot restore --state <dir> --kind <base|proposal|final> --output <dir> [--json]
+
+Restores the latest captured snapshot of the requested kind from CAS into an empty directory.`)
 }
 
 func stateCommand(args []string) error {

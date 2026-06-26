@@ -16,6 +16,9 @@ subreview state validate --state <dir> --json
 subreview policy check --config <path> --repo <path> --json
 subreview policy bind --state <dir> --config <path> --profile <name> --json
 subreview policy explain --state <dir> --profile <name> --json
+subreview snapshot capture --state <dir> --kind <base|proposal|final> --repo <path> [--ref <ref>] --json
+subreview snapshot restore --state <dir> --kind <base|proposal|final> --output <dir> --json
+subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> --json
 subreview install-skills --plan --target all --json
 ```
 
