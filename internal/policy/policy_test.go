@@ -214,6 +214,130 @@ func TestExplainRejectsPolicyObjectForDifferentProfile(t *testing.T) {
 	}
 }
 
+func TestExplainRejectsPolicyEventWithMismatchedRepo(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	cfg := Config{
+		SchemaVersion: SchemaVersion,
+		PolicyID:      "v1-default",
+		Profiles:      map[string]Profile{"default": validProfile()},
+	}
+	effective, err := Effective(cfg, "default", root)
+	if err != nil {
+		t.Fatalf("Effective: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	policyObject, err := store.PutJSON(effective, "application/vnd.subreview.policy+json")
+	if err != nil {
+		t.Fatalf("PutJSON policy: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "policy.bound",
+		ObjectDigests: []string{policyObject.Digest},
+		Repo:          filepath.Join(root, "other-repo"),
+		Details: map[string]string{
+			"profile":   "default",
+			"policy":    policyObject.Digest,
+			"policy_id": "v1-default",
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	_, err = Explain(ExplainOptions{StateDir: stateDir, Profile: "default"})
+	if err == nil || !strings.Contains(err.Error(), "repo mismatch") {
+		t.Fatalf("expected repo mismatch error, got %v", err)
+	}
+}
+
+func TestExplainRejectsPolicyEventWithMismatchedPolicyID(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	cfg := Config{
+		SchemaVersion: SchemaVersion,
+		PolicyID:      "v1-default",
+		Profiles:      map[string]Profile{"default": validProfile()},
+	}
+	effective, err := Effective(cfg, "default", root)
+	if err != nil {
+		t.Fatalf("Effective: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	policyObject, err := store.PutJSON(effective, "application/vnd.subreview.policy+json")
+	if err != nil {
+		t.Fatalf("PutJSON policy: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "policy.bound",
+		ObjectDigests: []string{policyObject.Digest},
+		Repo:          root,
+		Details: map[string]string{
+			"profile":   "default",
+			"policy":    policyObject.Digest,
+			"policy_id": "other-policy",
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	_, err = Explain(ExplainOptions{StateDir: stateDir, Profile: "default"})
+	if err == nil || !strings.Contains(err.Error(), "event policy_id") {
+		t.Fatalf("expected policy_id mismatch error, got %v", err)
+	}
+}
+
+func TestExplainRejectsNonCanonicalPolicyObject(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	cfg := Config{
+		SchemaVersion: SchemaVersion,
+		PolicyID:      "v1-default",
+		Profiles:      map[string]Profile{"default": validProfile()},
+	}
+	effective, err := Effective(cfg, "default", root)
+	if err != nil {
+		t.Fatalf("Effective: %v", err)
+	}
+	effective.ClosurePredicates[0].Required = false
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	policyObject, err := store.PutJSON(effective, "application/vnd.subreview.policy+json")
+	if err != nil {
+		t.Fatalf("PutJSON policy: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "policy.bound",
+		ObjectDigests: []string{policyObject.Digest},
+		Repo:          root,
+		Details: map[string]string{
+			"profile":   "default",
+			"policy":    policyObject.Digest,
+			"policy_id": "v1-default",
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	_, err = Explain(ExplainOptions{StateDir: stateDir, Profile: "default"})
+	if err == nil || !strings.Contains(err.Error(), "object is not canonical") {
+		t.Fatalf("expected non-canonical policy error, got %v", err)
+	}
+}
+
 func validPolicyConfig() map[string]any {
 	return map[string]any{
 		"schema_version": float64(SchemaVersion),
