@@ -50,6 +50,15 @@ func TestCheckCatalogValidatesAndDigestsCommands(t *testing.T) {
 	if _, err := CheckCatalog(CheckOptions{CatalogPath: duplicatePath, RepoPath: repo}); err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("expected duplicate command error, got %v", err)
 	}
+
+	pathlessPinned := testCommand("pathless", []string{"sh", "-c", "true"})
+	pathlessPath := writeCatalog(t, root, Catalog{
+		SchemaVersion: SchemaVersion,
+		Commands:      []CommandDefinition{pathlessPinned},
+	})
+	if _, err := CheckCatalog(CheckOptions{CatalogPath: pathlessPath, RepoPath: repo}); err == nil || !strings.Contains(err.Error(), "environment_pinned argv[0]") {
+		t.Fatalf("expected pathless pinned command error, got %v", err)
+	}
 }
 
 func TestRunStoresCLIWitnessedGateEvidence(t *testing.T) {
@@ -201,6 +210,28 @@ func TestTailBufferKeepsBoundedSuffix(t *testing.T) {
 	got = tail.String()
 	if len(got) != maxDiagnosticBytes || got != strings.Repeat("c", maxDiagnosticBytes) {
 		t.Fatalf("large write tail mismatch len=%d", len(got))
+	}
+}
+
+func TestExecuteCommandEnvironmentPinnedDoesNotInheritAmbientEnvironment(t *testing.T) {
+	t.Setenv("SUBREVIEW_AMBIENT_SECRET", "leaked")
+	command := testCommand("go_test_all", []string{"/bin/sh", "-c", `test -z "$SUBREVIEW_AMBIENT_SECRET" && test "$SUBREVIEW_ALLOWED" = yes`})
+	command.Env = map[string]string{"SUBREVIEW_ALLOWED": "yes"}
+	command.AllowedExitCodes = []int{0}
+	result := executeCommand(t.TempDir(), command, time.Now().UTC())
+	if result.Outcome != OutcomePass {
+		t.Fatalf("environment-pinned gate should only receive catalog env, got %+v", result)
+	}
+}
+
+func TestExecuteCommandSignaledProcessDoesNotRecordInvalidExitCode(t *testing.T) {
+	command := testCommand("go_test_all", []string{"/bin/sh", "-c", "kill -TERM $$"})
+	result := executeCommand(t.TempDir(), command, time.Now().UTC())
+	if result.Outcome != OutcomeError {
+		t.Fatalf("signaled process should be recorded as error, got %+v", result)
+	}
+	if result.ExitCode != nil {
+		t.Fatalf("signaled process should not record invalid exit code, got %+v", result)
 	}
 }
 

@@ -441,6 +441,9 @@ func normalizeCommand(command CommandDefinition) (CommandDefinition, error) {
 			return CommandDefinition{}, fmt.Errorf("gate command %s argv[0] is required", command.ID)
 		}
 	}
+	if command.EnvironmentPinned && !argv0HasPathSeparator(command.Argv[0]) {
+		return CommandDefinition{}, fmt.Errorf("gate command %s environment_pinned argv[0] must include a path separator", command.ID)
+	}
 	if command.WorkingDir == "" {
 		command.WorkingDir = "."
 	}
@@ -540,9 +543,13 @@ type commandRun struct {
 func executeCommand(repo string, command CommandDefinition, startedAt time.Time) commandRun {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(command.TimeoutSeconds)*time.Second)
 	defer cancel()
+	if command.EnvironmentPinned && !argv0HasPathSeparator(command.Argv[0]) {
+		endedAt := time.Now().UTC()
+		return commandRun{Outcome: OutcomeError, Summary: "environment-pinned gate argv[0] must include a path separator", EndedAt: endedAt}
+	}
 	cmd := exec.Command(command.Argv[0], command.Argv[1:]...)
 	cmd.Dir = filepath.Join(repo, filepath.FromSlash(command.WorkingDir))
-	cmd.Env = commandEnv(command.Env)
+	cmd.Env = commandEnv(command)
 	configureCommandProcess(cmd)
 	var stdout, stderr tailBuffer
 	cmd.Stdout = &stdout
@@ -576,6 +583,9 @@ func executeCommand(repo string, command CommandDefinition, startedAt time.Time)
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		code := exitErr.ExitCode()
+		if code < 0 || code > 255 {
+			return commandRun{Outcome: OutcomeError, Summary: truncateDiagnostic(exitErr.Error()), StdoutTail: stdoutTail, StderrTail: stderrTail, EndedAt: endedAt}
+		}
 		return commandRun{Outcome: outcomeForExitCode(command, code), ExitCode: &code, Summary: fmt.Sprintf("gate command exited with code %d", code), StdoutTail: stdoutTail, StderrTail: stderrTail, EndedAt: endedAt}
 	}
 	return commandRun{Outcome: OutcomeError, Summary: truncateDiagnostic(err.Error()), StdoutTail: stdoutTail, StderrTail: stderrTail, EndedAt: endedAt}
@@ -874,17 +884,24 @@ func cleanRepoPath(path string) (string, error) {
 	return clean, nil
 }
 
-func commandEnv(extra map[string]string) []string {
-	env := os.Environ()
-	keys := make([]string, 0, len(extra))
-	for key := range extra {
+func commandEnv(command CommandDefinition) []string {
+	env := []string{}
+	if !command.EnvironmentPinned {
+		env = append(env, os.Environ()...)
+	}
+	keys := make([]string, 0, len(command.Env))
+	for key := range command.Env {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		env = append(env, key+"="+extra[key])
+		env = append(env, key+"="+command.Env[key])
 	}
 	return env
+}
+
+func argv0HasPathSeparator(argv0 string) bool {
+	return strings.ContainsAny(argv0, `/\`)
 }
 
 func outcomeForExitCode(command CommandDefinition, code int) string {
