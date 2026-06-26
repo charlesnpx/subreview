@@ -181,6 +181,45 @@ func TestSnapshotCaptureRestoreAndDiffCLI(t *testing.T) {
 	if out, err := exec.Command(bin, "state", "init", "--state", stateDir, "--repo", repo, "--json").CombinedOutput(); err != nil {
 		t.Fatalf("state init failed: %v\n%s", err, out)
 	}
+	policyPath := filepath.Join(root, "policy.json")
+	if err := os.WriteFile(policyPath, []byte(`{
+  "schema_version": 1,
+  "policy_id": "v1-default",
+  "profiles": {
+    "default": {
+      "gate_requirements": [
+        {"command_id": "go_test_all", "required": true}
+      ],
+      "route_limits": {
+        "primary_semantic_reviews": 1,
+        "targeted_verifications": 1,
+        "fresh_final_reviews": 0,
+        "context_expansion_rounds": 1
+      },
+      "required_evidence_facts": [
+        "required_gates_satisfied",
+        "primary_review_completed",
+        "blocking_findings_verified",
+        "coverage_obligations_satisfied",
+        "policy_bound",
+        "independent_final_completed"
+      ],
+      "risk_routing": [
+        {"risk_tier": "high", "review_effort": "medium", "require_independent_final": true}
+      ],
+      "closure_basis": {
+        "allowed_basis": ["clean", "fixed", "deterministic_refutation"],
+        "require_basis_for_unresolved": true
+      }
+    }
+  }
+}
+`), 0o644); err != nil {
+		t.Fatalf("write policy config: %v", err)
+	}
+	if out, err := exec.Command(bin, "policy", "bind", "--state", stateDir, "--config", policyPath, "--profile", "default", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("policy bind failed: %v\n%s", err, out)
+	}
 
 	baseOut, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "base", "--repo", repo, "--ref", "HEAD", "--json").CombinedOutput()
 	if err != nil {
@@ -301,6 +340,79 @@ func TestSnapshotCaptureRestoreAndDiffCLI(t *testing.T) {
 	}
 	if statuses["alpha-file"] != "modified" || statuses["missing-file"] != "unresolved" || len(anchorsResult.ClosureBlockers) != 1 || anchorsResult.ClosureBlockers[0].AnchorID != "missing-file" {
 		t.Fatalf("bad anchor migration statuses: %s", anchorsOut)
+	}
+
+	writeCLIFile(t, repo, "alpha.txt", "three\n")
+	writeCLIFile(t, repo, "beta.txt", "beta\n")
+	finalOut, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "final", "--repo", repo, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("snapshot final failed: %v\n%s", err, finalOut)
+	}
+	var final struct {
+		Kind     string `json:"kind"`
+		Dirty    bool   `json:"dirty"`
+		Snapshot struct {
+			Digest string `json:"digest"`
+		} `json:"snapshot"`
+	}
+	if err := json.Unmarshal(finalOut, &final); err != nil {
+		t.Fatalf("final output is not json: %v\n%s", err, finalOut)
+	}
+	if final.Kind != "final" || !final.Dirty || final.Snapshot.Digest == "" {
+		t.Fatalf("bad final output: %s", finalOut)
+	}
+	baseFinalOut, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "final", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("base->final diff create failed: %v\n%s", err, baseFinalOut)
+	}
+	obligationsOut, err := exec.Command(bin, "obligations", "build", "--state", stateDir, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("obligations build failed: %v\n%s", err, obligationsOut)
+	}
+	var obligationsResult struct {
+		Manifest struct {
+			Digest string `json:"digest"`
+			Path   string `json:"path"`
+		} `json:"manifest"`
+		ObligationCount int    `json:"obligation_count"`
+		BlockerCount    int    `json:"blocker_count"`
+		EventID         string `json:"event_id"`
+	}
+	if err := json.Unmarshal(obligationsOut, &obligationsResult); err != nil {
+		t.Fatalf("obligations output is not json: %v\n%s", err, obligationsOut)
+	}
+	if obligationsResult.Manifest.Digest == "" || obligationsResult.Manifest.Path == "" || obligationsResult.ObligationCount == 0 || obligationsResult.BlockerCount != 0 || obligationsResult.EventID == "" {
+		t.Fatalf("bad obligations build output: %s", obligationsOut)
+	}
+	if _, err := os.Stat(obligationsResult.Manifest.Path); err != nil {
+		t.Fatalf("obligations manifest object path should exist %s: %v\n%s", obligationsResult.Manifest.Path, err, obligationsOut)
+	}
+	statusOut, err := exec.Command(bin, "obligations", "status", "--state", stateDir, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("obligations status failed: %v\n%s", err, statusOut)
+	}
+	var obligationStatus struct {
+		Closed                       bool     `json:"closed"`
+		UnsatisfiedCount             int      `json:"unsatisfied_count"`
+		UnsatisfiedSatisfactionKinds []string `json:"unsatisfied_satisfaction_kinds"`
+		Blockers                     []struct {
+			Code string `json:"code"`
+		} `json:"blockers"`
+	}
+	if err := json.Unmarshal(statusOut, &obligationStatus); err != nil {
+		t.Fatalf("obligations status output is not json: %v\n%s", err, statusOut)
+	}
+	if obligationStatus.Closed || obligationStatus.UnsatisfiedCount == 0 || len(obligationStatus.UnsatisfiedSatisfactionKinds) == 0 {
+		t.Fatalf("bad obligations status output: %s", statusOut)
+	}
+	statusBlockers := map[string]bool{}
+	for _, blocker := range obligationStatus.Blockers {
+		statusBlockers[blocker.Code] = true
+	}
+	for _, want := range []string{"unsatisfied_required_check", "unsatisfied_coverage", "unresolved_anchor"} {
+		if !statusBlockers[want] {
+			t.Fatalf("obligations status missing blocker %s: %s", want, statusOut)
+		}
 	}
 
 	restoreDir := filepath.Join(root, "restore")
