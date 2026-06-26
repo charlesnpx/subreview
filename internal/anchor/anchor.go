@@ -763,7 +763,7 @@ func objectPathBestEffort(stateDir, digest string) string {
 	if len(hexDigest) < 2 {
 		return ""
 	}
-	return filepath.Join(stateDir, "objects", "sha256", hexDigest[:2], digest)
+	return filepath.Join(stateDir, "objects", "sha256", hexDigest[:2], hexDigest)
 }
 
 func decodeStrict(body []byte, target any) error {

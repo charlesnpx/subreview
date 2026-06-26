@@ -249,7 +249,13 @@ func TestSnapshotCaptureRestoreAndDiffCLI(t *testing.T) {
 		FromSnapshot string `json:"from_snapshot"`
 		ToSnapshot   string `json:"to_snapshot"`
 		EventID      string `json:"event_id"`
-		Results      []struct {
+		Diff         struct {
+			Path string `json:"path"`
+		} `json:"diff"`
+		Patch struct {
+			Path string `json:"path"`
+		} `json:"patch"`
+		Results []struct {
 			Anchor struct {
 				ID string `json:"id"`
 			} `json:"anchor"`
@@ -266,6 +272,14 @@ func TestSnapshotCaptureRestoreAndDiffCLI(t *testing.T) {
 	}
 	if anchorsResult.FromSnapshot != base.Snapshot.Digest || anchorsResult.ToSnapshot != proposal.Snapshot.Digest || anchorsResult.EventID == "" || len(anchorsResult.Results) != 2 {
 		t.Fatalf("bad anchors output: %s", anchorsOut)
+	}
+	for _, path := range []string{anchorsResult.Diff.Path, anchorsResult.Patch.Path} {
+		if path == "" {
+			t.Fatalf("anchor migration emitted empty object path: %s", anchorsOut)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("anchor migration object path should exist %s: %v\n%s", path, err, anchorsOut)
+		}
 	}
 	statuses := map[string]string{}
 	for _, result := range anchorsResult.Results {
