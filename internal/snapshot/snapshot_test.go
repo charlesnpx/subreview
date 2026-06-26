@@ -49,6 +49,19 @@ func TestCaptureRestoreAndDiffCommittedAndUncommittedSnapshots(t *testing.T) {
 	if proposalRecord.Provenance.CommitPresent {
 		t.Fatalf("dirty proposal should not claim committed snapshot provenance: %+v", proposalRecord.Provenance)
 	}
+	events, err := state.ReadEvents(stateDir)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var proposalEvent state.Event
+	for _, event := range events {
+		if event.Type == "snapshot.captured" && event.Details["kind"] == "proposal" {
+			proposalEvent = event
+		}
+	}
+	if len(proposalEvent.ObjectDigests) != 2 || !containsDigest(proposalEvent.ObjectDigests, proposal.Snapshot.Digest) || !containsDigest(proposalEvent.ObjectDigests, proposal.Tree.Digest) {
+		t.Fatalf("proposal capture event should pin only snapshot and tree objects, got %+v", proposalEvent.ObjectDigests)
+	}
 
 	restoreDir := filepath.Join(root, "restore")
 	restored, err := Restore(RestoreOptions{StateDir: stateDir, Kind: "proposal", Output: restoreDir})
@@ -189,39 +202,6 @@ func TestRestoreRejectsSnapshotEventTreeMismatch(t *testing.T) {
 	}
 }
 
-func TestRestoreRejectsSnapshotEventMissingPinnedBlobDigest(t *testing.T) {
-	root := t.TempDir()
-	repo := filepath.Join(root, "repo")
-	stateDir := filepath.Join(root, "state")
-	initGitRepo(t, repo)
-	writeFile(t, repo, "alpha.txt", "one\n")
-	git(t, repo, "add", "alpha.txt")
-	git(t, repo, "commit", "-m", "initial")
-	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	captured, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
-	if err != nil {
-		t.Fatalf("Capture base: %v", err)
-	}
-	if _, err := state.AppendEvent(stateDir, state.Event{
-		Type:          "snapshot.captured",
-		ObjectDigests: []string{captured.Snapshot.Digest, captured.Tree.Digest},
-		Repo:          repo,
-		Details: map[string]string{
-			"kind":     "base",
-			"snapshot": captured.Snapshot.Digest,
-			"tree":     captured.Tree.Digest,
-		},
-	}); err != nil {
-		t.Fatalf("AppendEvent: %v", err)
-	}
-	_, err = Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: filepath.Join(root, "restore")})
-	if err == nil || !strings.Contains(err.Error(), "does not pin tree entry digest") {
-		t.Fatalf("expected missing pinned blob error, got %v", err)
-	}
-}
-
 func TestRestoreDoesNotPartiallyWriteWhenBlobIsMissing(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
@@ -258,8 +238,8 @@ func TestRestoreDoesNotPartiallyWriteWhenBlobIsMissing(t *testing.T) {
 		t.Fatalf("remove object: %v", err)
 	}
 	validation := state.Validate(stateDir)
-	if validation.OK {
-		t.Fatalf("state validation should fail after pinned blob removal")
+	if !validation.OK {
+		t.Fatalf("generic state validation should remain bounded to ledger-referenced objects: %+v", validation.Errors)
 	}
 	restoreDir := filepath.Join(root, "restore")
 	err = restoreEntries(store, tree.Entries, restoreDir)
@@ -589,7 +569,7 @@ func appendMalformedSnapshot(t *testing.T, stateDir, repo, kind string, paths []
 	}
 	if _, err := state.AppendEvent(stateDir, state.Event{
 		Type:          "snapshot.captured",
-		ObjectDigests: snapshotObjectDigests(snapshotRef.Digest, tree.Digest, entries),
+		ObjectDigests: snapshotObjectDigests(snapshotRef.Digest, tree.Digest),
 		Repo:          repo,
 		Details: map[string]string{
 			"kind":     kind,

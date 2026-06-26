@@ -133,10 +133,9 @@ type stateBinding struct {
 }
 
 type snapshotBinding struct {
-	Digest  string
-	Kind    string
-	Tree    string
-	Objects []string
+	Digest string
+	Kind   string
+	Tree   string
 }
 
 type verifiedEntry struct {
@@ -211,10 +210,9 @@ func Capture(opts CaptureOptions) (CaptureResult, error) {
 	if err != nil {
 		return CaptureResult{}, err
 	}
-	objectDigests := snapshotObjectDigests(snapshotRef.Digest, tree.Digest, entries)
 	event, err := state.AppendEvent(stateDir, state.Event{
 		Type:          "snapshot.captured",
-		ObjectDigests: objectDigests,
+		ObjectDigests: snapshotObjectDigests(snapshotRef.Digest, tree.Digest),
 		Repo:          repo,
 		Details: map[string]string{
 			"kind":            opts.Kind,
@@ -669,17 +667,13 @@ func latestSnapshotBinding(stateDir, kind string) (snapshotBinding, error) {
 		if len(event.ObjectDigests) < 2 || !containsDigest(event.ObjectDigests, digest) || !containsDigest(event.ObjectDigests, tree) {
 			return snapshotBinding{}, fmt.Errorf("malformed snapshot.captured event for kind %s: object_digests must include snapshot and tree", kind)
 		}
-		return snapshotBinding{Digest: digest, Kind: kind, Tree: tree, Objects: append([]string(nil), event.ObjectDigests...)}, nil
+		return snapshotBinding{Digest: digest, Kind: kind, Tree: tree}, nil
 	}
 	return snapshotBinding{}, fmt.Errorf("snapshot kind is not captured in state: %s", kind)
 }
 
-func snapshotObjectDigests(snapshotDigest, treeDigest string, entries []TreeEntry) []string {
-	digests := []string{snapshotDigest, treeDigest}
-	for _, entry := range entries {
-		digests = append(digests, entry.Digest)
-	}
-	return digests
+func snapshotObjectDigests(snapshotDigest, treeDigest string) []string {
+	return []string{snapshotDigest, treeDigest}
 }
 
 func containsDigest(values []string, digest string) bool {
@@ -727,9 +721,6 @@ func readSnapshot(store state.Store, binding snapshotBinding, kind string) (Snap
 		if err := validateTreeEntry(entry); err != nil {
 			return SnapshotRecord{}, nil, err
 		}
-		if !containsDigest(binding.Objects, entry.Digest) {
-			return SnapshotRecord{}, nil, fmt.Errorf("snapshot.captured event for kind %s does not pin tree entry digest %s", kind, entry.Digest)
-		}
 	}
 	return record, tree.Entries, nil
 }
@@ -757,28 +748,32 @@ func validateSnapshotRecord(record SnapshotRecord, kind string) error {
 }
 
 func validateTreeTopology(entries []TreeEntry) error {
-	seen := map[string]struct{}{}
+	files := map[string]struct{}{}
+	dirPrefixes := map[string]struct{}{}
 	for _, entry := range entries {
 		rel, err := cleanRepoPath(entry.Path)
 		if err != nil {
 			return err
 		}
-		if _, ok := seen[rel]; ok {
+		if _, ok := files[rel]; ok {
 			return fmt.Errorf("duplicate tree entry path: %s", rel)
 		}
-		for existing := range seen {
-			if strings.HasPrefix(existing, rel+"/") {
-				return fmt.Errorf("tree entry path conflicts with file descendant: %s", rel)
-			}
+		if _, ok := dirPrefixes[rel]; ok {
+			return fmt.Errorf("tree entry path conflicts with file descendant: %s", rel)
 		}
-		seen[rel] = struct{}{}
 		parts := strings.Split(rel, "/")
-		for i := 1; i < len(parts); i++ {
-			parent := strings.Join(parts[:i], "/")
-			if _, ok := seen[parent]; ok {
+		prefix := ""
+		for i := 0; i < len(parts)-1; i++ {
+			if i > 0 {
+				prefix += "/"
+			}
+			prefix += parts[i]
+			if _, ok := files[prefix]; ok {
 				return fmt.Errorf("tree entry path conflicts with file parent: %s", rel)
 			}
+			dirPrefixes[prefix] = struct{}{}
 		}
+		files[rel] = struct{}{}
 	}
 	return nil
 }
