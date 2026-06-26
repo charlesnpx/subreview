@@ -317,6 +317,11 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		return StatusResult{}, err
 	}
 	blockers := append([]Blocker(nil), manifest.Blockers...)
+	freshnessBlockers, err := manifestFreshnessBlockers(store, events, binding.State, binding.Repo, manifest)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	blockers = append(blockers, freshnessBlockers...)
 	blockers = append(blockers, contextBlockers(events)...)
 	anchorBlockers, err := unresolvedAnchorBlockers(store, events, binding.Repo, manifest.SourceDiffs)
 	if err != nil {
@@ -811,6 +816,61 @@ func latestCoverageManifest(store state.Store, events []state.Event, stateDir, r
 		}, manifest, nil
 	}
 	return state.ObjectRef{}, CoverageManifest{}, errors.New("obligations have not been built in state")
+}
+
+func manifestFreshnessBlockers(store state.Store, events []state.Event, stateDir, repo string, manifest CoverageManifest) ([]Blocker, error) {
+	blockers := []Blocker{}
+	seenTransitions := map[string]struct{}{}
+	for _, diff := range manifest.SourceDiffs {
+		seenTransitions[diff.Transition] = struct{}{}
+		latestFrom, err := latestSnapshotDigest(events, diff.FromKind, repo)
+		if err != nil {
+			return nil, err
+		}
+		latestTo, err := latestSnapshotDigest(events, diff.ToKind, repo)
+		if err != nil {
+			return nil, err
+		}
+		if diff.FromSnapshot != latestFrom || diff.ToSnapshot != latestTo {
+			blockers = append(blockers, staleManifestBlocker(diff.Transition, "manifest source diff does not match latest snapshots"))
+			continue
+		}
+		latestDiff, err := latestDiffBinding(store, events, stateDir, diff.FromKind, diff.ToKind, repo)
+		if err != nil {
+			blockers = append(blockers, staleManifestBlocker(diff.Transition, err.Error()))
+			continue
+		}
+		if diff.Diff.Digest != latestDiff.Diff.Digest || diff.Patch.Digest != latestDiff.Patch.Digest {
+			blockers = append(blockers, staleManifestBlocker(diff.Transition, "manifest source diff does not match latest captured diff"))
+		}
+	}
+	if _, ok := seenTransitions["base->final"]; !ok {
+		if _, err := latestDiffBinding(store, events, stateDir, "base", "final", repo); err == nil {
+			blockers = append(blockers, staleManifestBlocker("base->final", "base->final diff was captured after this manifest was built"))
+		}
+	}
+	currentPolicy, err := latestBoundPolicy(store, events, repo)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case manifest.Policy == nil && currentPolicy != nil:
+		blockers = append(blockers, staleManifestBlocker("", "policy was bound after this manifest was built"))
+	case manifest.Policy != nil && currentPolicy == nil:
+		blockers = append(blockers, staleManifestBlocker("", "manifest references a policy but no policy is currently bound"))
+	case manifest.Policy != nil && currentPolicy != nil && manifest.Policy.Digest != currentPolicy.Ref.Digest:
+		blockers = append(blockers, staleManifestBlocker("", "manifest policy does not match latest bound policy"))
+	}
+	sortBlockers(blockers)
+	return blockers, nil
+}
+
+func staleManifestBlocker(transition, message string) Blocker {
+	return Blocker{
+		Code:       "stale_coverage_manifest",
+		Message:    message + "; rerun obligations build",
+		Transition: transition,
+	}
 }
 
 func validateManifest(manifest CoverageManifest, repo string) error {

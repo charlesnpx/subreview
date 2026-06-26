@@ -218,6 +218,79 @@ func TestStatusRejectsCarriedForwardEvidenceOnAmbiguousAnchors(t *testing.T) {
 	}
 }
 
+func TestStatusReportsStaleManifestAfterNewerSnapshot(t *testing.T) {
+	repo, stateDir := initializedReviewState(t)
+	writeObligationFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	bindDefaultPolicy(t, stateDir, repo, false)
+	writeObligationFile(t, repo, "alpha.txt", "two\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if _, err := Build(BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	writeObligationFile(t, repo, "alpha.txt", "three\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture newer proposal: %v", err)
+	}
+	status, err := Status(StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if !hasBlocker(status.Blockers, "stale_coverage_manifest") {
+		t.Fatalf("status should report stale coverage manifest after newer snapshot: %+v", status.Blockers)
+	}
+}
+
+func TestStatusReportsStaleManifestAfterPolicyRebind(t *testing.T) {
+	repo, stateDir := initializedReviewState(t)
+	writeObligationFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	bindDefaultPolicy(t, stateDir, repo, false)
+	writeObligationFile(t, repo, "alpha.txt", "two\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if _, err := Build(BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	bindDefaultPolicy(t, stateDir, repo, true)
+	status, err := Status(StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if !hasBlocker(status.Blockers, "stale_coverage_manifest") {
+		t.Fatalf("status should report stale coverage manifest after policy rebind: %+v", status.Blockers)
+	}
+}
+
 func TestStatusUsesLatestAnchorMigrationForActiveTransition(t *testing.T) {
 	repo, stateDir := initializedReviewState(t)
 	writeObligationFile(t, repo, "ambiguous.txt", "dup\nstay\n")
