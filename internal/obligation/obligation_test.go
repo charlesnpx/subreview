@@ -108,6 +108,23 @@ func TestObligationsFromDiffIncludesHeaderOnlyChanges(t *testing.T) {
 	})
 	assertHasObligation(t, spacePathObligations, KindChangedPath, "base->proposal", "a b.sh")
 	assertHasObligation(t, spacePathObligations, KindChangedFile, "base->proposal", "a b.sh")
+	separatorPathObligations := obligationsFromDiff(diffBinding{
+		Transition: "base->proposal",
+		PatchBody:  []byte("diff --git from/a to/file.txt to/a to/file.txt\nold mode 100644\nnew mode 100755\n"),
+	})
+	assertHasObligation(t, separatorPathObligations, KindChangedPath, "base->proposal", "a to/file.txt")
+	assertHasObligation(t, separatorPathObligations, KindChangedFile, "base->proposal", "a to/file.txt")
+	renameObligations := obligationsFromDiff(diffBinding{
+		Transition: "base->proposal",
+		PatchBody:  []byte("diff --git from/old to/file.txt to/new to/file.txt\nsimilarity index 100%\nrename from old to/file.txt\nrename to new to/file.txt\n"),
+	})
+	assertHasObligation(t, renameObligations, KindChangedPath, "base->proposal", "new to/file.txt")
+	assertHasObligation(t, renameObligations, KindChangedFile, "base->proposal", "new to/file.txt")
+	for _, obligation := range renameObligations {
+		if obligation.Path == "new to/file.txt" && obligation.OldPath != "old to/file.txt" {
+			t.Fatalf("rename obligation should preserve old path, got %+v", obligation)
+		}
+	}
 }
 
 func TestBuildRecordsHiddenScopeUncertaintyWhenFinalDiffIsMissing(t *testing.T) {
@@ -241,6 +258,62 @@ func TestStatusUsesLatestAnchorMigrationForActiveTransition(t *testing.T) {
 	}
 	if hasBlocker(status.Blockers, "ambiguous_anchor") {
 		t.Fatalf("status should ignore superseded ambiguous anchor blocker: %+v", status.Blockers)
+	}
+}
+
+func TestStatusDoesNotSupersedeDifferentAnchorOnSameTransition(t *testing.T) {
+	repo, stateDir := initializedReviewState(t)
+	writeObligationFile(t, repo, "ambiguous.txt", "dup\nstay\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	bindDefaultPolicy(t, stateDir, repo, false)
+	writeObligationFile(t, repo, "ambiguous.txt", "dup\ndup\nstay\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if _, err := anchor.Migrate(anchor.MigrateOptions{
+		StateDir:    stateDir,
+		FromKind:    "base",
+		ToKind:      "proposal",
+		WriteLedger: true,
+		Anchors: []anchor.Anchor{
+			{ID: "still-ambiguous", Kind: anchor.KindHunk, Path: "ambiguous.txt", StartLine: 1, EndLine: 1, Text: "dup\n"},
+		},
+	}); err != nil {
+		t.Fatalf("Migrate ambiguous anchor: %v", err)
+	}
+	if _, err := anchor.Migrate(anchor.MigrateOptions{
+		StateDir:    stateDir,
+		FromKind:    "base",
+		ToKind:      "proposal",
+		WriteLedger: true,
+		Anchors: []anchor.Anchor{
+			{ID: "resolved-other", Kind: anchor.KindHunk, Path: "ambiguous.txt", StartLine: 2, EndLine: 2, Text: "stay\n"},
+		},
+	}); err != nil {
+		t.Fatalf("Migrate resolved anchor: %v", err)
+	}
+	if _, err := Build(BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	status, err := Status(StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if !hasBlocker(status.Blockers, "ambiguous_anchor") {
+		t.Fatalf("status should retain older blocker for different anchor id: %+v", status.Blockers)
 	}
 }
 

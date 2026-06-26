@@ -531,6 +531,14 @@ func parsePatch(body []byte) []filePatch {
 			current.OldPath = normalizeHeaderPath(strings.TrimSpace(strings.TrimPrefix(line, "--- ")), "from", "a")
 		case strings.HasPrefix(line, "+++ ") && current != nil:
 			current.NewPath = normalizeHeaderPath(strings.TrimSpace(strings.TrimPrefix(line, "+++ ")), "to", "b")
+		case strings.HasPrefix(line, "rename from ") && current != nil:
+			current.OldPath = normalizeMetadataPath(strings.TrimSpace(strings.TrimPrefix(line, "rename from ")))
+		case strings.HasPrefix(line, "rename to ") && current != nil:
+			current.NewPath = normalizeMetadataPath(strings.TrimSpace(strings.TrimPrefix(line, "rename to ")))
+		case strings.HasPrefix(line, "copy from ") && current != nil:
+			current.OldPath = normalizeMetadataPath(strings.TrimSpace(strings.TrimPrefix(line, "copy from ")))
+		case strings.HasPrefix(line, "copy to ") && current != nil:
+			current.NewPath = normalizeMetadataPath(strings.TrimSpace(strings.TrimPrefix(line, "copy to ")))
 		case strings.HasPrefix(line, "@@ ") && current != nil:
 			if hunk, ok := parseHunkHeader(line); ok {
 				current.Hunks = append(current.Hunks, hunk)
@@ -622,10 +630,18 @@ func parseDiffGitHeader(line string) (string, string) {
 
 func splitDiffGitArgs(rest string) (string, string, bool) {
 	rest = strings.TrimSpace(rest)
-	if left, right, ok := splitKnownDiffPrefixes(rest, "from/", "to/"); ok {
+	if strings.HasPrefix(rest, "from/") {
+		left, right, ok := splitKnownDiffPrefixes(rest, "from/", "to/")
+		if !ok {
+			return "", "", false
+		}
 		return left, right, true
 	}
-	if left, right, ok := splitKnownDiffPrefixes(rest, "a/", "b/"); ok {
+	if strings.HasPrefix(rest, "a/") {
+		left, right, ok := splitKnownDiffPrefixes(rest, "a/", "b/")
+		if !ok {
+			return "", "", false
+		}
 		return left, right, true
 	}
 	first, remaining, ok := readDiffGitArg(rest)
@@ -644,15 +660,45 @@ func splitKnownDiffPrefixes(rest, leftPrefix, rightPrefix string) (string, strin
 		return "", "", false
 	}
 	marker := " " + rightPrefix
-	index := strings.LastIndex(rest, marker)
-	if index <= 0 {
+	indexes := []int{}
+	searchStart := 0
+	for {
+		index := strings.Index(rest[searchStart:], marker)
+		if index < 0 {
+			break
+		}
+		index += searchStart
+		if index > 0 {
+			indexes = append(indexes, index)
+		}
+		searchStart = index + len(marker)
+	}
+	if len(indexes) == 0 {
 		return "", "", false
 	}
-	left := rest[:index]
-	right := rest[index+1:]
-	if !strings.HasPrefix(right, rightPrefix) {
+	var fallbackLeft, fallbackRight string
+	for _, index := range indexes {
+		left := rest[:index]
+		right := rest[index+1:]
+		if !strings.HasPrefix(right, rightPrefix) {
+			continue
+		}
+		leftPath := normalizeHeaderPath(left, leftPrefix[:len(leftPrefix)-1], "")
+		rightPath := normalizeHeaderPath(right, rightPrefix[:len(rightPrefix)-1], "")
+		if leftPath != "" && rightPath != "" && leftPath == rightPath {
+			return left, right, true
+		}
+		if fallbackLeft == "" && fallbackRight == "" {
+			fallbackLeft, fallbackRight = left, right
+		}
+	}
+	if fallbackLeft == "" && fallbackRight == "" {
 		return "", "", false
 	}
+	if len(indexes) > 1 {
+		return "", "", false
+	}
+	left, right := fallbackLeft, fallbackRight
 	return left, right, true
 }
 
@@ -687,8 +733,23 @@ func readDiffGitArg(rest string) (string, string, bool) {
 
 func normalizeHeaderPath(path string, primaryPrefix, alternatePrefix string) string {
 	for _, prefix := range []string{primaryPrefix, alternatePrefix} {
+		if prefix == "" {
+			continue
+		}
 		if strings.HasPrefix(path, prefix+"/") {
 			return normalizeDiffPath(path, prefix)
+		}
+	}
+	return cleanDiffPath(path)
+}
+
+func normalizeMetadataPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	if strings.HasPrefix(path, `"`) {
+		if unquoted, err := strconv.Unquote(path); err == nil {
+			path = unquoted
 		}
 	}
 	return cleanDiffPath(path)
@@ -918,20 +979,31 @@ func unresolvedAnchorBlockers(store state.Store, events []state.Event, repo stri
 		if migration.FromKind != event.Details["from_kind"] || migration.ToKind != event.Details["to_kind"] || migration.FromSnapshot != event.Details["from_snapshot"] || migration.ToSnapshot != event.Details["to_snapshot"] {
 			return nil, errors.New("anchor migration object does not match anchors.migrated event")
 		}
-		for _, blocker := range migration.ClosureBlockers {
+		for _, result := range migration.Results {
+			anchorID := result.Anchor.ID
+			if strings.TrimSpace(anchorID) == "" {
+				continue
+			}
+			anchorKey := key + "\x00" + anchorID
+			if _, ok := seen[anchorKey]; ok {
+				continue
+			}
+			seen[anchorKey] = struct{}{}
+			if !result.BlocksClosure {
+				continue
+			}
 			code := "unresolved_anchor"
-			if blocker.Status == anchor.StatusAmbiguous {
+			if result.Status == anchor.StatusAmbiguous {
 				code = "ambiguous_anchor"
 			}
 			blockers = append(blockers, Blocker{
 				Code:       code,
-				Message:    "carried-forward evidence is blocked by anchor migration status: " + blocker.Reason,
-				AnchorID:   blocker.AnchorID,
-				Status:     blocker.Status,
+				Message:    "carried-forward evidence is blocked by anchor migration status: " + result.Reason,
+				AnchorID:   anchorID,
+				Status:     result.Status,
 				Transition: migration.FromKind + "->" + migration.ToKind,
 			})
 		}
-		seen[key] = struct{}{}
 	}
 	sortBlockers(blockers)
 	return blockers, nil
