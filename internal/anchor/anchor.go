@@ -361,16 +361,7 @@ func migrateHunkAnchor(anchor Anchor, from, to snapshotView) AnchorResult {
 	samePath, samePathExists := to.Files[anchor.Path]
 	if samePathExists {
 		occurrences := findTextOccurrences(samePath.Body, fromText, anchor.Path, samePath.Digest)
-		switch len(occurrences) {
-		case 0:
-			status := StatusDeleted
-			reason := "hunk text is absent from target file"
-			if hunkAppearsModified(fromText, samePath.Body) {
-				status = StatusModified
-				reason = "target file still contains related hunk text but not an exact match"
-			}
-			return AnchorResult{Anchor: anchor, Status: status, From: fromLoc, To: ptr(AnchorLocation{Path: anchor.Path, Digest: samePath.Digest}), Reason: reason}
-		case 1:
+		if len(occurrences) == 1 {
 			status := StatusMoved
 			reason := "hunk moved within the same file"
 			if occurrences[0].StartLine == anchor.StartLine && occurrences[0].EndLine == anchor.EndLine {
@@ -378,16 +369,29 @@ func migrateHunkAnchor(anchor Anchor, from, to snapshotView) AnchorResult {
 				reason = "hunk text remains at the same location"
 			}
 			return AnchorResult{Anchor: anchor, Status: status, From: fromLoc, To: &occurrences[0], Reason: reason}
-		default:
+		}
+		if len(occurrences) > 1 {
 			return blocker(AnchorResult{Anchor: anchor, Status: StatusAmbiguous, From: fromLoc, Candidates: occurrences, Reason: "hunk text appears multiple times in target file"})
 		}
 	}
 	allMatches := []AnchorLocation{}
 	for _, file := range sortedFiles(to.Files) {
+		if samePathExists && file.Path == anchor.Path {
+			continue
+		}
 		allMatches = append(allMatches, findTextOccurrences(file.Body, fromText, file.Path, file.Digest)...)
 	}
 	switch len(allMatches) {
 	case 0:
+		if samePathExists {
+			status := StatusDeleted
+			reason := "hunk text is absent from target file"
+			if hunkAppearsModified(fromText, samePath.Body) {
+				status = StatusModified
+				reason = "target file still contains related hunk text but not an exact match"
+			}
+			return AnchorResult{Anchor: anchor, Status: status, From: fromLoc, To: ptr(AnchorLocation{Path: anchor.Path, Digest: samePath.Digest}), Reason: reason}
+		}
 		return AnchorResult{Anchor: anchor, Status: StatusDeleted, From: fromLoc, Reason: "hunk path and text are absent from target snapshot"}
 	case 1:
 		return AnchorResult{Anchor: anchor, Status: StatusMoved, From: fromLoc, To: &allMatches[0], Reason: "hunk moved to unique target path"}

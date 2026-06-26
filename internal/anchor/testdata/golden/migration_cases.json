@@ -40,6 +40,14 @@
     "blocks_closure": true
   },
   {
+    "id": "hunk_moved_to_other_file",
+    "status": "moved",
+    "to_path": "dest.txt",
+    "to_start_line": 1,
+    "to_end_line": 1,
+    "blocks_closure": false
+  },
+  {
     "id": "file_unresolved",
     "status": "unresolved",
     "blocks_closure": true

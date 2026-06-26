@@ -35,6 +35,7 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 	writeFile(t, repo, "delete.txt", "gone\n")
 	writeFile(t, repo, "rename-old.txt", "same\n")
 	writeFile(t, repo, "ambiguous.txt", "dup\n")
+	writeFile(t, repo, "source.txt", "move-me\nstay\n")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-m", "initial")
 	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
@@ -53,6 +54,8 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 		t.Fatalf("rename file: %v", err)
 	}
 	writeFile(t, repo, "ambiguous.txt", "dup\nmiddle\ndup\n")
+	writeFile(t, repo, "source.txt", "stay\n")
+	writeFile(t, repo, "dest.txt", "move-me\n")
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
 		t.Fatalf("Capture proposal: %v", err)
 	}
@@ -71,6 +74,7 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 			{ID: "file_deleted", Kind: KindFile, Path: "delete.txt"},
 			{ID: "file_renamed", Kind: KindFile, Path: "rename-old.txt"},
 			{ID: "hunk_ambiguous", Kind: KindHunk, Path: "ambiguous.txt", StartLine: 1, EndLine: 1, Text: "dup\n"},
+			{ID: "hunk_moved_to_other_file", Kind: KindHunk, Path: "source.txt", StartLine: 1, EndLine: 1, Text: "move-me\n"},
 			{ID: "file_unresolved", Kind: KindFile, Path: "missing.txt"},
 		},
 	})
