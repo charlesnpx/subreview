@@ -9,6 +9,7 @@ import (
 
 	"github.com/charlesnpx/subreview/internal/anchor"
 	"github.com/charlesnpx/subreview/internal/install"
+	"github.com/charlesnpx/subreview/internal/obligation"
 	"github.com/charlesnpx/subreview/internal/policy"
 	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
@@ -29,6 +30,8 @@ func main() {
 		err = diffCommand(os.Args[2:])
 	case "install-skills":
 		err = installSkills(os.Args[2:])
+	case "obligations":
+		err = obligationsCommand(os.Args[2:])
 	case "policy":
 		err = policyCommand(os.Args[2:])
 	case "snapshot":
@@ -53,6 +56,8 @@ func usage(w io.Writer) {
   subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> --anchors <path> [--json]
   subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--json]
   subreview install-skills [--plan|--install|--uninstall] [--target tools|claude|codex|all] [--json] [--install-root <dir>]
+  subreview obligations build --state <dir> [--json]
+  subreview obligations status --state <dir> [--json]
   subreview policy check --config <path> --repo <path> [--json]
   subreview policy bind --state <dir> --config <path> --profile <name> [--json]
   subreview policy explain --state <dir> --profile <name> [--json]
@@ -61,6 +66,96 @@ func usage(w io.Writer) {
   subreview state init --state <dir> --repo <path> [--json]
   subreview state validate --state <dir> [--json]
   subreview version`)
+}
+
+func obligationsCommand(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("obligations requires subcommand: build or status")
+	}
+	if isHelpCommand(args[0]) {
+		usageObligations(os.Stdout)
+		return nil
+	}
+	switch args[0] {
+	case "build":
+		return obligationsBuild(args[1:])
+	case "status":
+		return obligationsStatus(args[1:])
+	default:
+		return fmt.Errorf("obligations requires subcommand: build or status")
+	}
+}
+
+func obligationsBuild(args []string) error {
+	if hasHelpFlag(args) {
+		usageObligationsBuild(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("obligations build", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("obligations build does not accept positional arguments")
+	}
+	result, err := obligation.Build(obligation.BuildOptions{StateDir: *stateDir})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("obligations built: %s (%d obligations, %d blockers)\n", result.Manifest.Digest, result.ObligationCount, result.BlockerCount)
+	return nil
+}
+
+func obligationsStatus(args []string) error {
+	if hasHelpFlag(args) {
+		usageObligationsStatus(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("obligations status", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("obligations status does not accept positional arguments")
+	}
+	result, err := obligation.Status(obligation.StatusOptions{StateDir: *stateDir})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("obligations status: %d unsatisfied, %d blockers\n", result.UnsatisfiedCount, len(result.Blockers))
+	return nil
+}
+
+func usageObligations(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview obligations build --state <dir> [--json]
+  subreview obligations status --state <dir> [--json]`)
+}
+
+func usageObligationsBuild(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview obligations build --state <dir> [--json]
+
+Builds a CAS-backed coverage manifest from captured base->proposal and base->final diffs.`)
+}
+
+func usageObligationsStatus(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview obligations status --state <dir> [--json]
+
+Reports unsatisfied obligation evidence slots and closure blockers from the latest coverage manifest.`)
 }
 
 func anchorsCommand(args []string) error {

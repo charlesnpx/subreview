@@ -16,6 +16,8 @@ subreview snapshot capture --state /tmp/subreview-state --kind proposal --repo .
 subreview snapshot restore --state /tmp/subreview-state --kind proposal --output /tmp/subreview-restore --json
 subreview diff create --state /tmp/subreview-state --from base --to proposal --json
 subreview anchors migrate --state /tmp/subreview-state --from base --to proposal --anchors /tmp/subreview-anchors.json --json
+subreview obligations build --state /tmp/subreview-state --json
+subreview obligations status --state /tmp/subreview-state --json
 subreview install-skills --plan --target all --json
 subreview install-skills --install --target all --json --install-root /tmp/subreview-stage
 subreview install-skills --uninstall --target all --json --install-root /tmp/subreview-stage
@@ -42,5 +44,7 @@ The installed skills are intentionally thin. They tell agents to invoke the CLI,
 `subreview snapshot capture` records base, proposal, or final snapshots as reconstructable CAS tree manifests and file blobs. Captures from `--ref` record commit/tree metadata when available; working-tree captures explicitly record dirty state and omit `commit_sha` when the snapshot is not committed. `subreview snapshot restore` reconstructs the latest captured snapshot of a kind from CAS into an empty output directory. `subreview diff create` stores transition diff objects for captured snapshot pairs such as base to proposal, proposal to final, and base to final.
 
 `subreview anchors migrate` migrates JSON anchor manifests containing file, path, and hunk anchors across an already captured snapshot diff. Migration results are stored in CAS and ledgered as `anchors.migrated`; ambiguous and unresolved anchors are emitted as closure blockers rather than silently carried forward.
+
+`subreview obligations build` creates a CAS-backed coverage manifest from captured base-to-proposal and base-to-final diffs plus the bound policy. The manifest records hunk, file, path, gate-requirement, context-request placeholder, and policy-final-review obligations. `subreview obligations status` reports unsatisfied evidence slots and explicit blockers for missing gate evidence, missing review evidence, unresolved context, unresolved anchors, hidden final-state scope, and unsatisfied required checks. Story 007 intentionally records future evidence slots without importing review, gate, verification, or refutation adapters yet.
 
 The existing `research/` corpus and `scripts/` utilities are research inputs for policy design and evaluation. They are separate from the v1 runtime CLI and are not imported or executed by `subreview` commands.
