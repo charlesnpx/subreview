@@ -1154,6 +1154,8 @@ func renderVerificationStablePrefix(data verificationRenderData) string {
 	fmt.Fprintf(&b, "- class: %s\n", data.Verification.Finding.Class)
 	fmt.Fprintf(&b, "- claim: %s\n", markdownJSONString(data.Verification.Finding.Claim))
 	fmt.Fprintf(&b, "- failure_scenario: %s\n", markdownJSONString(data.Verification.Finding.FailureScenario))
+	renderLineRefs(&b, "citations", data.Verification.Finding.Citations)
+	renderAnchorRefs(&b, "anchors", data.Verification.Finding.Anchors)
 	if len(data.Verification.ExpectedFixSurface) > 0 {
 		fmt.Fprintln(&b, "- expected_fix_surface:")
 		for _, surface := range data.Verification.ExpectedFixSurface {
@@ -1230,6 +1232,53 @@ func renderVerificationStablePrefix(data verificationRenderData) string {
 	fmt.Fprintln(&b, "- finding_invalid requires verifier_relation=fresh_blinded and relation_evidence=cli_witnessed|caller_asserted|external_asserted.")
 	fmt.Fprintln(&b, "- deterministic_refuted requires matching deterministic_refutations evidence for the same finding_id.")
 	return strings.TrimSpace(b.String())
+}
+
+func renderLineRefs(b *strings.Builder, label string, refs []reviewresult.LineRef) {
+	if len(refs) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "- %s:\n", label)
+	for _, ref := range refs {
+		fmt.Fprintf(b, "  - %s", markdownJSONString(ref.Path))
+		renderLineRange(b, ref.StartLine, ref.EndLine)
+		if ref.Quote != "" {
+			fmt.Fprintf(b, " quote=%s", markdownJSONString(ref.Quote))
+		}
+		if ref.Digest != "" {
+			fmt.Fprintf(b, " digest=%s", ref.Digest)
+		}
+		fmt.Fprintln(b)
+	}
+}
+
+func renderAnchorRefs(b *strings.Builder, label string, refs []reviewresult.AnchorRef) {
+	if len(refs) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "- %s:\n", label)
+	for _, ref := range refs {
+		fmt.Fprintf(b, "  - %s", markdownJSONString(ref.Path))
+		renderLineRange(b, ref.StartLine, ref.EndLine)
+		if ref.Kind != "" {
+			fmt.Fprintf(b, " kind=%s", ref.Kind)
+		}
+		if ref.ObligationID != "" {
+			fmt.Fprintf(b, " obligation_id=%s", ref.ObligationID)
+		}
+		fmt.Fprintln(b)
+	}
+}
+
+func renderLineRange(b *strings.Builder, startLine, endLine int) {
+	if startLine <= 0 {
+		return
+	}
+	if endLine <= 0 {
+		fmt.Fprintf(b, ":%d", startLine)
+		return
+	}
+	fmt.Fprintf(b, ":%d-%d", startLine, endLine)
 }
 
 func renderVolatileSuffix(stateDir string, now time.Time) string {

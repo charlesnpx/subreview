@@ -628,7 +628,7 @@ func TestBuildVerificationPacketUsesProposalFinalState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read markdown: %v", err)
 	}
-	for _, want := range []string{"# Subreview Verification Packet", "## Verification Questions", "proposal-to-final", "resolved, not_resolved, regression_introduced", "finding_invalid requires verifier_relation=fresh_blinded", "deterministic_refuted requires matching deterministic_refutations"} {
+	for _, want := range []string{"# Subreview Verification Packet", "## Verification Questions", "proposal-to-final", "resolved, not_resolved, regression_introduced", "finding_invalid requires verifier_relation=fresh_blinded", "deterministic_refuted requires matching deterministic_refutations", "- citations:", "- anchors:", "\"alpha.txt\":1-2", "kind=hunk"} {
 		if !strings.Contains(string(markdown), want) {
 			t.Fatalf("verification markdown missing %q:\n%s", want, markdown)
 		}
