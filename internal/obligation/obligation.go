@@ -359,6 +359,12 @@ func Status(opts StatusOptions) (StatusResult, error) {
 					ObligationID: obligation.ID,
 					Path:         obligation.Path,
 				})
+			case !gateEvidenceMatchesSnapshot(evidence.Record, manifest):
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "stale_gate_evidence",
+					Message:      "gate evidence snapshot does not match this coverage manifest",
+					ObligationID: obligation.ID,
+				})
 			case !gateEvidenceMatchesPolicy(evidence.Record, manifest.Policy):
 				status.Blockers = append(status.Blockers, Blocker{
 					Code:         "stale_gate_evidence",
@@ -422,6 +428,30 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		Blockers:                     blockers,
 		Obligations:                  statuses,
 	}, nil
+}
+
+func gateEvidenceMatchesSnapshot(evidence gate.EvidenceRecord, manifest CoverageManifest) bool {
+	kind, digest := requiredGateSnapshot(manifest)
+	return kind != "" && evidence.InputSnapshot.Kind == kind && evidence.InputSnapshot.Digest == digest
+}
+
+func requiredGateSnapshot(manifest CoverageManifest) (string, string) {
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == "base" && diff.ToKind == "final" {
+			return diff.ToKind, diff.ToSnapshot
+		}
+	}
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == "base" && diff.ToKind == "proposal" {
+			return diff.ToKind, diff.ToSnapshot
+		}
+	}
+	for _, diff := range manifest.SourceDiffs {
+		if diff.ToKind != "" && diff.ToSnapshot != "" {
+			return diff.ToKind, diff.ToSnapshot
+		}
+	}
+	return "", ""
 }
 
 func gateEvidenceMatchesPolicy(evidence gate.EvidenceRecord, manifestPolicy *PolicyRef) bool {

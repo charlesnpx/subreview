@@ -98,6 +98,27 @@ func TestRunStoresCLIWitnessedGateEvidence(t *testing.T) {
 	}
 }
 
+func TestRunExecutesRestoredSnapshotNotDirtyWorkingTree(t *testing.T) {
+	repo, stateDir := initializedGateState(t)
+	writeFile(t, repo, "alpha.txt", "dirty\n")
+	catalogPath := writeCatalog(t, t.TempDir(), Catalog{
+		SchemaVersion: SchemaVersion,
+		Commands: []CommandDefinition{
+			testCommand("go_test_all", []string{"/bin/sh", "-c", "test \"$(cat alpha.txt)\" = one"}),
+		},
+	})
+	result, err := Run(RunOptions{StateDir: stateDir, CatalogPath: catalogPath, CommandID: "go_test_all", SnapshotKind: "proposal", Now: time.Unix(250, 0)})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Outcome != OutcomePass {
+		t.Fatalf("gate should run against restored snapshot, got %+v", result)
+	}
+	if got := readFile(t, repo, "alpha.txt"); got != "dirty\n" {
+		t.Fatalf("gate run should not modify live working tree, got %q", got)
+	}
+}
+
 func TestRecordStoresExternalAssertedGateEvidence(t *testing.T) {
 	_, stateDir := initializedGateState(t)
 	catalogPath := writeCatalog(t, t.TempDir(), Catalog{
@@ -241,4 +262,13 @@ func writeFile(t *testing.T, root, rel, body string) {
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", rel, err)
 	}
+}
+
+func readFile(t *testing.T, root, rel string) string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	return string(body)
 }

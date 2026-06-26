@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/subreview/internal/policy"
+	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
 )
 
@@ -235,7 +236,7 @@ func Run(opts RunOptions) (EvidenceResult, error) {
 	if err != nil {
 		return EvidenceResult{}, err
 	}
-	snapshot, err := latestSnapshotBinding(events, opts.SnapshotKind, binding.Repo)
+	inputSnapshot, err := latestSnapshotBinding(events, opts.SnapshotKind, binding.Repo)
 	if err != nil {
 		return EvidenceResult{}, err
 	}
@@ -251,8 +252,13 @@ func Run(opts RunOptions) (EvidenceResult, error) {
 	if start.IsZero() {
 		start = time.Now().UTC()
 	}
-	run := executeCommand(binding.Repo, command, start)
-	record := evidenceRecord(binding.Repo, command, catalogRef, policyRef, snapshot, ProvenanceCLIWitnessed, run.Outcome, run.ExitCode, EvidenceDiagnostics{
+	runRoot, cleanup, err := restoredSnapshotRoot(binding.State, opts.SnapshotKind, inputSnapshot.Digest)
+	if err != nil {
+		return EvidenceResult{}, err
+	}
+	defer cleanup()
+	run := executeCommand(runRoot, command, start)
+	record := evidenceRecord(binding.Repo, command, catalogRef, policyRef, inputSnapshot, ProvenanceCLIWitnessed, run.Outcome, run.ExitCode, EvidenceDiagnostics{
 		Summary:    run.Summary,
 		StdoutTail: run.StdoutTail,
 		StderrTail: run.StderrTail,
@@ -548,6 +554,25 @@ func executeCommand(repo string, command CommandDefinition, startedAt time.Time)
 		return commandRun{Outcome: outcomeForExitCode(command, code), ExitCode: &code, Summary: fmt.Sprintf("gate command exited with code %d", code), StdoutTail: stdoutTail, StderrTail: stderrTail, EndedAt: endedAt}
 	}
 	return commandRun{Outcome: OutcomeError, Summary: truncateDiagnostic(err.Error()), StdoutTail: stdoutTail, StderrTail: stderrTail, EndedAt: endedAt}
+}
+
+func restoredSnapshotRoot(stateDir, kind, expectedDigest string) (string, func(), error) {
+	root, err := os.MkdirTemp("", "subreview-gate-*")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(root) }
+	output := filepath.Join(root, "snapshot")
+	restored, err := snapshot.Restore(snapshot.RestoreOptions{StateDir: stateDir, Kind: kind, Output: output})
+	if err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	if restored.SnapshotDigest != expectedDigest {
+		cleanup()
+		return "", nil, fmt.Errorf("restored snapshot changed before gate run: %s != %s", restored.SnapshotDigest, expectedDigest)
+	}
+	return output, cleanup, nil
 }
 
 func evidenceRecord(repo string, command CommandDefinition, catalog state.ObjectRef, policyRef *PolicyRef, snapshot snapshotBinding, provenance, outcome string, exitCode *int, diagnostics EvidenceDiagnostics, startedAt, endedAt time.Time) EvidenceRecord {

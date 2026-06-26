@@ -98,7 +98,7 @@ func TestGateEvidenceSatisfiesGateRequirementObligation(t *testing.T) {
 		StateDir:     stateDir,
 		CatalogPath:  catalogPath,
 		CommandID:    "go_test_all",
-		SnapshotKind: "proposal",
+		SnapshotKind: "final",
 		Outcome:      gate.OutcomePass,
 		Provenance:   gate.ProvenanceExternalAsserted,
 		Diagnostic:   "external pass",
@@ -119,7 +119,7 @@ func TestGateEvidenceSatisfiesGateRequirementObligation(t *testing.T) {
 	}
 }
 
-func TestGateFailureBlocksReview(t *testing.T) {
+func TestGateEvidenceMustMatchManifestSnapshot(t *testing.T) {
 	_, stateDir := initializedStateWithBuiltObligations(t)
 	catalogPath := writeGateCatalog(t, t.TempDir(), "go_test_all")
 	if _, err := gate.Record(gate.RecordOptions{
@@ -127,6 +127,34 @@ func TestGateFailureBlocksReview(t *testing.T) {
 		CatalogPath:  catalogPath,
 		CommandID:    "go_test_all",
 		SnapshotKind: "proposal",
+		Outcome:      gate.OutcomePass,
+		Provenance:   gate.ProvenanceExternalAsserted,
+		Diagnostic:   "external pass on proposal",
+		Now:          time.Unix(200, 0),
+	}); err != nil {
+		t.Fatalf("Record proposal gate pass: %v", err)
+	}
+	status, err := Status(StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if !hasBlocker(status.Blockers, "stale_gate_evidence") {
+		t.Fatalf("proposal evidence should not satisfy final-state manifest: %+v", status.Blockers)
+	}
+	gateStatus := gateObligationStatus(t, status, "go_test_all")
+	if gateStatus.Satisfied {
+		t.Fatalf("stale snapshot gate evidence should not satisfy obligation: %+v", gateStatus)
+	}
+}
+
+func TestGateFailureBlocksReview(t *testing.T) {
+	_, stateDir := initializedStateWithBuiltObligations(t)
+	catalogPath := writeGateCatalog(t, t.TempDir(), "go_test_all")
+	if _, err := gate.Record(gate.RecordOptions{
+		StateDir:     stateDir,
+		CatalogPath:  catalogPath,
+		CommandID:    "go_test_all",
+		SnapshotKind: "final",
 		Outcome:      gate.OutcomeFail,
 		Provenance:   gate.ProvenanceExternalAsserted,
 		Diagnostic:   "external failure",
