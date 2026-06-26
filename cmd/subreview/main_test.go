@@ -231,6 +231,50 @@ func TestSnapshotCaptureRestoreAndDiffCLI(t *testing.T) {
 		t.Fatalf("bad diff output: %s", diffOut)
 	}
 
+	anchorsPath := filepath.Join(root, "anchors.json")
+	if err := os.WriteFile(anchorsPath, []byte(`{
+  "schema_version": 1,
+  "anchors": [
+    {"id": "alpha-file", "kind": "file", "path": "alpha.txt"},
+    {"id": "missing-file", "kind": "file", "path": "missing.txt"}
+  ]
+}`), 0o644); err != nil {
+		t.Fatalf("write anchors manifest: %v", err)
+	}
+	anchorsOut, err := exec.Command(bin, "anchors", "migrate", "--state", stateDir, "--from", "base", "--to", "proposal", "--anchors", anchorsPath, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("anchors migrate failed: %v\n%s", err, anchorsOut)
+	}
+	var anchorsResult struct {
+		FromSnapshot string `json:"from_snapshot"`
+		ToSnapshot   string `json:"to_snapshot"`
+		EventID      string `json:"event_id"`
+		Results      []struct {
+			Anchor struct {
+				ID string `json:"id"`
+			} `json:"anchor"`
+			Status        string `json:"status"`
+			BlocksClosure bool   `json:"blocks_closure"`
+		} `json:"results"`
+		ClosureBlockers []struct {
+			AnchorID string `json:"anchor_id"`
+			Status   string `json:"status"`
+		} `json:"closure_blockers"`
+	}
+	if err := json.Unmarshal(anchorsOut, &anchorsResult); err != nil {
+		t.Fatalf("anchors output is not json: %v\n%s", err, anchorsOut)
+	}
+	if anchorsResult.FromSnapshot != base.Snapshot.Digest || anchorsResult.ToSnapshot != proposal.Snapshot.Digest || anchorsResult.EventID == "" || len(anchorsResult.Results) != 2 {
+		t.Fatalf("bad anchors output: %s", anchorsOut)
+	}
+	statuses := map[string]string{}
+	for _, result := range anchorsResult.Results {
+		statuses[result.Anchor.ID] = result.Status
+	}
+	if statuses["alpha-file"] != "modified" || statuses["missing-file"] != "unresolved" || len(anchorsResult.ClosureBlockers) != 1 || anchorsResult.ClosureBlockers[0].AnchorID != "missing-file" {
+		t.Fatalf("bad anchor migration statuses: %s", anchorsOut)
+	}
+
 	restoreDir := filepath.Join(root, "restore")
 	restoreOut, err := exec.Command(bin, "snapshot", "restore", "--state", stateDir, "--kind", "proposal", "--output", restoreDir, "--json").CombinedOutput()
 	if err != nil {

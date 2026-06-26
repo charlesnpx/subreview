@@ -1,0 +1,47 @@
+[
+  {
+    "id": "path_unchanged",
+    "status": "unchanged",
+    "to_path": "edit.txt",
+    "blocks_closure": false
+  },
+  {
+    "id": "file_modified",
+    "status": "modified",
+    "to_path": "edit.txt",
+    "blocks_closure": false
+  },
+  {
+    "id": "hunk_adjacent",
+    "status": "moved",
+    "to_path": "adjacent.txt",
+    "to_start_line": 3,
+    "to_end_line": 3,
+    "blocks_closure": false
+  },
+  {
+    "id": "file_deleted",
+    "status": "deleted",
+    "blocks_closure": false
+  },
+  {
+    "id": "file_renamed",
+    "status": "moved",
+    "to_path": "rename-new.txt",
+    "blocks_closure": false
+  },
+  {
+    "id": "hunk_ambiguous",
+    "status": "ambiguous",
+    "candidates": [
+      "ambiguous.txt:1-1",
+      "ambiguous.txt:3-3"
+    ],
+    "blocks_closure": true
+  },
+  {
+    "id": "file_unresolved",
+    "status": "unresolved",
+    "blocks_closure": true
+  }
+]

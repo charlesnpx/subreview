@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/charlesnpx/subreview/internal/anchor"
 	"github.com/charlesnpx/subreview/internal/install"
 	"github.com/charlesnpx/subreview/internal/policy"
 	"github.com/charlesnpx/subreview/internal/snapshot"
@@ -22,6 +23,8 @@ func main() {
 	}
 	var err error
 	switch os.Args[1] {
+	case "anchors":
+		err = anchorsCommand(os.Args[2:])
 	case "diff":
 		err = diffCommand(os.Args[2:])
 	case "install-skills":
@@ -47,6 +50,7 @@ func main() {
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
+  subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--anchors <path>] [--json]
   subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--json]
   subreview install-skills [--plan|--install|--uninstall] [--target tools|claude|codex|all] [--json] [--install-root <dir>]
   subreview policy check --config <path> --repo <path> [--json]
@@ -57,6 +61,63 @@ func usage(w io.Writer) {
   subreview state init --state <dir> --repo <path> [--json]
   subreview state validate --state <dir> [--json]
   subreview version`)
+}
+
+func anchorsCommand(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("anchors requires subcommand: migrate")
+	}
+	if isHelpCommand(args[0]) {
+		usageAnchors(os.Stdout)
+		return nil
+	}
+	switch args[0] {
+	case "migrate":
+		return anchorsMigrate(args[1:])
+	default:
+		return fmt.Errorf("anchors requires subcommand: migrate")
+	}
+}
+
+func anchorsMigrate(args []string) error {
+	if hasHelpFlag(args) {
+		usageAnchorsMigrate(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("anchors migrate", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	fromKind := fs.String("from", "", "Snapshot kind to migrate from")
+	toKind := fs.String("to", "", "Snapshot kind to migrate to")
+	anchorsPath := fs.String("anchors", "", "Optional JSON anchor manifest path")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("anchors migrate does not accept positional arguments")
+	}
+	result, err := anchor.Migrate(anchor.MigrateOptions{StateDir: *stateDir, FromKind: *fromKind, ToKind: *toKind, AnchorPath: *anchorsPath, WriteLedger: true})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("anchors migrated: %s->%s %s (%d blockers)\n", result.FromKind, result.ToKind, result.Migration.Digest, len(result.ClosureBlockers))
+	return nil
+}
+
+func usageAnchors(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--anchors <path>] [--json]`)
+}
+
+func usageAnchorsMigrate(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--anchors <path>] [--json]
+
+Migrates file, path, and hunk anchors across an already captured snapshot diff.`)
 }
 
 func diffCommand(args []string) error {
