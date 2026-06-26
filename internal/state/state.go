@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	SchemaVersion      = 1
-	maxLedgerLineBytes = 1 << 20
+	SchemaVersion           = 1
+	maxLedgerLineBytes      = 1 << 20
+	maxLedgerScanTokenBytes = maxLedgerLineBytes + 1
 )
 
 var (
@@ -521,7 +522,7 @@ func validateLedger(lay layout, result *ValidationResult) []string {
 	defer f.Close()
 	var referenced []string
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxLedgerLineBytes)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLedgerScanTokenBytes)
 	lineNo := 0
 	prior := ""
 	for scanner.Scan() {
@@ -772,7 +773,7 @@ func lastEventID(path string) (string, error) {
 	}
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxLedgerLineBytes)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLedgerScanTokenBytes)
 	last := ""
 	lineNo := 0
 	for scanner.Scan() {

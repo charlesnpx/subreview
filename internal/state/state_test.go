@@ -454,6 +454,59 @@ func TestLedgerAcceptsSupportedLargeEvents(t *testing.T) {
 	}
 }
 
+func TestLedgerAcceptsMaxSizedEventLine(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	ledgerPath := filepath.Join(stateDir, "ledger.jsonl")
+	prior, err := lastEventID(ledgerPath)
+	if err != nil {
+		t.Fatalf("lastEventID: %v", err)
+	}
+	event := Event{
+		SchemaVersion: SchemaVersion,
+		Time:          time.Unix(101, 0).UTC().Format(time.RFC3339Nano),
+		Type:          "max_line",
+		PriorEventID:  prior,
+		Details: map[string]string{
+			"payload": "",
+		},
+	}
+	event.EventID = eventID(event)
+	baseLine, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal base event: %v", err)
+	}
+	payloadLen := maxLedgerLineBytes - len(baseLine)
+	if payloadLen <= 0 {
+		t.Fatalf("base event unexpectedly exceeds ledger line limit: %d", len(baseLine))
+	}
+	event.Details["payload"] = strings.Repeat("x", payloadLen)
+	event.EventID = eventID(event)
+	line, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal max event: %v", err)
+	}
+	if len(line) != maxLedgerLineBytes {
+		t.Fatalf("expected max line length %d, got %d", maxLedgerLineBytes, len(line))
+	}
+	if _, err := AppendEvent(stateDir, Event{Time: event.Time, Type: event.Type, Details: event.Details}); err != nil {
+		t.Fatalf("AppendEvent max line: %v", err)
+	}
+	if _, err := AppendEvent(stateDir, Event{Time: time.Unix(102, 0).UTC().Format(time.RFC3339Nano), Type: "after_max"}); err != nil {
+		t.Fatalf("AppendEvent after max line: %v", err)
+	}
+	validation := Validate(stateDir)
+	if !validation.OK {
+		t.Fatalf("state should validate with max line event: %+v", validation.Errors)
+	}
+	if validation.EventCount != 3 {
+		t.Fatalf("unexpected event count after max line event: %+v", validation)
+	}
+}
+
 func TestLedgerRejectsOversizedEvents(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")
