@@ -318,7 +318,7 @@ func Status(opts StatusOptions) (StatusResult, error) {
 	}
 	blockers := append([]Blocker(nil), manifest.Blockers...)
 	blockers = append(blockers, contextBlockers(events)...)
-	anchorBlockers, err := unresolvedAnchorBlockers(store, events, binding.Repo)
+	anchorBlockers, err := unresolvedAnchorBlockers(store, events, binding.Repo, manifest.SourceDiffs)
 	if err != nil {
 		return StatusResult{}, err
 	}
@@ -525,11 +525,12 @@ func parsePatch(body []byte) []filePatch {
 			if current != nil {
 				files = append(files, *current)
 			}
-			current = &filePatch{}
+			oldPath, newPath := parseDiffGitHeader(line)
+			current = &filePatch{OldPath: oldPath, NewPath: newPath}
 		case strings.HasPrefix(line, "--- ") && current != nil:
-			current.OldPath = normalizeDiffPath(strings.TrimSpace(strings.TrimPrefix(line, "--- ")), "from")
+			current.OldPath = normalizeHeaderPath(strings.TrimSpace(strings.TrimPrefix(line, "--- ")), "from", "a")
 		case strings.HasPrefix(line, "+++ ") && current != nil:
-			current.NewPath = normalizeDiffPath(strings.TrimSpace(strings.TrimPrefix(line, "+++ ")), "to")
+			current.NewPath = normalizeHeaderPath(strings.TrimSpace(strings.TrimPrefix(line, "+++ ")), "to", "b")
 		case strings.HasPrefix(line, "@@ ") && current != nil:
 			if hunk, ok := parseHunkHeader(line); ok {
 				current.Hunks = append(current.Hunks, hunk)
@@ -589,6 +590,13 @@ func finalHunkSpan(hunk patchHunk) (int, int) {
 }
 
 func normalizeDiffPath(path, prefix string) string {
+	if prefix != "" {
+		path = strings.TrimPrefix(path, prefix+"/")
+	}
+	return cleanDiffPath(path)
+}
+
+func cleanDiffPath(path string) string {
 	if path == "/dev/null" || path == "" {
 		return ""
 	}
@@ -596,12 +604,94 @@ func normalizeDiffPath(path, prefix string) string {
 		path = path[:tab]
 	}
 	path = strings.Trim(path, `"`)
-	path = strings.TrimPrefix(path, prefix+"/")
 	clean, err := cleanRepoPath(path)
 	if err != nil {
 		return ""
 	}
 	return clean
+}
+
+func parseDiffGitHeader(line string) (string, string) {
+	rest := strings.TrimSpace(strings.TrimPrefix(line, "diff --git "))
+	left, right, ok := splitDiffGitArgs(rest)
+	if !ok {
+		return "", ""
+	}
+	return normalizeHeaderPath(left, "from", "a"), normalizeHeaderPath(right, "to", "b")
+}
+
+func splitDiffGitArgs(rest string) (string, string, bool) {
+	rest = strings.TrimSpace(rest)
+	if left, right, ok := splitKnownDiffPrefixes(rest, "from/", "to/"); ok {
+		return left, right, true
+	}
+	if left, right, ok := splitKnownDiffPrefixes(rest, "a/", "b/"); ok {
+		return left, right, true
+	}
+	first, remaining, ok := readDiffGitArg(rest)
+	if !ok {
+		return "", "", false
+	}
+	second, remaining, ok := readDiffGitArg(strings.TrimSpace(remaining))
+	if !ok || strings.TrimSpace(remaining) != "" {
+		return "", "", false
+	}
+	return first, second, true
+}
+
+func splitKnownDiffPrefixes(rest, leftPrefix, rightPrefix string) (string, string, bool) {
+	if !strings.HasPrefix(rest, leftPrefix) {
+		return "", "", false
+	}
+	marker := " " + rightPrefix
+	index := strings.LastIndex(rest, marker)
+	if index <= 0 {
+		return "", "", false
+	}
+	left := rest[:index]
+	right := rest[index+1:]
+	if !strings.HasPrefix(right, rightPrefix) {
+		return "", "", false
+	}
+	return left, right, true
+}
+
+func readDiffGitArg(rest string) (string, string, bool) {
+	if rest == "" {
+		return "", "", false
+	}
+	if rest[0] != '"' {
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			return "", "", false
+		}
+		return fields[0], strings.TrimSpace(strings.TrimPrefix(rest, fields[0])), true
+	}
+	escaped := false
+	for i := 1; i < len(rest); i++ {
+		switch {
+		case escaped:
+			escaped = false
+		case rest[i] == '\\':
+			escaped = true
+		case rest[i] == '"':
+			value, err := strconv.Unquote(rest[:i+1])
+			if err != nil {
+				return "", "", false
+			}
+			return value, rest[i+1:], true
+		}
+	}
+	return "", "", false
+}
+
+func normalizeHeaderPath(path string, primaryPrefix, alternatePrefix string) string {
+	for _, prefix := range []string{primaryPrefix, alternatePrefix} {
+		if strings.HasPrefix(path, prefix+"/") {
+			return normalizeDiffPath(path, prefix)
+		}
+	}
+	return cleanDiffPath(path)
 }
 
 func latestCoverageManifest(store state.Store, events []state.Event, stateDir, repo string) (state.ObjectRef, CoverageManifest, error) {
@@ -791,14 +881,24 @@ func latestSnapshotDigest(events []state.Event, kind, repo string) (string, erro
 	return "", fmt.Errorf("snapshot kind is not captured in state: %s", kind)
 }
 
-func unresolvedAnchorBlockers(store state.Store, events []state.Event, repo string) ([]Blocker, error) {
+func unresolvedAnchorBlockers(store state.Store, events []state.Event, repo string, activeDiffs []TransitionDiff) ([]Blocker, error) {
 	blockers := []Blocker{}
-	for _, event := range events {
+	active := activeTransitionDiffs(activeDiffs)
+	seen := map[string]struct{}{}
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
 		if event.Type != "anchors.migrated" {
 			continue
 		}
 		if event.Repo != repo {
 			return nil, errors.New("malformed anchors.migrated event: repo mismatch")
+		}
+		key := transitionKey(event.Details["from_kind"], event.Details["to_kind"], event.Details["from_snapshot"], event.Details["to_snapshot"])
+		if _, ok := active[key]; !ok {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
 		}
 		digest := event.Details["migration"]
 		if strings.TrimSpace(digest) == "" {
@@ -815,6 +915,9 @@ func unresolvedAnchorBlockers(store state.Store, events []state.Event, repo stri
 		if migration.SchemaVersion != anchor.SchemaVersion || migration.Repo != repo {
 			return nil, errors.New("anchor migration object does not match anchors.migrated event")
 		}
+		if migration.FromKind != event.Details["from_kind"] || migration.ToKind != event.Details["to_kind"] || migration.FromSnapshot != event.Details["from_snapshot"] || migration.ToSnapshot != event.Details["to_snapshot"] {
+			return nil, errors.New("anchor migration object does not match anchors.migrated event")
+		}
 		for _, blocker := range migration.ClosureBlockers {
 			code := "unresolved_anchor"
 			if blocker.Status == anchor.StatusAmbiguous {
@@ -828,9 +931,22 @@ func unresolvedAnchorBlockers(store state.Store, events []state.Event, repo stri
 				Transition: migration.FromKind + "->" + migration.ToKind,
 			})
 		}
+		seen[key] = struct{}{}
 	}
 	sortBlockers(blockers)
 	return blockers, nil
+}
+
+func activeTransitionDiffs(diffs []TransitionDiff) map[string]struct{} {
+	active := map[string]struct{}{}
+	for _, diff := range diffs {
+		active[transitionKey(diff.FromKind, diff.ToKind, diff.FromSnapshot, diff.ToSnapshot)] = struct{}{}
+	}
+	return active
+}
+
+func transitionKey(fromKind, toKind, fromSnapshot, toSnapshot string) string {
+	return fromKind + "\x00" + toKind + "\x00" + fromSnapshot + "\x00" + toSnapshot
 }
 
 func contextBlockers(events []state.Event) []Blocker {
