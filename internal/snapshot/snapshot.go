@@ -189,9 +189,14 @@ func Capture(opts CaptureOptions) (CaptureResult, error) {
 		record.Provenance.Dirty = git.Dirty
 		if !git.Dirty && git.HeadCommitSHA != "" {
 			record.CommitSHA = git.HeadCommitSHA
-			record.GitTreeSHA, _ = gitTreeSHA(repo, "HEAD")
+			record.GitTreeSHA, err = gitTreeSHA(repo, "HEAD")
+			if err != nil {
+				return CaptureResult{}, err
+			}
+			entries, err = captureGitTree(store, repo, record.GitTreeSHA)
+		} else {
+			entries, err = captureWorkingTree(store, repo)
 		}
-		entries, err = captureWorkingTree(store, repo)
 		if err != nil {
 			return CaptureResult{}, err
 		}

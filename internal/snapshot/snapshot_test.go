@@ -133,6 +133,45 @@ func TestCaptureRestoreAndDiffCommittedAndUncommittedSnapshots(t *testing.T) {
 	}
 }
 
+func TestCleanWorkingTreeCaptureUsesGitTreeBytes(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	git(t, repo, "config", "core.autocrlf", "false")
+	writeFile(t, repo, ".gitattributes", "*.txt text eol=crlf\n")
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", ".gitattributes", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if err := os.Remove(filepath.Join(repo, "alpha.txt")); err != nil {
+		t.Fatalf("remove alpha: %v", err)
+	}
+	git(t, repo, "checkout", "--", "alpha.txt")
+	if status := gitOutput(t, repo, "status", "--porcelain"); status != "" {
+		t.Fatalf("expected clean repo after checkout, got status %q", status)
+	}
+	if body := readFile(t, repo, "alpha.txt"); body != "one\r\n" {
+		t.Skipf("git did not materialize CRLF working tree bytes, got %q", body)
+	}
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	captured, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base"})
+	if err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	if captured.Dirty || captured.CommitSHA == "" || captured.GitTreeSHA == "" {
+		t.Fatalf("clean capture should advertise commit/tree provenance: %+v", captured)
+	}
+	restoreDir := filepath.Join(root, "restore")
+	if _, err := Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: restoreDir}); err != nil {
+		t.Fatalf("Restore base: %v", err)
+	}
+	if got := readFile(t, restoreDir, "alpha.txt"); got != "one\n" {
+		t.Fatalf("clean capture should restore HEAD blob bytes, got %q", got)
+	}
+}
+
 func TestCreateDiffFailsWhenSnapshotIsMissing(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
