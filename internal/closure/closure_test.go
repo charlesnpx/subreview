@@ -190,6 +190,15 @@ func TestEvaluateEnforcesAllowedClosureBasis(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Import clean result: %v", err)
 	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build final obligations: %v", err)
+	}
 	blocked, err := closure.Evaluate(closure.EvaluateOptions{StateDir: stateDir, PolicyProfile: "default"})
 	if err != nil {
 		t.Fatalf("Evaluate closure: %v", err)
@@ -223,14 +232,8 @@ func TestEvaluateEnforcesContextExpansionRouteLimit(t *testing.T) {
 	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
 		t.Fatalf("CreateDiff base->proposal: %v", err)
 	}
-	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
-		t.Fatalf("Capture final: %v", err)
-	}
-	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
-		t.Fatalf("CreateDiff base->final: %v", err)
-	}
 	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
-		t.Fatalf("Build obligations: %v", err)
+		t.Fatalf("Build proposal obligations: %v", err)
 	}
 	primary, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary})
 	if err != nil {
@@ -269,6 +272,15 @@ func TestEvaluateEnforcesContextExpansionRouteLimit(t *testing.T) {
 		}),
 	}); err != nil {
 		t.Fatalf("Import clean result: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build final obligations: %v", err)
 	}
 	blocked, err := closure.Evaluate(closure.EvaluateOptions{StateDir: stateDir, PolicyProfile: "default"})
 	if err != nil {

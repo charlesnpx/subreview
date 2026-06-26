@@ -804,6 +804,50 @@ func TestVerificationPacketDoesNotCarryFindingAcrossPolicy(t *testing.T) {
 	}
 }
 
+func TestVerificationPacketCanCarryOpenFindingAfterLaterCleanProposalReview(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("carried-finding")},
+		}),
+		Now: time.Unix(243, 0),
+	}); err != nil {
+		t.Fatalf("Import proposal finding result: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "A later review did not explicitly resolve the prior finding.",
+		}),
+		Now: time.Unix(244, 0),
+	}); err != nil {
+		t.Fatalf("Import later clean result: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Rebuild final manifest: %v", err)
+	}
+	verification, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindVerification, FindingID: "carried-finding"})
+	if err != nil {
+		t.Fatalf("Build verification packet for still-open carried finding: %v", err)
+	}
+	if verification.Verification == nil || verification.Verification.FindingID != "carried-finding" {
+		t.Fatalf("verification packet should target carried finding: %+v", verification.Verification)
+	}
+}
+
 func TestVerificationOutcomeVocabularyMapsToLifecycle(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	if _, err := reviewresult.Import(reviewresult.ImportOptions{

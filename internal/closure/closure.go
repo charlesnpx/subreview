@@ -469,6 +469,17 @@ func closureObservationApplies(record reviewresult.ResultRecord, manifestDigest,
 		packetPolicyMatches(record.Packet.Policy, policyDigest)
 }
 
+func closureRunObservationApplies(record reviewresult.ResultRecord, manifestDigest, proposalDigest, policyDigest string) bool {
+	if record.Packet.CoverageManifest.Digest == manifestDigest {
+		return true
+	}
+	return record.RunKind == reviewresult.RunKindDiscovery &&
+		proposalDigest != "" &&
+		record.Packet.TargetState.Kind == "proposal" &&
+		record.Packet.TargetState.Digest == proposalDigest &&
+		packetPolicyMatches(record.Packet.Policy, policyDigest)
+}
+
 func proposalTargetDigest(manifest obligation.CoverageManifest) string {
 	for _, diff := range manifest.SourceDiffs {
 		if diff.FromKind == "base" && diff.ToKind == "proposal" {
@@ -660,7 +671,7 @@ func findingFacts(observations []reviewresult.EvidenceObservation, manifestDiges
 	facts := FindingFacts{ActiveBlockingFindings: []FindingBlocker{}}
 	for _, observation := range observations {
 		record := observation.Record
-		if !closureObservationApplies(record, manifestDigest, proposalDigest, policyDigest) {
+		if !closureRunObservationApplies(record, manifestDigest, proposalDigest, policyDigest) {
 			continue
 		}
 		for _, finding := range record.Findings {
@@ -692,7 +703,7 @@ func runAndTokenFacts(observations []reviewresult.EvidenceObservation, manifestD
 	tokens := TokenFacts{}
 	for _, observation := range observations {
 		record := observation.Record
-		if !closureObservationApplies(record, manifestDigest, proposalDigest, policyDigest) {
+		if !closureRunObservationApplies(record, manifestDigest, proposalDigest, policyDigest) {
 			continue
 		}
 		runs.ByRoute[record.Route]++

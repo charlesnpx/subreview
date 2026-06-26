@@ -1805,10 +1805,6 @@ func latestFindingForVerification(store state.Store, events []state.Event, repo,
 		return reviewresult.FindingRecord{}, err
 	}
 	var carried *reviewresult.FindingRecord
-	carriedEventID := ""
-	if latestProposal, ok := reviewresult.LatestPrimaryReviewForTargetState(observations, proposalDigest, policyDigest); ok {
-		carriedEventID = latestProposal.EventID
-	}
 	for _, observation := range observations {
 		for _, finding := range observation.Record.Findings {
 			if finding.ID != findingID || !finding.Accepted {
@@ -1817,7 +1813,7 @@ func latestFindingForVerification(store state.Store, events []state.Event, repo,
 			if observation.Record.Packet.CoverageManifest.Digest == manifestDigest {
 				return finding, nil
 			}
-			if carried == nil && observation.EventID == carriedEventID && carriedFindingRecordApplies(observation.Record, proposalDigest, policyDigest) {
+			if carried == nil && carriedFindingRecordApplies(observation.Record, proposalDigest, policyDigest) {
 				value := finding
 				carried = &value
 			}
