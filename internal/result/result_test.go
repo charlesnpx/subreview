@@ -224,6 +224,49 @@ func TestImportRejectsDeterministicRefutationForDifferentFindingThanPacket(t *te
 	}
 }
 
+func TestImportRejectsFindingRefutationOnPrimaryPacket(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("finding-one")},
+		}),
+		Now: time.Unix(234, 1),
+	}); err != nil {
+		t.Fatalf("Import finding: %v", err)
+	}
+	before := readEvents(t, stateDir)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			DeterministicRefutations: []reviewresult.DeterministicRefutationInput{{
+				FindingID:    "finding-one",
+				EvidenceKind: "test",
+				Summary:      "This attempts to use a primary packet to refute a finding.",
+				Citations:    []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 1}},
+			}},
+		}),
+		Now: time.Unix(234, 2),
+	}); err == nil {
+		t.Fatal("primary packet should not accept finding-level deterministic refutations")
+	}
+	if after := readEvents(t, stateDir); len(after) != len(before) {
+		t.Fatalf("primary-packet finding refutation should not append ledger event: before=%d after=%d", len(before), len(after))
+	}
+}
+
 func TestImportRejectsDiscoverySelfVerification(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	before := readEvents(t, stateDir)
@@ -453,6 +496,29 @@ func TestVerificationOutcomeRejectsContradictoryStateAndBasis(t *testing.T) {
 	}
 	if after := readEvents(t, stateDir); len(after) != len(before) {
 		t.Fatalf("contradictory basis should not append ledger event: before=%d after=%d", len(before), len(after))
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: verificationPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        verificationPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
+				FindingID: "finding-one",
+				State:     reviewresult.StateVerified,
+				Basis:     reviewresult.BasisDeterministicRefutation,
+				Summary:   "The omitted outcome would otherwise be inferred inconsistently.",
+			}},
+		}),
+		Now: time.Unix(239, 3),
+	}); err == nil {
+		t.Fatal("omitted verification outcome should still reject contradictory state and basis")
+	}
+	if after := readEvents(t, stateDir); len(after) != len(before) {
+		t.Fatalf("omitted-outcome contradiction should not append ledger event: before=%d after=%d", len(before), len(after))
 	}
 }
 

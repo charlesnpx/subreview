@@ -617,20 +617,25 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 	if runKind == RunKindDiscovery && (packet.RunKind != runKind || packet.Route != route) {
 		return ResultRecord{}, fmt.Errorf("discovery result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
 	}
-	if len(input.VerifierOutcomes) > 0 {
+	hasFindingRefutation := false
+	for _, refutation := range input.DeterministicRefutations {
+		if strings.TrimSpace(refutation.FindingID) != "" {
+			hasFindingRefutation = true
+			break
+		}
+	}
+	if len(input.VerifierOutcomes) > 0 || hasFindingRefutation {
 		if packet.RunKind != runKind || packet.Route != route {
 			return ResultRecord{}, fmt.Errorf("verification result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
 		}
 		if packet.VerificationFindingID == "" {
-			return ResultRecord{}, errors.New("verification packet is missing targeted finding_id")
+			return ResultRecord{}, errors.New("finding-level verification evidence requires a targeted verification packet")
 		}
 		for _, outcome := range input.VerifierOutcomes {
 			if strings.TrimSpace(outcome.FindingID) != packet.VerificationFindingID {
 				return ResultRecord{}, fmt.Errorf("verifier outcome finding_id %q does not match packet finding_id %q", outcome.FindingID, packet.VerificationFindingID)
 			}
 		}
-	}
-	if packet.VerificationFindingID != "" {
 		for _, refutation := range input.DeterministicRefutations {
 			if findingID := strings.TrimSpace(refutation.FindingID); findingID != "" && findingID != packet.VerificationFindingID {
 				return ResultRecord{}, fmt.Errorf("deterministic refutation finding_id %q does not match packet finding_id %q", refutation.FindingID, packet.VerificationFindingID)
@@ -1001,16 +1006,11 @@ func normalizeVerifierOutcomes(input []VerifierOutcomeInput) ([]VerifierOutcome,
 		stateValue := strings.TrimSpace(outcome.State)
 		basis := strings.TrimSpace(outcome.Basis)
 		if outcomeValue != "" {
-			expectedState := stateForVerificationOutcome(outcomeValue)
 			if stateValue == "" {
-				stateValue = expectedState
-			} else if stateValue != expectedState {
-				return nil, fmt.Errorf("verification outcome %s conflicts with state %s", outcomeValue, stateValue)
+				stateValue = stateForVerificationOutcome(outcomeValue)
 			}
 			if basis == "" {
 				basis = basisForVerificationOutcome(outcomeValue)
-			} else if !basisAllowedForVerificationOutcome(outcomeValue, basis) {
-				return nil, fmt.Errorf("verification outcome %s conflicts with basis %s", outcomeValue, basis)
 			}
 		}
 		if !validLifecycleState(stateValue) || stateValue == StateOpen || stateValue == StateRejectedStructural || stateValue == StateDuplicate {
@@ -1038,6 +1038,12 @@ func normalizeVerifierOutcomes(input []VerifierOutcomeInput) ([]VerifierOutcome,
 		}
 		if outcomeValue == "" {
 			outcomeValue = verificationOutcomeForState(stateValue, basis)
+		}
+		if stateValue != stateForVerificationOutcome(outcomeValue) {
+			return nil, fmt.Errorf("verification outcome %s conflicts with state %s", outcomeValue, stateValue)
+		}
+		if !basisAllowedForVerificationOutcome(outcomeValue, basis) {
+			return nil, fmt.Errorf("verification outcome %s conflicts with basis %s", outcomeValue, basis)
 		}
 		out = append(out, VerifierOutcome{
 			FindingID:        findingID,
