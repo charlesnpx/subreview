@@ -244,6 +244,10 @@ func TestRestoreDoesNotPartiallyWriteWhenBlobIsMissing(t *testing.T) {
 	if err := os.Remove(missingPath); err != nil {
 		t.Fatalf("remove object: %v", err)
 	}
+	validation := state.Validate(stateDir)
+	if validation.OK {
+		t.Fatalf("state validation should fail after pinned blob removal")
+	}
 	restoreDir := filepath.Join(root, "restore")
 	err = restoreEntries(store, tree.Entries, restoreDir)
 	if err == nil {
@@ -254,6 +258,90 @@ func TestRestoreDoesNotPartiallyWriteWhenBlobIsMissing(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(restoreDir, "b.txt")); !os.IsNotExist(statErr) {
 		t.Fatalf("restore should not partially write b.txt, stat err=%v", statErr)
+	}
+}
+
+func TestCaptureWorkingTreeRejectsGitlinkDirectory(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "seed.txt", "seed\n")
+	git(t, repo, "add", "seed.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	head := gitOutput(t, repo, "rev-parse", "HEAD")
+	git(t, repo, "update-index", "--add", "--cacheinfo", "160000,"+head+",vendor/lib")
+	if err := os.MkdirAll(filepath.Join(repo, "vendor", "lib"), 0o755); err != nil {
+		t.Fatalf("mkdir gitlink path: %v", err)
+	}
+	_, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported working tree directory entry") {
+		t.Fatalf("expected gitlink directory capture error, got %v", err)
+	}
+}
+
+func TestRestoreRejectsSymlinkedOutputPath(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	external := filepath.Join(root, "external")
+	if err := os.Mkdir(external, 0o755); err != nil {
+		t.Fatalf("mkdir external: %v", err)
+	}
+	output := filepath.Join(root, "restore-link")
+	if err := os.Symlink(external, output); err != nil {
+		t.Fatalf("symlink output: %v", err)
+	}
+	_, err := Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: output})
+	if err == nil || !strings.Contains(err.Error(), "output path must not be a symlink") {
+		t.Fatalf("expected symlink output error, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(external, "alpha.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("restore should not write through output symlink, stat err=%v", statErr)
+	}
+}
+
+func TestRestoreRejectsSymlinkedOutputParent(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	external := filepath.Join(root, "external")
+	if err := os.Mkdir(external, 0o755); err != nil {
+		t.Fatalf("mkdir external: %v", err)
+	}
+	linkParent := filepath.Join(root, "link-parent")
+	if err := os.Symlink(external, linkParent); err != nil {
+		t.Fatalf("symlink parent: %v", err)
+	}
+	_, err := Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: filepath.Join(linkParent, "restore")})
+	if err == nil || !strings.Contains(err.Error(), "output parent path must not be a symlink") {
+		t.Fatalf("expected symlink parent error, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(external, "restore")); !os.IsNotExist(statErr) {
+		t.Fatalf("restore should not create output through symlink parent, stat err=%v", statErr)
 	}
 }
 
@@ -321,6 +409,16 @@ func git(t *testing.T, repo string, args ...string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
+}
+
+func gitOutput(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func writeFile(t *testing.T, root, rel, body string) {

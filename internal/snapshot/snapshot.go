@@ -579,7 +579,7 @@ func captureWorkingTree(store state.Store, repo string) ([]TreeEntry, error) {
 			return nil, err
 		}
 		if info.IsDir() {
-			continue
+			return nil, fmt.Errorf("unsupported working tree directory entry, possible gitlink/submodule: %s", rel)
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return nil, fmt.Errorf("unsupported working tree entry: %s", rel)
@@ -804,12 +804,18 @@ func restoreEntries(store state.Store, entries []TreeEntry, output string) error
 }
 
 func ensureEmptyOutputDir(path string) error {
-	info, err := os.Stat(path)
+	if err := rejectSymlinkedNearestOutputParent(path); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
 		}
 		return os.MkdirAll(path, 0o755)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("output path must not be a symlink: %s", path)
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("output path is not a directory: %s", path)
@@ -822,6 +828,31 @@ func ensureEmptyOutputDir(path string) error {
 		return fmt.Errorf("output directory must be empty: %s", path)
 	}
 	return nil
+}
+
+func rejectSymlinkedNearestOutputParent(path string) error {
+	dir := filepath.Dir(filepath.Clean(path))
+	for {
+		info, err := os.Lstat(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				next := filepath.Dir(dir)
+				if next == dir || next == "." || next == "" {
+					return err
+				}
+				dir = next
+				continue
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("output parent path must not be a symlink: %s", dir)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("output parent path is not a directory: %s", dir)
+		}
+		return nil
+	}
 }
 
 func gitNoIndexDiff(workdir string) ([]byte, error) {
