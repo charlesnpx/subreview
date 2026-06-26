@@ -299,7 +299,7 @@ func Build(opts BuildOptions) (BuildResult, error) {
 		return BuildResult{}, err
 	}
 	context := buildContext(store, target, targetTree, patchFiles, maxContextBytes)
-	gates, err := gateSummaries(store, events, binding.Repo)
+	gates, err := gateSummaries(store, events, binding.Repo, manifest)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -1097,19 +1097,23 @@ func readSnapshotTree(store state.Store, target SnapshotRef) (map[string]snapsho
 	return entries, nil
 }
 
-func gateSummaries(store state.Store, events []state.Event, repo string) ([]GateSummary, error) {
-	latest, err := gate.LatestEvidenceByCommand(store, events, repo)
+func gateSummaries(store state.Store, events []state.Event, repo string, manifest obligation.CoverageManifest) ([]GateSummary, error) {
+	observations, err := gate.EvidenceByCommand(store, events, repo)
 	if err != nil {
 		return nil, err
 	}
-	commandIDs := make([]string, 0, len(latest))
-	for commandID := range latest {
+	commandIDs := make([]string, 0, len(observations))
+	for commandID := range observations {
 		commandIDs = append(commandIDs, commandID)
 	}
 	sort.Strings(commandIDs)
 	summaries := []GateSummary{}
+	expectedDigests := expectedGateCommandDigests(manifest)
 	for _, commandID := range commandIDs {
-		observation := latest[commandID]
+		observation, ok := latestMatchingGateEvidence(observations[commandID], manifest, expectedDigests[commandID])
+		if !ok {
+			continue
+		}
 		policyDigest := ""
 		if observation.Record.Policy != nil {
 			policyDigest = observation.Record.Policy.Digest
@@ -1127,6 +1131,64 @@ func gateSummaries(store state.Store, events []state.Event, repo string) ([]Gate
 		})
 	}
 	return summaries, nil
+}
+
+func latestMatchingGateEvidence(observations []gate.EvidenceObservation, manifest obligation.CoverageManifest, expectedCommandDigest string) (gate.EvidenceObservation, bool) {
+	for _, observation := range observations {
+		if expectedCommandDigest != "" && observation.Record.CommandDigest != expectedCommandDigest {
+			continue
+		}
+		if !gateEvidenceMatchesSnapshot(observation.Record, manifest) || !gateEvidenceMatchesPolicy(observation.Record, manifest.Policy) {
+			continue
+		}
+		return observation, true
+	}
+	return gate.EvidenceObservation{}, false
+}
+
+func expectedGateCommandDigests(manifest obligation.CoverageManifest) map[string]string {
+	digests := map[string]string{}
+	for _, item := range manifest.Obligations {
+		if item.Kind != obligation.KindGateRequirement || item.CommandID == "" || item.Metadata == nil {
+			continue
+		}
+		digest := item.Metadata["command_digest"]
+		if digest != "" {
+			digests[item.CommandID] = digest
+		}
+	}
+	return digests
+}
+
+func gateEvidenceMatchesSnapshot(evidence gate.EvidenceRecord, manifest obligation.CoverageManifest) bool {
+	kind, digest := requiredGateSnapshot(manifest)
+	return kind != "" && evidence.InputSnapshot.Kind == kind && evidence.InputSnapshot.Digest == digest
+}
+
+func requiredGateSnapshot(manifest obligation.CoverageManifest) (string, string) {
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == "base" && diff.ToKind == "final" {
+			return diff.ToKind, diff.ToSnapshot
+		}
+	}
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == "base" && diff.ToKind == "proposal" {
+			return diff.ToKind, diff.ToSnapshot
+		}
+	}
+	for _, diff := range manifest.SourceDiffs {
+		if diff.ToKind != "" && diff.ToSnapshot != "" {
+			return diff.ToKind, diff.ToSnapshot
+		}
+	}
+	return "", ""
+}
+
+func gateEvidenceMatchesPolicy(evidence gate.EvidenceRecord, manifestPolicy *obligation.PolicyRef) bool {
+	if manifestPolicy == nil {
+		return evidence.Policy == nil
+	}
+	return evidence.Policy != nil && evidence.Policy.Digest == manifestPolicy.Digest
 }
 
 func latestCoverageManifest(store state.Store, events []state.Event, stateDir, repo string) (state.ObjectRef, obligation.CoverageManifest, error) {

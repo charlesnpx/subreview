@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/obligation"
 	"github.com/charlesnpx/subreview/internal/policy"
 	"github.com/charlesnpx/subreview/internal/snapshot"
@@ -227,6 +228,88 @@ func TestBuildPrimaryPacketIncludesDeletedPatchContext(t *testing.T) {
 	}
 }
 
+func TestBuildPrimaryPacketFiltersStaleGateEvidence(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	command := packetGateCommand("go_test_all")
+	catalogPath := writePacketGateCatalog(t, root, command)
+	_, normalizedCatalog, err := gate.LoadCatalog(catalogPath)
+	if err != nil {
+		t.Fatalf("Load gate catalog: %v", err)
+	}
+	command = normalizedCatalog.Commands[0]
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "base\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(10, 0)}); err != nil {
+		t.Fatalf("Init state: %v", err)
+	}
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfigWithGate(t, root, command.ID, gate.CommandDigest(command)), Profile: "default"}); err != nil {
+		t.Fatalf("Bind policy: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	writeFile(t, repo, "alpha.txt", "proposal one\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture first proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff first proposal: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build first obligations: %v", err)
+	}
+	staleEvidence, err := gate.Record(gate.RecordOptions{
+		StateDir:     stateDir,
+		CatalogPath:  catalogPath,
+		CommandID:    command.ID,
+		SnapshotKind: "proposal",
+		Outcome:      gate.OutcomePass,
+		Provenance:   gate.ProvenanceExternalAsserted,
+		Diagnostic:   "pass on first proposal",
+		Now:          time.Unix(20, 0),
+	})
+	if err != nil {
+		t.Fatalf("Record stale proposal gate: %v", err)
+	}
+	writeFile(t, repo, "alpha.txt", "proposal two\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture second proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff second proposal: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build second obligations: %v", err)
+	}
+	staleResult, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(30, 0)})
+	if err != nil {
+		t.Fatalf("Build stale packet: %v", err)
+	}
+	assertNoGateEvidence(t, staleResult, stateDir, staleEvidence.Evidence.Digest)
+	currentEvidence, err := gate.Record(gate.RecordOptions{
+		StateDir:     stateDir,
+		CatalogPath:  catalogPath,
+		CommandID:    command.ID,
+		SnapshotKind: "proposal",
+		Outcome:      gate.OutcomePass,
+		Provenance:   gate.ProvenanceExternalAsserted,
+		Diagnostic:   "pass on second proposal",
+		Now:          time.Unix(40, 0),
+	})
+	if err != nil {
+		t.Fatalf("Record current proposal gate: %v", err)
+	}
+	currentResult, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(50, 0)})
+	if err != nil {
+		t.Fatalf("Build current packet: %v", err)
+	}
+	assertHasGateEvidence(t, currentResult, stateDir, currentEvidence.Evidence.Digest)
+}
+
 func TestParsePatchHandlesQuotedAndSeparatorPaths(t *testing.T) {
 	files := parsePatch([]byte(`diff --git "from/a\tb.txt" "to/a\tb.txt"
 --- "from/a\tb.txt"
@@ -334,6 +417,44 @@ func initializedDeletedPacketState(t *testing.T, baseBody string) (string, strin
 	return repo, stateDir
 }
 
+func assertNoGateEvidence(t *testing.T, result BuildResult, stateDir, evidenceDigest string) {
+	t.Helper()
+	record := readPacketRecord(t, stateDir, result.Packet.Digest)
+	for _, summary := range record.Gates {
+		if summary.Evidence == evidenceDigest {
+			t.Fatalf("stale gate evidence should not be included: %+v", record.Gates)
+		}
+	}
+}
+
+func assertHasGateEvidence(t *testing.T, result BuildResult, stateDir, evidenceDigest string) {
+	t.Helper()
+	record := readPacketRecord(t, stateDir, result.Packet.Digest)
+	for _, summary := range record.Gates {
+		if summary.Evidence == evidenceDigest {
+			return
+		}
+	}
+	t.Fatalf("current gate evidence missing: want %s got %+v", evidenceDigest, record.Gates)
+}
+
+func readPacketRecord(t *testing.T, stateDir, digest string) PacketRecord {
+	t.Helper()
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	body, err := store.Read(digest)
+	if err != nil {
+		t.Fatalf("Read packet: %v", err)
+	}
+	var record PacketRecord
+	if err := json.Unmarshal(body, &record); err != nil {
+		t.Fatalf("Unmarshal packet: %v", err)
+	}
+	return record
+}
+
 func writePolicyConfig(t *testing.T, root string) string {
 	t.Helper()
 	body := []byte(`{
@@ -353,6 +474,55 @@ func writePolicyConfig(t *testing.T, root string) string {
 	path := filepath.Join(root, "policy.json")
 	if err := os.WriteFile(path, body, 0o644); err != nil {
 		t.Fatalf("write policy: %v", err)
+	}
+	return path
+}
+
+func writePolicyConfigWithGate(t *testing.T, root, commandID, commandDigest string) string {
+	t.Helper()
+	body := []byte(`{
+  "schema_version": 1,
+  "policy_id": "test-policy",
+  "profiles": {
+    "default": {
+      "gate_requirements": [{"command_id": "` + commandID + `", "command_digest": "` + commandDigest + `", "required": true}],
+      "route_limits": {"primary_semantic_reviews": 1, "targeted_verifications": 1, "fresh_final_reviews": 0, "context_expansion_rounds": 1},
+      "required_evidence_facts": ["primary_review_completed", "blocking_findings_verified", "coverage_obligations_satisfied", "policy_bound"],
+      "risk_routing": [],
+      "closure_basis": {"allowed_basis": ["clean", "fixed", "deterministic_refutation"], "require_basis_for_unresolved": true}
+    }
+  }
+}
+`)
+	path := filepath.Join(root, "policy-with-gate.json")
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	return path
+}
+
+func packetGateCommand(commandID string) gate.CommandDefinition {
+	return gate.CommandDefinition{
+		ID:                commandID,
+		Description:       "test gate",
+		Argv:              []string{"/bin/sh", "-c", "true"},
+		ReplayClass:       gate.ReplayContentPure,
+		EnvironmentPinned: true,
+		ExecutesRepoCode:  false,
+		SideEffects:       gate.SideEffectsNone,
+		TimeoutSeconds:    30,
+	}
+}
+
+func writePacketGateCatalog(t *testing.T, root string, command gate.CommandDefinition) string {
+	t.Helper()
+	body, err := json.Marshal(gate.Catalog{SchemaVersion: gate.SchemaVersion, Commands: []gate.CommandDefinition{command}})
+	if err != nil {
+		t.Fatalf("marshal gate catalog: %v", err)
+	}
+	path := filepath.Join(root, "gate-catalog.json")
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatalf("write gate catalog: %v", err)
 	}
 	return path
 }
