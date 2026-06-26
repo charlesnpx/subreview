@@ -366,7 +366,7 @@ func Import(opts ImportOptions) (ImportResult, error) {
 	if err := decodeStrict(raw, &input); err != nil {
 		return ImportResult{}, fmt.Errorf("malformed worker result: %w", err)
 	}
-	existing, err := existingFindingDedupeDigests(store, events, binding.Repo)
+	existing, err := existingFindingDedupeDigests(store, events, binding.Repo, packetRef.CoverageManifest.Digest)
 	if err != nil {
 		return ImportResult{}, err
 	}
@@ -623,36 +623,37 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 	if len(input.DeterministicRefutations) > maxRefutations {
 		return ResultRecord{}, fmt.Errorf("worker result has too many deterministic refutations: %d > %d", len(input.DeterministicRefutations), maxRefutations)
 	}
-	if outcome == OutcomeFindings && len(input.Findings) == 0 {
-		return ResultRecord{}, errors.New("outcome findings requires at least one finding")
-	}
-	if outcome == OutcomeNeedsContext && len(input.NeedsContext) == 0 {
-		return ResultRecord{}, errors.New("outcome needs_context requires at least one context request")
-	}
-	if outcome == OutcomeClean && len(input.Findings) > 0 {
-		return ResultRecord{}, errors.New("outcome clean cannot include findings")
+	if err := validateOutcomeShape(runKind, outcome, input); err != nil {
+		return ResultRecord{}, err
 	}
 	summary, err := normalizeBoundedString(input.Summary, maxSummaryBytes, "summary", false)
 	if err != nil {
 		return ResultRecord{}, err
 	}
 	findings := make([]FindingRecord, 0, len(input.Findings))
-	seenInResult := map[string]struct{}{}
+	seenDigests := map[string]struct{}{}
+	seenIDs := map[string]string{}
 	for i, finding := range input.Findings {
 		normalized := normalizeFinding(finding, i)
 		if normalized.Accepted {
-			if _, exists := existing[normalized.DedupeDigest]; exists {
+			if priorDigest, exists := seenIDs[normalized.ID]; exists && priorDigest != normalized.DedupeDigest {
+				normalized.Accepted = false
+				normalized.Blocking = false
+				normalized.State = StateRejectedStructural
+				normalized.RejectionReason = "duplicate finding id with different finding content"
+			} else if _, exists := existing[normalized.DedupeDigest]; exists {
 				normalized.Accepted = false
 				normalized.Blocking = false
 				normalized.State = StateDuplicate
 				normalized.DuplicateOf = normalized.DedupeDigest
-			} else if _, exists := seenInResult[normalized.DedupeDigest]; exists {
+			} else if _, exists := seenDigests[normalized.DedupeDigest]; exists {
 				normalized.Accepted = false
 				normalized.Blocking = false
 				normalized.State = StateDuplicate
 				normalized.DuplicateOf = normalized.DedupeDigest
 			} else {
-				seenInResult[normalized.DedupeDigest] = struct{}{}
+				seenIDs[normalized.ID] = normalized.DedupeDigest
+				seenDigests[normalized.DedupeDigest] = struct{}{}
 			}
 		}
 		findings = append(findings, normalized)
@@ -1239,13 +1240,16 @@ func readBoundedRegularFile(path string) ([]byte, error) {
 	return body, nil
 }
 
-func existingFindingDedupeDigests(store state.Store, events []state.Event, repo string) (map[string]struct{}, error) {
+func existingFindingDedupeDigests(store state.Store, events []state.Event, repo, manifestDigest string) (map[string]struct{}, error) {
 	observations, err := Observations(store, events, repo)
 	if err != nil {
 		return nil, err
 	}
 	existing := map[string]struct{}{}
 	for _, observation := range observations {
+		if observation.Record.Packet.CoverageManifest.Digest != manifestDigest {
+			continue
+		}
 		for _, finding := range observation.Record.Findings {
 			if finding.Accepted && finding.DedupeDigest != "" {
 				existing[finding.DedupeDigest] = struct{}{}
@@ -1311,6 +1315,46 @@ func inferOutcome(input WorkerResult) string {
 		return OutcomeVerification
 	}
 	return OutcomeClean
+}
+
+func validateOutcomeShape(runKind, outcome string, input WorkerResult) error {
+	switch outcome {
+	case OutcomeClean:
+		if len(input.Findings) > 0 {
+			return errors.New("outcome clean cannot include findings")
+		}
+		if len(input.NeedsContext) > 0 {
+			return errors.New("outcome clean cannot include context requests")
+		}
+		if len(input.VerifierOutcomes) > 0 || len(input.DeterministicRefutations) > 0 {
+			return errors.New("outcome clean cannot include verification evidence")
+		}
+	case OutcomeFindings:
+		if len(input.Findings) == 0 {
+			return errors.New("outcome findings requires at least one finding")
+		}
+		if len(input.VerifierOutcomes) > 0 || len(input.DeterministicRefutations) > 0 {
+			return errors.New("findings result cannot include verification evidence")
+		}
+	case OutcomeNeedsContext:
+		if len(input.NeedsContext) == 0 {
+			return errors.New("outcome needs_context requires at least one context request")
+		}
+		if len(input.VerifierOutcomes) > 0 || len(input.DeterministicRefutations) > 0 {
+			return errors.New("needs_context result cannot include verification evidence")
+		}
+	case OutcomeVerification:
+		if runKind != RunKindVerification {
+			return errors.New("verification outcome requires verification run_kind")
+		}
+		if len(input.VerifierOutcomes) == 0 && len(input.DeterministicRefutations) == 0 {
+			return errors.New("verification outcome requires verifier outcome or refutation")
+		}
+		if len(input.Findings) > 0 || len(input.NeedsContext) > 0 {
+			return errors.New("verification result cannot introduce findings or context requests")
+		}
+	}
+	return nil
 }
 
 func validRunKind(value string) bool {

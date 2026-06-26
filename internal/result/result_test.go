@@ -99,6 +99,86 @@ func TestImportRejectsDiscoveryRouteMismatch(t *testing.T) {
 	}
 }
 
+func TestImportRejectsDiscoverySelfVerification(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	before := readEvents(t, stateDir)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("finding-one")},
+			VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
+				FindingID:        "finding-one",
+				State:            reviewresult.StateInvalidated,
+				Basis:            reviewresult.BasisFreshSemantic,
+				Summary:          "The primary reviewer tried to invalidate its own finding.",
+				VerifierRelation: reviewresult.RelationFreshBlinded,
+				RelationEvidence: reviewresult.RelationEvidenceCallerAssert,
+			}},
+		}),
+	}); err == nil {
+		t.Fatal("discovery findings result should not import verifier outcomes")
+	}
+	if after := readEvents(t, stateDir); len(after) != len(before) {
+		t.Fatalf("self-verification import should not append ledger event: before=%d after=%d", len(before), len(after))
+	}
+}
+
+func TestFindingDedupeIsScopedToCoverageManifest(t *testing.T) {
+	repo, stateDir, firstPacket, _ := initializedResultState(t)
+	first, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: firstPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        firstPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("finding-one")},
+		}),
+		Now: time.Unix(240, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import first finding result: %v", err)
+	}
+	if first.AcceptedFindingCount != 1 || first.DuplicateFindingCount != 0 {
+		t.Fatalf("first finding should be accepted: %+v", first)
+	}
+
+	writeFile(t, repo, "alpha.txt", "one\ntwo\nthree\n")
+	secondPacket := rebuildResultPacket(t, stateDir, repo)
+	second, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: secondPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        secondPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("finding-one")},
+		}),
+		Now: time.Unix(250, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import second finding result: %v", err)
+	}
+	if second.AcceptedFindingCount != 1 || second.DuplicateFindingCount != 0 {
+		t.Fatalf("same finding digest should not be duplicate across manifests: %+v", second)
+	}
+	observations := readObservations(t, stateDir)
+	blockers := reviewresult.ActiveFindingBlockers(observations, secondPacket.CoverageManifest.Digest)
+	if len(blockers) != 1 || blockers[0].FindingID != "finding-one" {
+		t.Fatalf("second manifest should retain its active finding blocker: %+v", blockers)
+	}
+}
+
 func TestFindingsDedupeStructuralRejectionAndLifecycle(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	first, err := reviewresult.Import(reviewresult.ImportOptions{
@@ -165,6 +245,40 @@ func TestFindingsDedupeStructuralRejectionAndLifecycle(t *testing.T) {
 	observations = readObservations(t, stateDir)
 	if blockers := reviewresult.ActiveFindingBlockers(observations, built.CoverageManifest.Digest); len(blockers) != 0 {
 		t.Fatalf("invalidated finding should not block closure: %+v", blockers)
+	}
+}
+
+func TestDuplicateFindingIDsRejectLaterDistinctFinding(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	secondFinding := validFinding("same-id")
+	secondFinding.Claim = "alpha.txt can hide an entirely different downstream failure."
+	secondFinding.FailureScenario = "A different consumer observes a distinct failure path from the same proposal."
+	imported, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings: []reviewresult.FindingInput{
+				validFinding("same-id"),
+				secondFinding,
+			},
+		}),
+		Now: time.Unix(260, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import duplicate-id findings: %v", err)
+	}
+	if imported.AcceptedFindingCount != 1 || imported.RejectedStructuralCount != 1 {
+		t.Fatalf("distinct findings sharing one id should reject the second as structural: %+v", imported)
+	}
+	observations := readObservations(t, stateDir)
+	blockers := reviewresult.ActiveFindingBlockers(observations, built.CoverageManifest.Digest)
+	if len(blockers) != 1 || blockers[0].FindingID != "same-id" {
+		t.Fatalf("duplicate id should not collapse active blockers: %+v", blockers)
 	}
 }
 
@@ -264,6 +378,30 @@ func initializedResultState(t *testing.T) (string, string, packet.BuildResult, o
 		t.Fatalf("Unmarshal manifest: %v", err)
 	}
 	return repo, stateDir, builtPacket, manifest
+}
+
+func rebuildResultPacket(t *testing.T, stateDir, repo string) packet.BuildResult {
+	t.Helper()
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture replacement proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff replacement base->proposal: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture replacement final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff replacement base->final: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build replacement obligations: %v", err)
+	}
+	result, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary, Now: time.Unix(120, 0)})
+	if err != nil {
+		t.Fatalf("Build replacement packet: %v", err)
+	}
+	return result
 }
 
 func validFinding(id string) reviewresult.FindingInput {
