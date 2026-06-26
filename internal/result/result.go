@@ -366,11 +366,11 @@ func Import(opts ImportOptions) (ImportResult, error) {
 	if err := decodeStrict(raw, &input); err != nil {
 		return ImportResult{}, fmt.Errorf("malformed worker result: %w", err)
 	}
-	existing, err := existingFindingDedupeDigests(store, events, binding.Repo, packetRef.CoverageManifest.Digest)
+	existingDigests, existingIDs, err := existingFindingIdentity(store, events, binding.Repo, packetRef.CoverageManifest.Digest)
 	if err != nil {
 		return ImportResult{}, err
 	}
-	record, err := normalizeWorkerResult(input, packetRef, binding.Repo, now, existing)
+	record, err := normalizeWorkerResult(input, packetRef, binding.Repo, now, existingDigests, existingIDs)
 	if err != nil {
 		return ImportResult{}, err
 	}
@@ -577,7 +577,7 @@ func ActiveFindingBlockers(observations []EvidenceObservation, manifestDigest st
 	return blockers
 }
 
-func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, now time.Time, existing map[string]struct{}) (ResultRecord, error) {
+func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, now time.Time, existingDigests map[string]struct{}, existingIDs map[string]string) (ResultRecord, error) {
 	if input.SchemaVersion != SchemaVersion {
 		return ResultRecord{}, fmt.Errorf("unsupported worker result schema_version: %d", input.SchemaVersion)
 	}
@@ -636,12 +636,17 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 	for i, finding := range input.Findings {
 		normalized := normalizeFinding(finding, i)
 		if normalized.Accepted {
-			if priorDigest, exists := seenIDs[normalized.ID]; exists && priorDigest != normalized.DedupeDigest {
+			if priorDigest, exists := existingIDs[normalized.ID]; exists && priorDigest != normalized.DedupeDigest {
 				normalized.Accepted = false
 				normalized.Blocking = false
 				normalized.State = StateRejectedStructural
 				normalized.RejectionReason = "duplicate finding id with different finding content"
-			} else if _, exists := existing[normalized.DedupeDigest]; exists {
+			} else if priorDigest, exists := seenIDs[normalized.ID]; exists && priorDigest != normalized.DedupeDigest {
+				normalized.Accepted = false
+				normalized.Blocking = false
+				normalized.State = StateRejectedStructural
+				normalized.RejectionReason = "duplicate finding id with different finding content"
+			} else if _, exists := existingDigests[normalized.DedupeDigest]; exists {
 				normalized.Accepted = false
 				normalized.Blocking = false
 				normalized.State = StateDuplicate
@@ -714,6 +719,8 @@ func normalizeFinding(input FindingInput, index int) FindingRecord {
 	}
 	if !validLifecycleState(stateValue) {
 		reasons = append(reasons, "invalid lifecycle state")
+	} else if !blocksClosure(stateValue) {
+		stateValue = StateNeedsConfirmation
 	}
 	if !validSeverity(severity) {
 		reasons = append(reasons, "invalid severity")
@@ -1240,23 +1247,25 @@ func readBoundedRegularFile(path string) ([]byte, error) {
 	return body, nil
 }
 
-func existingFindingDedupeDigests(store state.Store, events []state.Event, repo, manifestDigest string) (map[string]struct{}, error) {
+func existingFindingIdentity(store state.Store, events []state.Event, repo, manifestDigest string) (map[string]struct{}, map[string]string, error) {
 	observations, err := Observations(store, events, repo)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	existing := map[string]struct{}{}
+	digests := map[string]struct{}{}
+	ids := map[string]string{}
 	for _, observation := range observations {
 		if observation.Record.Packet.CoverageManifest.Digest != manifestDigest {
 			continue
 		}
 		for _, finding := range observation.Record.Findings {
 			if finding.Accepted && finding.DedupeDigest != "" {
-				existing[finding.DedupeDigest] = struct{}{}
+				digests[finding.DedupeDigest] = struct{}{}
+				ids[finding.ID] = finding.DedupeDigest
 			}
 		}
 	}
-	return existing, nil
+	return digests, ids, nil
 }
 
 func validateRecord(record ResultRecord, repo, packetDigest string) error {

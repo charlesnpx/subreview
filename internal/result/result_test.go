@@ -129,6 +129,43 @@ func TestImportRejectsDiscoverySelfVerification(t *testing.T) {
 	}
 }
 
+func TestImportNormalizesTerminalDiscoveryFindingToNeedsConfirmation(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	finding := validFinding("terminal-start")
+	finding.State = reviewresult.StateInvalidated
+	imported, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{finding},
+		}),
+		Now: time.Unix(235, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import terminal-state finding: %v", err)
+	}
+	if imported.AcceptedFindingCount != 1 || imported.RejectedStructuralCount != 0 {
+		t.Fatalf("terminal-state finding should remain accepted but blocking: %+v", imported)
+	}
+	observations := readObservations(t, stateDir)
+	blockers := reviewresult.ActiveFindingBlockers(observations, built.CoverageManifest.Digest)
+	if len(blockers) != 1 || blockers[0].FindingID != "terminal-start" || blockers[0].State != reviewresult.StateNeedsConfirmation {
+		t.Fatalf("terminal-state finding should require confirmation: %+v", blockers)
+	}
+	status, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Closed || !hasStatusBlocker(status, "open_finding") {
+		t.Fatalf("terminal-start finding should keep closure blocked: %+v", status)
+	}
+}
+
 func TestFindingDedupeIsScopedToCoverageManifest(t *testing.T) {
 	repo, stateDir, firstPacket, _ := initializedResultState(t)
 	first, err := reviewresult.Import(reviewresult.ImportOptions{
@@ -279,6 +316,56 @@ func TestDuplicateFindingIDsRejectLaterDistinctFinding(t *testing.T) {
 	blockers := reviewresult.ActiveFindingBlockers(observations, built.CoverageManifest.Digest)
 	if len(blockers) != 1 || blockers[0].FindingID != "same-id" {
 		t.Fatalf("duplicate id should not collapse active blockers: %+v", blockers)
+	}
+}
+
+func TestDuplicateFindingIDAcrossImportsRejectsLaterDistinctFinding(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	first, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("same-id")},
+		}),
+		Now: time.Unix(261, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import first finding: %v", err)
+	}
+	if first.AcceptedFindingCount != 1 {
+		t.Fatalf("first finding should be accepted: %+v", first)
+	}
+	secondFinding := validFinding("same-id")
+	secondFinding.Claim = "alpha.txt can hide a later, distinct downstream failure."
+	secondFinding.FailureScenario = "A later importer uses the same id for a distinct finding on this manifest."
+	second, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{secondFinding},
+		}),
+		Now: time.Unix(262, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import second finding: %v", err)
+	}
+	if second.AcceptedFindingCount != 0 || second.RejectedStructuralCount != 1 {
+		t.Fatalf("later distinct finding reusing an id should be structurally rejected: %+v", second)
+	}
+	observations := readObservations(t, stateDir)
+	blockers := reviewresult.ActiveFindingBlockers(observations, built.CoverageManifest.Digest)
+	if len(blockers) != 1 || blockers[0].FindingID != "same-id" {
+		t.Fatalf("later duplicate id should not replace prior blocker: %+v", blockers)
 	}
 }
 
@@ -465,6 +552,15 @@ func firstCoverageObligationID(t *testing.T, manifest obligation.CoverageManifes
 	}
 	t.Fatalf("manifest has no coverage obligation: %+v", manifest.Obligations)
 	return ""
+}
+
+func hasStatusBlocker(status obligation.StatusResult, code string) bool {
+	for _, blocker := range status.Blockers {
+		if blocker.Code == code {
+			return true
+		}
+	}
+	return false
 }
 
 func writePolicyConfig(t *testing.T, root string) string {
