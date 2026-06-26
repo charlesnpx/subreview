@@ -279,10 +279,14 @@ func Restore(opts RestoreOptions) (RestoreResult, error) {
 	if !record.Reconstructable {
 		return RestoreResult{}, fmt.Errorf("snapshot is not reconstructable: %s", binding.Digest)
 	}
+	verified, err := verifyEntries(store, entries)
+	if err != nil {
+		return RestoreResult{}, err
+	}
 	if err := ensureEmptyOutputDir(output); err != nil {
 		return RestoreResult{}, err
 	}
-	if err := restoreEntries(store, entries, output); err != nil {
+	if err := writeVerifiedEntries(verified, output); err != nil {
 		return RestoreResult{}, err
 	}
 	return RestoreResult{
@@ -468,7 +472,15 @@ func explicitRepoPath(path string) (string, error) {
 }
 
 func rejectStateInsideRepo(stateDir, repo string) error {
-	rel, err := filepath.Rel(repo, stateDir)
+	repoReal, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		return err
+	}
+	stateReal, err := filepath.EvalSymlinks(stateDir)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(repoReal, stateReal)
 	if err != nil {
 		return err
 	}
@@ -748,21 +760,33 @@ func validateTreeEntry(entry TreeEntry) error {
 }
 
 func restoreEntries(store state.Store, entries []TreeEntry, output string) error {
+	verified, err := verifyEntries(store, entries)
+	if err != nil {
+		return err
+	}
+	return writeVerifiedEntries(verified, output)
+}
+
+func verifyEntries(store state.Store, entries []TreeEntry) ([]verifiedEntry, error) {
 	verified := make([]verifiedEntry, 0, len(entries))
 	for _, entry := range entries {
 		rel, err := cleanRepoPath(entry.Path)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		body, err := store.Read(entry.Digest)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if int64(len(body)) != entry.Size {
-			return fmt.Errorf("tree entry size mismatch for %s", rel)
+			return nil, fmt.Errorf("tree entry size mismatch for %s", rel)
 		}
 		verified = append(verified, verifiedEntry{Entry: entry, Body: body})
 	}
+	return verified, nil
+}
+
+func writeVerifiedEntries(verified []verifiedEntry, output string) error {
 	for _, item := range verified {
 		entry := item.Entry
 		body := item.Body
@@ -877,7 +901,7 @@ func cleanRepoPath(path string) (string, error) {
 	slash := filepath.ToSlash(path)
 	clean := filepath.Clean(slash)
 	clean = filepath.ToSlash(clean)
-	if clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, "../") || clean == ".." || strings.Contains(clean, "/../") {
+	if clean != slash || clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, "../") || clean == ".." {
 		return "", fmt.Errorf("invalid repository-relative path: %s", path)
 	}
 	if clean == ".git" || strings.HasPrefix(clean, ".git/") {

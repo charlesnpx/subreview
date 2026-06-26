@@ -267,6 +267,14 @@ func TestRestoreDoesNotPartiallyWriteWhenBlobIsMissing(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(restoreDir, "b.txt")); !os.IsNotExist(statErr) {
 		t.Fatalf("restore should not partially write b.txt, stat err=%v", statErr)
 	}
+	restoreOutput := filepath.Join(root, "restore-command")
+	_, err = Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: restoreOutput})
+	if err == nil {
+		t.Fatal("expected restore command failure")
+	}
+	if _, statErr := os.Stat(restoreOutput); !os.IsNotExist(statErr) {
+		t.Fatalf("restore command should not create output after missing blob, stat err=%v", statErr)
+	}
 }
 
 func TestCaptureWorkingTreeRejectsGitlinkDirectory(t *testing.T) {
@@ -356,10 +364,13 @@ func TestRestoreRejectsSymlinkedOutputParent(t *testing.T) {
 func TestRestoreRejectsMalformedTreeTopologyBeforeWriting(t *testing.T) {
 	tests := map[string][]string{
 		"duplicate":               {"a.txt", "a.txt"},
+		"dot_path":                {"./file.txt"},
 		"file_parent_first":       {"a", "a/b.txt"},
 		"file_parent_second":      {"a/b.txt", "a"},
 		"nested_file_parent_late": {"a/b/c.txt", "a/b"},
 		"nul_path":                {"valid.txt", "bad\x00path.txt"},
+		"parent_segment":          {"dir/../file.txt"},
+		"repeated_separator":      {"dir//file.txt"},
 	}
 	for name, paths := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -399,6 +410,31 @@ func TestCaptureRejectsStateInsideRepo(t *testing.T) {
 	_, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
 	if err == nil || !strings.Contains(err.Error(), "outside repo") {
 		t.Fatalf("expected state-inside-repo error, got %v", err)
+	}
+}
+
+func TestCaptureRejectsStateResolvingInsideRepoThroughSymlink(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	targetParent := filepath.Join(repo, "state-target")
+	if err := os.Mkdir(targetParent, 0o755); err != nil {
+		t.Fatalf("mkdir target parent: %v", err)
+	}
+	linkParent := filepath.Join(root, "visible-state-parent")
+	if err := os.Symlink(targetParent, linkParent); err != nil {
+		t.Fatalf("symlink parent: %v", err)
+	}
+	stateDir := filepath.Join(linkParent, "state")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	_, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
+	if err == nil || !strings.Contains(err.Error(), "outside repo") {
+		t.Fatalf("expected realpath state-inside-repo error, got %v", err)
 	}
 }
 
