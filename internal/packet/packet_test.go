@@ -181,6 +181,72 @@ func TestBuildPrimaryPacketIncludesPatchContextForExistingFileHunks(t *testing.T
 	t.Fatalf("patch hunk context missing for existing file: %+v", record.Context.Entries)
 }
 
+func TestBuildPrimaryPacketIncludesPatchFileForNoHunkDiff(t *testing.T) {
+	_, stateDir := initializedModeOnlyPacketState(t)
+	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(100, 0)})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	record := readPacketRecord(t, stateDir, result.Packet.Digest)
+	hasChangedFile := false
+	for _, entry := range record.Context.Entries {
+		if entry.Path != "alpha.sh" {
+			continue
+		}
+		if entry.Kind == "changed_file" {
+			hasChangedFile = true
+		}
+		if entry.Kind == "patch_file" {
+			if !strings.Contains(entry.Content, "old mode 100644") || !strings.Contains(entry.Content, "new mode 100755") {
+				t.Fatalf("mode-only patch metadata missing: %+v", entry)
+			}
+			if !hasChangedFile {
+				for _, candidate := range record.Context.Entries {
+					if candidate.Path == "alpha.sh" && candidate.Kind == "changed_file" {
+						hasChangedFile = true
+						break
+					}
+				}
+			}
+			if !hasChangedFile {
+				t.Fatalf("mode-only text file should include target file context: %+v", record.Context.Entries)
+			}
+			return
+		}
+	}
+	t.Fatalf("patch_file context missing for no-hunk diff: %+v", record.Context.Entries)
+}
+
+func TestBuildPrimaryPacketOmitsBinaryTargetContext(t *testing.T) {
+	_, stateDir := initializedBinaryPacketState(t)
+	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(100, 0)})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if result.SourceCompleteness != "partial" {
+		t.Fatalf("binary target omission should mark source partial: %+v", result)
+	}
+	if !hasPacketOmission(result.Context.Omissions, "binary_context_omitted") {
+		t.Fatalf("binary target omission missing: %+v", result.Context.Omissions)
+	}
+	record := readPacketRecord(t, stateDir, result.Packet.Digest)
+	for _, entry := range record.Context.Entries {
+		if entry.Path != "data.bin" {
+			continue
+		}
+		if entry.Kind == "changed_file" {
+			t.Fatalf("binary target bytes should not be rendered as changed_file context: %+v", entry)
+		}
+		if entry.Kind == "patch_file" {
+			if !strings.Contains(entry.Content, "GIT binary patch") {
+				t.Fatalf("binary patch metadata missing: %+v", entry)
+			}
+			return
+		}
+	}
+	t.Fatalf("patch_file context missing for binary diff: %+v", record.Context.Entries)
+}
+
 func TestLeakageDetectionRejectsEvaluationLabels(t *testing.T) {
 	report := CheckLeakage("this packet mentions a true_miss adjudication")
 	if report.OK || len(report.ForbiddenTerms) == 0 {
@@ -587,6 +653,73 @@ func initializedDeletedPacketState(t *testing.T, baseBody string) (string, strin
 	return repo, stateDir
 }
 
+func initializedModeOnlyPacketState(t *testing.T) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.sh", "#!/bin/sh\necho hi\n")
+	if err := os.Chmod(filepath.Join(repo, "alpha.sh"), 0o644); err != nil {
+		t.Fatalf("chmod alpha.sh: %v", err)
+	}
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(10, 0)}); err != nil {
+		t.Fatalf("Init state: %v", err)
+	}
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfig(t, root), Profile: "default"}); err != nil {
+		t.Fatalf("Bind policy: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(repo, "alpha.sh"), 0o755); err != nil {
+		t.Fatalf("chmod alpha.sh executable: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build obligations: %v", err)
+	}
+	return repo, stateDir
+}
+
+func initializedBinaryPacketState(t *testing.T) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeBytes(t, repo, "data.bin", []byte{0, 1, 2, 'o', 'l', 'd'})
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(10, 0)}); err != nil {
+		t.Fatalf("Init state: %v", err)
+	}
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfig(t, root), Profile: "default"}); err != nil {
+		t.Fatalf("Bind policy: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	writeBytes(t, repo, "data.bin", []byte{0, 1, 2, 'n', 'e', 'w'})
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build obligations: %v", err)
+	}
+	return repo, stateDir
+}
+
 func assertNoGateEvidence(t *testing.T, result BuildResult, stateDir, evidenceDigest string) {
 	t.Helper()
 	record := readPacketRecord(t, stateDir, result.Packet.Digest)
@@ -731,11 +864,16 @@ func git(t *testing.T, repo string, args ...string) {
 
 func writeFile(t *testing.T, root, rel, body string) {
 	t.Helper()
+	writeBytes(t, root, rel, []byte(body))
+}
+
+func writeBytes(t *testing.T, root, rel string, body []byte) {
+	t.Helper()
 	path := filepath.Join(root, filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("mkdir parent: %v", err)
 	}
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(path, body, 0o644); err != nil {
 		t.Fatalf("write %s: %v", rel, err)
 	}
 }

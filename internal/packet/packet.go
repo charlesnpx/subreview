@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/obligation"
@@ -242,6 +243,7 @@ type snapshotBinding struct {
 
 type patchFile struct {
 	Path  string
+	Patch string
 	Hunks []patchHunk
 }
 
@@ -890,7 +892,12 @@ func buildContext(store state.Store, target SnapshotRef, tree map[string]snapsho
 	}
 	for _, file := range files {
 		if len(file.Hunks) == 0 {
-			addEntry("changed_file", file.Path, nil)
+			if file.Patch != "" {
+				addEntry("patch_file", file.Path, &patchHunk{Patch: file.Patch})
+			}
+			if _, existsInTarget := tree[file.Path]; existsInTarget {
+				addEntry("changed_file", file.Path, nil)
+			}
 			continue
 		}
 		for _, hunk := range file.Hunks {
@@ -915,7 +922,7 @@ func buildContext(store state.Store, target SnapshotRef, tree map[string]snapsho
 }
 
 func contextEntry(store state.Store, target SnapshotRef, tree map[string]snapshot.TreeEntry, kind, path string, hunk *patchHunk) (ContextEntry, bool, Omission) {
-	if kind == "patch_hunk" && hunk != nil && hunk.Patch != "" {
+	if (kind == "patch_hunk" || kind == "patch_file") && hunk != nil && hunk.Patch != "" {
 		content := strings.TrimRight(hunk.Patch, "\n")
 		return ContextEntry{
 			Kind:         kind,
@@ -933,6 +940,9 @@ func contextEntry(store state.Store, target SnapshotRef, tree map[string]snapsho
 	body, err := store.Read(entry.Digest)
 	if err != nil {
 		return ContextEntry{}, false, Omission{Code: "context_read_failed", Path: path, Message: err.Error()}
+	}
+	if !isTextContextBody(body) {
+		return ContextEntry{}, false, Omission{Code: "binary_context_omitted", Path: path, Message: "target snapshot content is binary or not valid UTF-8; patch metadata is used instead"}
 	}
 	content := string(body)
 	start := 0
@@ -965,6 +975,10 @@ func contextEntry(store state.Store, target SnapshotRef, tree map[string]snapsho
 		Bytes:        len([]byte(content)),
 		Content:      content,
 	}, true, Omission{}
+}
+
+func isTextContextBody(body []byte) bool {
+	return utf8.Valid(body) && !bytes.Contains(body, []byte{0})
 }
 
 func nearbyPaths(tree map[string]snapshot.TreeEntry, files []patchFile) []string {
@@ -1044,28 +1058,35 @@ func parsePatch(body []byte) []patchFile {
 			if current != nil && current.Path != "" {
 				files = append(files, *current)
 			}
-			current = &patchFile{Path: parseDiffPath(line)}
+			current = &patchFile{Path: parseDiffPath(line), Patch: line}
 		case strings.HasPrefix(line, "--- ") && current != nil:
+			appendPatchFileLine(current, line)
 			path := normalizeOldPatchPath(strings.TrimSpace(strings.TrimPrefix(line, "--- ")))
 			if current.Path == "" && path != "" {
 				current.Path = path
 			}
 		case strings.HasPrefix(line, "+++ ") && current != nil:
+			appendPatchFileLine(current, line)
 			path := normalizePatchPath(strings.TrimSpace(strings.TrimPrefix(line, "+++ ")))
 			if path != "" && path != "/dev/null" {
 				current.Path = path
 			}
 		case strings.HasPrefix(line, "rename to ") && current != nil:
+			appendPatchFileLine(current, line)
 			path := normalizeMetadataPath(strings.TrimSpace(strings.TrimPrefix(line, "rename to ")))
 			if path != "" {
 				current.Path = path
 			}
 		case strings.HasPrefix(line, "@@ ") && current != nil:
+			appendPatchFileLine(current, line)
 			if hunk, ok := parseHunk(line); ok {
 				current.Hunks = append(current.Hunks, hunk)
 			}
 		case current != nil && len(current.Hunks) > 0 && isPatchHunkLine(line):
+			appendPatchFileLine(current, line)
 			appendPatchHunkLine(current, line)
+		case current != nil:
+			appendPatchFileLine(current, line)
 		}
 	}
 	if current != nil && current.Path != "" {
@@ -1073,6 +1094,14 @@ func parsePatch(body []byte) []patchFile {
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	return files
+}
+
+func appendPatchFileLine(file *patchFile, line string) {
+	if file.Patch == "" {
+		file.Patch = line
+		return
+	}
+	file.Patch += "\n" + line
 }
 
 func isPatchHunkLine(line string) bool {
@@ -1670,7 +1699,7 @@ func contextSummary(context ContextBundle) ContextSummary {
 
 func sourceCompleteness(context ContextBundle) string {
 	for _, omission := range context.Omissions {
-		if omission.Code == "context_budget_exceeded" || omission.Code == "context_read_failed" || omission.Code == "path_not_in_target_snapshot" {
+		if omission.Code == "context_budget_exceeded" || omission.Code == "context_read_failed" || omission.Code == "path_not_in_target_snapshot" || omission.Code == "binary_context_omitted" {
 			return "partial"
 		}
 	}
