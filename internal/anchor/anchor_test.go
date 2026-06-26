@@ -121,6 +121,92 @@ func TestMigrateRejectsEmptyAnchorInput(t *testing.T) {
 	}
 }
 
+func TestNormalizeAnchorsStoresCleanPaths(t *testing.T) {
+	anchors, err := normalizeAnchors([]Anchor{{ID: "a", Kind: KindFile, Path: `dir\file.go`}})
+	if err != nil {
+		t.Fatalf("normalizeAnchors: %v", err)
+	}
+	if anchors[0].Path != "dir/file.go" {
+		t.Fatalf("expected slash-normalized anchor path, got %q", anchors[0].Path)
+	}
+}
+
+func TestMigrateRejectsSnapshotTreeSizeMismatch(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "a.txt", "one\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	base, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
+	if err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	writeFile(t, repo, "a.txt", "two\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	treeRef, err := store.PutJSON(snapshot.TreeManifest{SchemaVersion: snapshot.SchemaVersion, Entries: []snapshot.TreeEntry{{Path: "a.txt", Mode: "100644", Digest: objectDigestForTest(t, stateDir, "one\n"), Size: 999}}}, "application/vnd.subreview.snapshot-tree+json")
+	if err != nil {
+		t.Fatalf("PutJSON tree: %v", err)
+	}
+	record := snapshot.SnapshotRecord{
+		SchemaVersion:   snapshot.SchemaVersion,
+		Kind:            "base",
+		Repo:            repo,
+		Source:          "test",
+		TreeDigest:      treeRef.Digest,
+		Tree:            treeRef,
+		EntryCount:      1,
+		Reconstructable: true,
+	}
+	recordRef, err := store.PutJSON(record, "application/vnd.subreview.snapshot+json")
+	if err != nil {
+		t.Fatalf("PutJSON snapshot: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "snapshot.captured",
+		ObjectDigests: []string{recordRef.Digest, treeRef.Digest},
+		Repo:          repo,
+		Details: map[string]string{
+			"kind":     "base",
+			"snapshot": recordRef.Digest,
+			"tree":     treeRef.Digest,
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent malformed snapshot: %v", err)
+	}
+	_, err = Migrate(MigrateOptions{
+		StateDir: stateDir,
+		FromKind: "base",
+		ToKind:   "proposal",
+		Anchors:  []Anchor{{ID: "a", Kind: KindFile, Path: "a.txt"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "size mismatch") {
+		t.Fatalf("expected size mismatch error, got %v", err)
+	}
+	events, err := state.ReadEvents(stateDir)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	for _, event := range events {
+		if event.Type == "anchors.migrated" {
+			t.Fatalf("migrate should not ledger after size mismatch; base=%s event=%+v", base.Snapshot.Digest, event)
+		}
+	}
+}
+
 func TestAnchorManifestReadSupportsObjectAndArrayForms(t *testing.T) {
 	root := t.TempDir()
 	objectPath := filepath.Join(root, "object.json")
@@ -238,4 +324,17 @@ func writeFile(t *testing.T, root, rel, body string) {
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", rel, err)
 	}
+}
+
+func objectDigestForTest(t *testing.T, stateDir, body string) string {
+	t.Helper()
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	ref, err := store.PutText(body)
+	if err != nil {
+		t.Fatalf("PutText: %v", err)
+	}
+	return ref.Digest
 }

@@ -532,28 +532,31 @@ func normalizeAnchors(anchors []Anchor) ([]Anchor, error) {
 			return nil, fmt.Errorf("duplicate anchor id: %s", anchor.ID)
 		}
 		ids[anchor.ID] = struct{}{}
-		if err := validateAnchor(anchor); err != nil {
+		path, err := validateAnchor(anchor)
+		if err != nil {
 			return nil, err
 		}
+		anchor.Path = path
 		normalized[i] = anchor
 	}
 	return normalized, nil
 }
 
-func validateAnchor(anchor Anchor) error {
-	if _, err := cleanRepoPath(anchor.Path); err != nil {
-		return err
+func validateAnchor(anchor Anchor) (string, error) {
+	path, err := cleanRepoPath(anchor.Path)
+	if err != nil {
+		return "", err
 	}
 	switch anchor.Kind {
 	case KindFile, KindPath:
-		return nil
+		return path, nil
 	case KindHunk:
 		if anchor.StartLine <= 0 || anchor.EndLine <= 0 || anchor.StartLine > anchor.EndLine {
-			return fmt.Errorf("hunk anchor %s requires a valid start_line and end_line", anchor.ID)
+			return "", fmt.Errorf("hunk anchor %s requires a valid start_line and end_line", anchor.ID)
 		}
-		return nil
+		return path, nil
 	default:
-		return fmt.Errorf("unsupported anchor kind: %s", anchor.Kind)
+		return "", fmt.Errorf("unsupported anchor kind: %s", anchor.Kind)
 	}
 }
 
@@ -630,6 +633,9 @@ func loadSnapshot(store state.Store, stateDir, kind, repo string) (snapshotView,
 			body, err := store.Read(entry.Digest)
 			if err != nil {
 				return snapshotView{}, err
+			}
+			if int64(len(body)) != entry.Size {
+				return snapshotView{}, fmt.Errorf("snapshot tree entry size mismatch for %s: %d != %d", path, len(body), entry.Size)
 			}
 			files[path] = fileView{Path: path, Digest: entry.Digest, Body: body}
 		}
@@ -773,7 +779,7 @@ func cleanRepoPath(path string) (string, error) {
 	if strings.ContainsRune(path, '\x00') {
 		return "", fmt.Errorf("invalid repository-relative path: %q", path)
 	}
-	slash := filepath.ToSlash(path)
+	slash := strings.ReplaceAll(filepath.ToSlash(path), "\\", "/")
 	clean := filepath.Clean(slash)
 	clean = filepath.ToSlash(clean)
 	if clean == "." || strings.HasPrefix(clean, "../") || clean == ".." || strings.HasPrefix(clean, "/") {
