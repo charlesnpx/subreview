@@ -37,6 +37,9 @@ func TestBuildPrimaryPacketStableDigestAndDedupeIgnoreVolatileTime(t *testing.T)
 	if first.SemanticDedupeKey.Digest != second.SemanticDedupeKey.Digest {
 		t.Fatalf("dedupe key should ignore volatile generated time: %s != %s", first.SemanticDedupeKey.Digest, second.SemanticDedupeKey.Digest)
 	}
+	if first.TargetState.Tree == "" || first.SemanticDedupeKey.TargetState != "proposal:"+first.TargetState.Tree {
+		t.Fatalf("dedupe target should use content tree identity: target=%+v key=%+v", first.TargetState, first.SemanticDedupeKey)
+	}
 	if first.VolatileDigest == second.VolatileDigest {
 		t.Fatalf("volatile digest should include generated time")
 	}
@@ -90,6 +93,15 @@ func TestLeakageDetectionRejectsEvaluationLabels(t *testing.T) {
 	}
 }
 
+func TestMarkdownFenceExceedsEmbeddedBackticks(t *testing.T) {
+	if got, want := markdownFence("plain text"), "```"; got != want {
+		t.Fatalf("unexpected default fence: got %q want %q", got, want)
+	}
+	if got, want := markdownFence("code ``` nested ```` fence"), "`````"; got != want {
+		t.Fatalf("unexpected expanded fence: got %q want %q", got, want)
+	}
+}
+
 func TestSemanticDedupeAndReusedTelemetryHelpers(t *testing.T) {
 	fields := SemanticDedupeFields{
 		PolicyID:             "policy",
@@ -108,6 +120,84 @@ func TestSemanticDedupeAndReusedTelemetryHelpers(t *testing.T) {
 	telemetry := ReusedTokenTelemetry(RunKindDiscovery, "complete", "packet-1", 1234)
 	if telemetry.ExecutionReusedFromPacketID != "packet-1" || telemetry.GrossDiscoveryTokens != 1234 || telemetry.IncrementalDiscoveryTokens != 0 {
 		t.Fatalf("bad reused telemetry: %+v", telemetry)
+	}
+}
+
+func TestSourceDiffDigestMaterialIgnoresObjectPaths(t *testing.T) {
+	first := []SourceDiff{{
+		Transition:   "base->proposal",
+		FromKind:     "base",
+		ToKind:       "proposal",
+		FromSnapshot: "sha256:base",
+		ToSnapshot:   "sha256:proposal",
+		Diff:         state.ObjectRef{Digest: "sha256:diff", MediaType: "application/json", Size: 12, Path: "/tmp/one/diff"},
+		Patch:        state.ObjectRef{Digest: "sha256:patch", MediaType: "text/x-patch", Size: 34, Path: "/tmp/one/patch"},
+		PatchDigest:  "sha256:patch",
+		HasChanges:   true,
+		ChangedPaths: []string{"beta.txt", "alpha.txt"},
+		HunkCount:    2,
+	}}
+	second := []SourceDiff{{
+		Transition:   "base->proposal",
+		FromKind:     "base",
+		ToKind:       "proposal",
+		FromSnapshot: "sha256:base",
+		ToSnapshot:   "sha256:proposal",
+		Diff:         state.ObjectRef{Digest: "sha256:diff", MediaType: "application/json", Size: 12, Path: "/tmp/two/diff"},
+		Patch:        state.ObjectRef{Digest: "sha256:patch", MediaType: "text/x-patch", Size: 34, Path: "/tmp/two/patch"},
+		PatchDigest:  "sha256:patch",
+		HasChanges:   true,
+		ChangedPaths: []string{"alpha.txt", "beta.txt"},
+		HunkCount:    2,
+	}}
+	if got, want := digestJSON(sourceDiffDigestMaterial(first)), digestJSON(sourceDiffDigestMaterial(second)); got != want {
+		t.Fatalf("canonical source diff material should ignore object paths and path ordering: got %s want %s", got, want)
+	}
+}
+
+func TestBuildPrimaryPacketIncludesDeletedPatchContext(t *testing.T) {
+	_, stateDir := initializedDeletedPacketState(t, "old\n```source\n")
+	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(100, 0)})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, omission := range result.Context.Omissions {
+		if omission.Code == "path_not_in_target_snapshot" && omission.Path == "alpha.txt" {
+			t.Fatalf("deleted file should use patch context instead of target omission: %+v", result.Context.Omissions)
+		}
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	packetBody, err := store.Read(result.Packet.Digest)
+	if err != nil {
+		t.Fatalf("Read packet: %v", err)
+	}
+	var record PacketRecord
+	if err := json.Unmarshal(packetBody, &record); err != nil {
+		t.Fatalf("Unmarshal packet: %v", err)
+	}
+	var deleted *ContextEntry
+	for i := range record.Context.Entries {
+		entry := &record.Context.Entries[i]
+		if entry.Path == "alpha.txt" && entry.Kind == "patch_hunk" {
+			deleted = entry
+			break
+		}
+	}
+	if deleted == nil {
+		t.Fatalf("deleted file patch context missing: %+v", record.Context.Entries)
+	}
+	if deleted.SnapshotKind != "patch" || !strings.Contains(deleted.Content, "-old") || !strings.Contains(deleted.Content, "-```source") {
+		t.Fatalf("deleted file patch context should include removed hunk text: %+v", deleted)
+	}
+	markdown, err := store.Read(result.Markdown.Digest)
+	if err != nil {
+		t.Fatalf("Read markdown: %v", err)
+	}
+	if !strings.Contains(string(markdown), "````\n@@ ") || !strings.Contains(string(markdown), "-```source\n````") {
+		t.Fatalf("markdown should use an expanded fence around embedded backticks:\n%s", markdown)
 	}
 }
 
@@ -172,6 +262,40 @@ func initializedPacketState(t *testing.T, baseBody, proposalBody string) (string
 		t.Fatalf("Capture base: %v", err)
 	}
 	writeFile(t, repo, "alpha.txt", proposalBody)
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build obligations: %v", err)
+	}
+	return repo, stateDir
+}
+
+func initializedDeletedPacketState(t *testing.T, baseBody string) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", baseBody)
+	writeFile(t, repo, "alpha_test.txt", "package fixture\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(10, 0)}); err != nil {
+		t.Fatalf("Init state: %v", err)
+	}
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfig(t, root), Profile: "default"}); err != nil {
+		t.Fatalf("Bind policy: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	if err := os.Remove(filepath.Join(repo, "alpha.txt")); err != nil {
+		t.Fatalf("remove alpha.txt: %v", err)
+	}
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
 		t.Fatalf("Capture proposal: %v", err)
 	}

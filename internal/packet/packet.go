@@ -248,6 +248,7 @@ type patchFile struct {
 type patchHunk struct {
 	NewStart int
 	NewCount int
+	Patch    string
 }
 
 func Build(opts BuildOptions) (BuildResult, error) {
@@ -305,8 +306,8 @@ func Build(opts BuildOptions) (BuildResult, error) {
 	context.AllowedContextDigest = digestJSON(contextDigestMaterial(context))
 	contentBundleHash := digestJSON(map[string]any{
 		"coverage_manifest": manifestRef.Digest,
-		"source_diffs":      sourceDiffs,
-		"target_state":      target,
+		"source_diffs":      sourceDiffDigestMaterial(sourceDiffs),
+		"target_state":      targetDigestMaterial(target),
 		"context":           context.AllowedContextDigest,
 		"gates":             gates,
 	})
@@ -324,7 +325,7 @@ func Build(opts BuildOptions) (BuildResult, error) {
 		PolicyID:             policyID,
 		PolicyDigest:         policyDigest,
 		Route:                RoutePrimary,
-		TargetState:          target.Digest,
+		TargetState:          targetDedupeID(target),
 		ContentBundleHash:    contentBundleHash,
 		RunKind:              RunKindDiscovery,
 		AllowedContextBundle: context.AllowedContextDigest,
@@ -564,9 +565,10 @@ func renderStablePrefix(data stableRenderData) string {
 		}
 		fmt.Fprintln(&b)
 		fmt.Fprintf(&b, "digest: %s\n\n", entry.Digest)
-		fmt.Fprintln(&b, "```")
+		fence := markdownFence(entry.Content)
+		fmt.Fprintln(&b, fence)
 		fmt.Fprintln(&b, entry.Content)
-		fmt.Fprintln(&b, "```")
+		fmt.Fprintln(&b, fence)
 	}
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "## Explicit Omissions")
@@ -595,6 +597,25 @@ func renderVolatileSuffix(stateDir string, now time.Time) string {
 	fmt.Fprintf(&b, "- generated_at: %s\n", now.Format(time.RFC3339Nano))
 	fmt.Fprintf(&b, "- state: %s\n", stateDir)
 	return strings.TrimSpace(b.String())
+}
+
+func markdownFence(content string) string {
+	maxRun := 0
+	currentRun := 0
+	for _, r := range content {
+		if r == '`' {
+			currentRun++
+			if currentRun > maxRun {
+				maxRun = currentRun
+			}
+			continue
+		}
+		currentRun = 0
+	}
+	if maxRun < 3 {
+		return "```"
+	}
+	return strings.Repeat("`", maxRun+1)
 }
 
 func buildContext(store state.Store, target SnapshotRef, tree map[string]snapshot.TreeEntry, files []patchFile, maxBytes int) ContextBundle {
@@ -655,6 +676,17 @@ func buildContext(store state.Store, target SnapshotRef, tree map[string]snapsho
 func contextEntry(store state.Store, target SnapshotRef, tree map[string]snapshot.TreeEntry, kind, path string, hunk *patchHunk) (ContextEntry, bool, Omission) {
 	entry, ok := tree[path]
 	if !ok {
+		if hunk != nil && hunk.Patch != "" {
+			content := strings.TrimRight(hunk.Patch, "\n")
+			return ContextEntry{
+				Kind:         "patch_hunk",
+				Path:         path,
+				SnapshotKind: "patch",
+				Digest:       digestString(content),
+				Bytes:        len([]byte(content)),
+				Content:      content,
+			}, true, Omission{}
+		}
 		return ContextEntry{}, false, Omission{Code: "path_not_in_target_snapshot", Path: path, Message: "changed path is absent from target snapshot"}
 	}
 	body, err := store.Read(entry.Digest)
@@ -771,6 +803,11 @@ func parsePatch(body []byte) []patchFile {
 				files = append(files, *current)
 			}
 			current = &patchFile{Path: parseDiffPath(line)}
+		case strings.HasPrefix(line, "--- ") && current != nil:
+			path := normalizeOldPatchPath(strings.TrimSpace(strings.TrimPrefix(line, "--- ")))
+			if current.Path == "" && path != "" {
+				current.Path = path
+			}
 		case strings.HasPrefix(line, "+++ ") && current != nil:
 			path := normalizePatchPath(strings.TrimSpace(strings.TrimPrefix(line, "+++ ")))
 			if path != "" && path != "/dev/null" {
@@ -785,6 +822,8 @@ func parsePatch(body []byte) []patchFile {
 			if hunk, ok := parseHunk(line); ok {
 				current.Hunks = append(current.Hunks, hunk)
 			}
+		case current != nil && len(current.Hunks) > 0 && isPatchHunkLine(line):
+			appendPatchHunkLine(current, line)
 		}
 	}
 	if current != nil && current.Path != "" {
@@ -792,6 +831,15 @@ func parsePatch(body []byte) []patchFile {
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	return files
+}
+
+func isPatchHunkLine(line string) bool {
+	return strings.HasPrefix(line, " ") || strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") || strings.HasPrefix(line, "\\")
+}
+
+func appendPatchHunkLine(file *patchFile, line string) {
+	index := len(file.Hunks) - 1
+	file.Hunks[index].Patch += "\n" + line
 }
 
 func parseDiffPath(line string) string {
@@ -804,6 +852,10 @@ func parseDiffPath(line string) string {
 
 func normalizePatchPath(path string) string {
 	return normalizeHeaderPath(path, "to", "b")
+}
+
+func normalizeOldPatchPath(path string) string {
+	return normalizeHeaderPath(path, "from", "a")
 }
 
 func normalizeMetadataPath(path string) string {
@@ -993,7 +1045,7 @@ func parseHunk(line string) (patchHunk, bool) {
 			count = parsed
 		}
 	}
-	return patchHunk{NewStart: start, NewCount: count}, true
+	return patchHunk{NewStart: start, NewCount: count, Patch: line}, true
 }
 
 func primaryTargetSnapshot(store state.Store, manifest obligation.CoverageManifest, events []state.Event, repo string) (SnapshotRef, error) {
@@ -1202,6 +1254,69 @@ func contextDigestMaterial(context ContextBundle) any {
 		"snippet_context_lines":    context.SnippetContextLines,
 		"configured_relationships": context.ConfiguredRelationships,
 	}
+}
+
+type canonicalObjectRef struct {
+	Digest    string `json:"digest"`
+	MediaType string `json:"media_type"`
+	Size      int64  `json:"size"`
+}
+
+type canonicalSourceDiff struct {
+	Transition   string             `json:"transition"`
+	FromKind     string             `json:"from_kind"`
+	ToKind       string             `json:"to_kind"`
+	FromSnapshot string             `json:"from_snapshot"`
+	ToSnapshot   string             `json:"to_snapshot"`
+	Diff         canonicalObjectRef `json:"diff"`
+	Patch        canonicalObjectRef `json:"patch"`
+	PatchDigest  string             `json:"patch_digest"`
+	HasChanges   bool               `json:"has_changes"`
+	ChangedPaths []string           `json:"changed_paths"`
+	HunkCount    int                `json:"hunk_count"`
+}
+
+type canonicalTargetState struct {
+	Kind string `json:"kind"`
+	Tree string `json:"tree,omitempty"`
+}
+
+func targetDigestMaterial(target SnapshotRef) canonicalTargetState {
+	return canonicalTargetState{Kind: target.Kind, Tree: target.Tree}
+}
+
+func targetDedupeID(target SnapshotRef) string {
+	if target.Tree != "" {
+		return target.Kind + ":" + target.Tree
+	}
+	return target.Kind + ":" + target.Digest
+}
+
+func sourceDiffDigestMaterial(sourceDiffs []SourceDiff) []canonicalSourceDiff {
+	canonical := make([]canonicalSourceDiff, 0, len(sourceDiffs))
+	for _, diff := range sourceDiffs {
+		changedPaths := append([]string(nil), diff.ChangedPaths...)
+		sort.Strings(changedPaths)
+		canonical = append(canonical, canonicalSourceDiff{
+			Transition:   diff.Transition,
+			FromKind:     diff.FromKind,
+			ToKind:       diff.ToKind,
+			FromSnapshot: diff.FromSnapshot,
+			ToSnapshot:   diff.ToSnapshot,
+			Diff:         canonicalObject(diff.Diff),
+			Patch:        canonicalObject(diff.Patch),
+			PatchDigest:  diff.PatchDigest,
+			HasChanges:   diff.HasChanges,
+			ChangedPaths: changedPaths,
+			HunkCount:    diff.HunkCount,
+		})
+	}
+	sort.Slice(canonical, func(i, j int) bool { return canonical[i].Transition < canonical[j].Transition })
+	return canonical
+}
+
+func canonicalObject(ref state.ObjectRef) canonicalObjectRef {
+	return canonicalObjectRef{Digest: ref.Digest, MediaType: ref.MediaType, Size: ref.Size}
 }
 
 func contextSummary(context ContextBundle) ContextSummary {
