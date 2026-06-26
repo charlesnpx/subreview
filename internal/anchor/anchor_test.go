@@ -154,6 +154,15 @@ func TestFindTextOccurrencesDetectsOverlappingRepeatedRanges(t *testing.T) {
 	}
 }
 
+func TestHunkAppearsModifiedUsesWholeLines(t *testing.T) {
+	if hunkAppearsModified("bar\n", []byte("foo\nfoobar\nbaz\n")) {
+		t.Fatal("modified heuristic should not match substrings inside target lines")
+	}
+	if !hunkAppearsModified("foo\nbar\n", []byte("foo\nbaz\n")) {
+		t.Fatal("modified heuristic should match surviving whole source lines")
+	}
+}
+
 func projectGoldenResults(results []AnchorResult) []goldenAnchorResult {
 	projected := make([]goldenAnchorResult, 0, len(results))
 	for _, result := range results {

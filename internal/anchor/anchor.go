@@ -491,11 +491,17 @@ func textLineSpan(text string) int {
 }
 
 func hunkAppearsModified(fromText string, body []byte) bool {
-	target := string(body)
-	for _, line := range strings.Split(fromText, "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" && strings.Contains(target, line) {
-			return true
+	targetLines := map[string]struct{}{}
+	for _, line := range splitLines(body) {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			targetLines[trimmed] = struct{}{}
+		}
+	}
+	for _, line := range splitLines([]byte(fromText)) {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			if _, ok := targetLines[trimmed]; ok {
+				return true
+			}
 		}
 	}
 	return false
