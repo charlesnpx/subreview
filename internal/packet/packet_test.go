@@ -445,6 +445,34 @@ func TestContentBundleDigestMaterialIgnoresCASRecordIdentities(t *testing.T) {
 	}
 }
 
+func TestVerificationContentBundleIncludesExpectedFixSurface(t *testing.T) {
+	baseFinding := reviewresult.FindingRecord{
+		ID:           "finding-one",
+		DedupeDigest: "sha256:finding",
+		Severity:     "high",
+		Class:        "correctness",
+		ExpectedFixSurface: []reviewresult.FixSurface{{
+			Kind:      "file",
+			Path:      "alpha.txt",
+			StartLine: 1,
+			EndLine:   2,
+		}},
+	}
+	changedFinding := baseFinding
+	changedFinding.ExpectedFixSurface = []reviewresult.FixSurface{{
+		Kind:      "file",
+		Path:      "beta.txt",
+		StartLine: 3,
+		EndLine:   4,
+	}}
+	target := SnapshotRef{Kind: "final", Digest: "sha256:target", Tree: "sha256:tree"}
+	first := digestJSON(verificationContentBundleDigestMaterial(nil, target, "sha256:context", nil, baseFinding))
+	second := digestJSON(verificationContentBundleDigestMaterial(nil, target, "sha256:context", nil, changedFinding))
+	if first == second {
+		t.Fatalf("verification content bundle digest should include expected fix surface: %s", first)
+	}
+}
+
 func TestBuildPrimaryPacketIncludesDeletedPatchContext(t *testing.T) {
 	_, stateDir := initializedDeletedPacketState(t, "old\n```source\n")
 	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(100, 0)})

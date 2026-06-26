@@ -522,6 +522,56 @@ func TestVerificationOutcomeRejectsContradictoryStateAndBasis(t *testing.T) {
 	}
 }
 
+func TestVerificationOutcomeRejectsDuplicateTargetedOutcomes(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("finding-one")},
+		}),
+		Now: time.Unix(239, 4),
+	}); err != nil {
+		t.Fatalf("Import finding: %v", err)
+	}
+	verificationPacket := buildVerificationResultPacket(t, stateDir, "finding-one")
+	before := readEvents(t, stateDir)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: verificationPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        verificationPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			VerifierOutcomes: []reviewresult.VerifierOutcomeInput{
+				{
+					FindingID: "finding-one",
+					Outcome:   reviewresult.VerificationResolved,
+					Summary:   "The final state removes the reported failure.",
+				},
+				{
+					FindingID: "finding-one",
+					Outcome:   reviewresult.VerificationNotResolved,
+					Summary:   "The final state still leaves the reported failure.",
+				},
+			},
+		}),
+		Now: time.Unix(239, 5),
+	}); err == nil {
+		t.Fatal("targeted verification should reject duplicate verifier outcomes")
+	}
+	if after := readEvents(t, stateDir); len(after) != len(before) {
+		t.Fatalf("duplicate outcome import should not append ledger event: before=%d after=%d", len(before), len(after))
+	}
+}
+
 func TestVerificationNotResolvedAndDeterministicRefutedOutcomes(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	if _, err := reviewresult.Import(reviewresult.ImportOptions{

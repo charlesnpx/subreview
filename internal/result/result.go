@@ -631,10 +631,15 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 		if packet.VerificationFindingID == "" {
 			return ResultRecord{}, errors.New("finding-level verification evidence requires a targeted verification packet")
 		}
+		seenOutcome := false
 		for _, outcome := range input.VerifierOutcomes {
 			if strings.TrimSpace(outcome.FindingID) != packet.VerificationFindingID {
 				return ResultRecord{}, fmt.Errorf("verifier outcome finding_id %q does not match packet finding_id %q", outcome.FindingID, packet.VerificationFindingID)
 			}
+			if seenOutcome {
+				return ResultRecord{}, fmt.Errorf("targeted verification packet accepts at most one verifier outcome for finding_id %q", packet.VerificationFindingID)
+			}
+			seenOutcome = true
 		}
 		for _, refutation := range input.DeterministicRefutations {
 			if findingID := strings.TrimSpace(refutation.FindingID); findingID != "" && findingID != packet.VerificationFindingID {

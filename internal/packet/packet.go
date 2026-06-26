@@ -2131,11 +2131,12 @@ func verificationContentBundleDigestMaterial(sourceDiffs []SourceDiff, target Sn
 		"target_state": targetDigestMaterial(target),
 		"context":      allowedContextDigest,
 		"gates":        gateDigestMaterial(gates),
-		"finding": map[string]string{
-			"id":            finding.ID,
-			"dedupe_digest": finding.DedupeDigest,
-			"severity":      finding.Severity,
-			"class":         finding.Class,
+		"finding": map[string]any{
+			"id":                   finding.ID,
+			"dedupe_digest":        finding.DedupeDigest,
+			"severity":             finding.Severity,
+			"class":                finding.Class,
+			"expected_fix_surface": finding.ExpectedFixSurface,
 		},
 	}
 }
