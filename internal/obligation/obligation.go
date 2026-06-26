@@ -598,6 +598,10 @@ func finalHunkSpan(hunk patchHunk) (int, int) {
 }
 
 func normalizeDiffPath(path, prefix string) string {
+	path, ok := decodeGitPathToken(path)
+	if !ok {
+		return ""
+	}
 	if prefix != "" {
 		path = strings.TrimPrefix(path, prefix+"/")
 	}
@@ -608,10 +612,6 @@ func cleanDiffPath(path string) string {
 	if path == "/dev/null" || path == "" {
 		return ""
 	}
-	if tab := strings.IndexByte(path, '\t'); tab >= 0 {
-		path = path[:tab]
-	}
-	path = strings.Trim(path, `"`)
 	clean, err := cleanRepoPath(path)
 	if err != nil {
 		return ""
@@ -721,38 +721,59 @@ func readDiffGitArg(rest string) (string, string, bool) {
 		case rest[i] == '\\':
 			escaped = true
 		case rest[i] == '"':
-			value, err := strconv.Unquote(rest[:i+1])
-			if err != nil {
-				return "", "", false
-			}
-			return value, rest[i+1:], true
+			return rest[:i+1], rest[i+1:], true
 		}
 	}
 	return "", "", false
 }
 
 func normalizeHeaderPath(path string, primaryPrefix, alternatePrefix string) string {
+	path, ok := decodeGitPathToken(path)
+	if !ok {
+		return ""
+	}
 	for _, prefix := range []string{primaryPrefix, alternatePrefix} {
 		if prefix == "" {
 			continue
 		}
 		if strings.HasPrefix(path, prefix+"/") {
-			return normalizeDiffPath(path, prefix)
+			return cleanDiffPath(strings.TrimPrefix(path, prefix+"/"))
 		}
 	}
 	return cleanDiffPath(path)
 }
 
 func normalizeMetadataPath(path string) string {
-	if path == "" {
+	path, ok := decodeGitPathToken(path)
+	if !ok {
 		return ""
 	}
-	if strings.HasPrefix(path, `"`) {
-		if unquoted, err := strconv.Unquote(path); err == nil {
-			path = unquoted
-		}
-	}
 	return cleanDiffPath(path)
+}
+
+func decodeGitPathToken(path string) (string, bool) {
+	path = strings.TrimSpace(path)
+	if path == "" || path == "/dev/null" {
+		return path, true
+	}
+	if strings.HasPrefix(path, `"`) {
+		value, rest, ok := readDiffGitArg(path)
+		if !ok {
+			return "", false
+		}
+		if strings.TrimSpace(rest) != "" && !strings.HasPrefix(rest, "\t") {
+			return "", false
+		}
+		unquoted, err := strconv.Unquote(value)
+		if err != nil {
+			return "", false
+		}
+		return unquoted, true
+	}
+	if tab := strings.IndexByte(path, '\t'); tab >= 0 {
+		path = path[:tab]
+	}
+	return path, true
 }
 
 func latestCoverageManifest(store state.Store, events []state.Event, stateDir, repo string) (state.ObjectRef, CoverageManifest, error) {

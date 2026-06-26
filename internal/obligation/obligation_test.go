@@ -125,6 +125,19 @@ func TestObligationsFromDiffIncludesHeaderOnlyChanges(t *testing.T) {
 			t.Fatalf("rename obligation should preserve old path, got %+v", obligation)
 		}
 	}
+	quotedPathObligations := obligationsFromDiff(diffBinding{
+		Transition: "base->proposal",
+		PatchBody: []byte(`diff --git "from/a\tb.txt" "to/a\tb.txt"
+--- "from/a\tb.txt"
++++ "to/a\tb.txt"
+@@ -1 +1 @@
+-old
++new
+`),
+	})
+	assertHasObligation(t, quotedPathObligations, KindChangedPath, "base->proposal", "a\tb.txt")
+	assertHasObligation(t, quotedPathObligations, KindChangedFile, "base->proposal", "a\tb.txt")
+	assertHasObligation(t, quotedPathObligations, KindChangedHunk, "base->proposal", "a\tb.txt")
 }
 
 func TestBuildRecordsHiddenScopeUncertaintyWhenFinalDiffIsMissing(t *testing.T) {
