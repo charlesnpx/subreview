@@ -540,13 +540,29 @@ type commandRun struct {
 func executeCommand(repo string, command CommandDefinition, startedAt time.Time) commandRun {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(command.TimeoutSeconds)*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, command.Argv[0], command.Argv[1:]...)
+	cmd := exec.Command(command.Argv[0], command.Argv[1:]...)
 	cmd.Dir = filepath.Join(repo, filepath.FromSlash(command.WorkingDir))
 	cmd.Env = commandEnv(command.Env)
+	configureCommandProcess(cmd)
 	var stdout, stderr tailBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		endedAt := time.Now().UTC()
+		return commandRun{Outcome: OutcomeError, Summary: truncateDiagnostic(err.Error()), EndedAt: endedAt}
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- cmd.Wait()
+	}()
+	var err error
+	select {
+	case err = <-errCh:
+	case <-ctx.Done():
+		_ = terminateCommandProcess(cmd)
+		<-errCh
+		err = ctx.Err()
+	}
 	endedAt := time.Now().UTC()
 	stdoutTail := stdout.String()
 	stderrTail := stderr.String()

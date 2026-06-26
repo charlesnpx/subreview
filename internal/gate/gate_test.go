@@ -204,6 +204,20 @@ func TestTailBufferKeepsBoundedSuffix(t *testing.T) {
 	}
 }
 
+func TestExecuteCommandTimeoutKillsShellChildren(t *testing.T) {
+	command := testCommand("go_test_all", []string{"/bin/sh", "-c", "sleep 5 & wait"})
+	command.TimeoutSeconds = 1
+	start := time.Now()
+	result := executeCommand(t.TempDir(), command, start.UTC())
+	elapsed := time.Since(start)
+	if result.Outcome != OutcomeError || result.Summary != "gate command timed out" {
+		t.Fatalf("expected timeout error, got %+v", result)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("timeout should kill shell children promptly, elapsed %s", elapsed)
+	}
+}
+
 func initializedGateState(t *testing.T) (string, string) {
 	t.Helper()
 	root := t.TempDir()

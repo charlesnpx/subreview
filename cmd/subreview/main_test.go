@@ -278,6 +278,42 @@ func TestGatesCheckRunAndRecordCLI(t *testing.T) {
 	if _, err := os.Stat(run.Evidence.Path); err != nil {
 		t.Fatalf("gate evidence object should exist %s: %v\n%s", run.Evidence.Path, err, runOut)
 	}
+	failingCatalogPath := filepath.Join(root, "failing-gate-catalog.json")
+	if err := os.WriteFile(failingCatalogPath, []byte(`{
+  "schema_version": 1,
+  "commands": [
+    {
+      "id": "go_test_all",
+      "argv": ["/bin/sh", "-c", "exit 7"],
+      "working_dir": ".",
+      "replay_class": "environment_bound",
+      "environment_pinned": true,
+      "executes_repo_code": true,
+      "side_effects": "none",
+      "timeout_seconds": 5
+    }
+  ]
+}
+`), 0o644); err != nil {
+		t.Fatalf("write failing gate catalog: %v", err)
+	}
+	failingCmd := exec.Command(bin, "gates", "run", "--state", stateDir, "--catalog", failingCatalogPath, "--command-id", "go_test_all", "--snapshot", "proposal", "--json")
+	failingOut, err := failingCmd.Output()
+	if err == nil {
+		t.Fatalf("failing gates run should exit non-zero: %s", failingOut)
+	}
+	var failingRun struct {
+		Outcome  string `json:"outcome"`
+		Evidence struct {
+			Digest string `json:"digest"`
+		} `json:"evidence"`
+	}
+	if err := json.Unmarshal(failingOut, &failingRun); err != nil {
+		t.Fatalf("failing gates run stdout should be json: %v\n%s", err, failingOut)
+	}
+	if failingRun.Outcome != "fail" || failingRun.Evidence.Digest == "" {
+		t.Fatalf("bad failing gates run output: %s", failingOut)
+	}
 	recordOut, err := exec.Command(bin, "gates", "record", "--state", stateDir, "--catalog", catalogPath, "--command-id", "go_test_all", "--snapshot", "proposal", "--outcome", "fail", "--diagnostic", "external failed", "--json").CombinedOutput()
 	if err != nil {
 		t.Fatalf("gates record failed: %v\n%s", err, recordOut)

@@ -144,9 +144,15 @@ func gatesRun(args []string) error {
 		return err
 	}
 	if *asJSON {
-		return writeJSON(result)
+		if err := writeJSON(result); err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("gate recorded: %s %s (%s)\n", result.CommandID, result.Evidence.Digest, result.Outcome)
 	}
-	fmt.Printf("gate recorded: %s %s (%s)\n", result.CommandID, result.Evidence.Digest, result.Outcome)
+	if result.Outcome != gate.OutcomePass {
+		return fmt.Errorf("gate %s finished with outcome %s", result.CommandID, result.Outcome)
+	}
 	return nil
 }
 
