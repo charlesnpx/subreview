@@ -19,7 +19,7 @@ import (
 const (
 	SchemaVersion           = 1
 	maxLedgerLineBytes      = 1 << 20
-	maxLedgerScanTokenBytes = maxLedgerLineBytes + 1
+	maxLedgerScanTokenBytes = maxLedgerLineBytes + 2
 )
 
 var (
@@ -593,7 +593,12 @@ func validateLedger(lay layout, result *ValidationResult) ledgerInfo {
 	prior := ""
 	for scanner.Scan() {
 		lineNo++
-		line := strings.TrimSpace(scanner.Text())
+		rawLine := scanner.Bytes()
+		if len(rawLine) > maxLedgerLineBytes {
+			result.addError("ledger_line_too_large", lay.ledgerPath, lineNo, fmt.Sprintf("ledger line exceeds %d byte limit", maxLedgerLineBytes))
+			continue
+		}
+		line := strings.TrimSpace(string(rawLine))
 		if line == "" {
 			continue
 		}
@@ -895,7 +900,11 @@ func lastEventID(path string) (string, error) {
 	prior := ""
 	for scanner.Scan() {
 		lineNo++
-		line := strings.TrimSpace(scanner.Text())
+		rawLine := scanner.Bytes()
+		if len(rawLine) > maxLedgerLineBytes {
+			return "", fmt.Errorf("ledger line %d exceeds %d byte limit", lineNo, maxLedgerLineBytes)
+		}
+		line := strings.TrimSpace(string(rawLine))
 		if line == "" {
 			continue
 		}
@@ -994,10 +1003,13 @@ func rollbackManifestIfEmptyLedger(manifestPath, ledgerPath string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err := os.Remove(manifestPath); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(manifestPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
-	return nil
+	return syncDir(filepath.Dir(manifestPath))
 }
 
 func writeJSONFileExclusive(path string, value any) error {
@@ -1260,6 +1272,9 @@ func CopyObject(dst io.Writer, store Store, digest string) error {
 	if err != nil {
 		return err
 	}
-	_, err = dst.Write(body)
+	n, err := dst.Write(body)
+	if err == nil && n != len(body) {
+		return io.ErrShortWrite
+	}
 	return err
 }

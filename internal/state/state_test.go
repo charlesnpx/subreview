@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -697,6 +698,53 @@ func TestLedgerAcceptsMaxSizedEventLine(t *testing.T) {
 	}
 }
 
+func TestLedgerRejectsOversizedFinalLineWithoutNewline(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	ledgerPath := filepath.Join(stateDir, "ledger.jsonl")
+	body, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	var event Event
+	if err := decodeStrictJSON([]byte(strings.TrimSpace(string(body))), &event); err != nil {
+		t.Fatalf("decode initial event: %v", err)
+	}
+	event.Details["padding"] = ""
+	event.EventID = eventID(event)
+	baseLine, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal base event: %v", err)
+	}
+	paddingLen := maxLedgerLineBytes + 1 - len(baseLine)
+	if paddingLen <= 0 {
+		t.Fatalf("base event unexpectedly exceeds target oversized line: %d", len(baseLine))
+	}
+	event.Details["padding"] = strings.Repeat("x", paddingLen)
+	event.EventID = eventID(event)
+	line, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal oversized event: %v", err)
+	}
+	if len(line) != maxLedgerLineBytes+1 {
+		t.Fatalf("expected oversized line length %d, got %d", maxLedgerLineBytes+1, len(line))
+	}
+	if err := os.WriteFile(ledgerPath, line, 0o644); err != nil {
+		t.Fatalf("write oversized ledger: %v", err)
+	}
+	validation := Validate(stateDir)
+	if validation.OK {
+		t.Fatal("expected oversized final ledger line validation failure")
+	}
+	requireIssue(t, validation, "ledger_line_too_large")
+	if _, err := AppendEvent(stateDir, Event{Time: time.Unix(101, 0).UTC().Format(time.RFC3339Nano), Type: "after_oversized"}); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected append to reject oversized final ledger line, got %v", err)
+	}
+}
+
 func TestLedgerRejectsOversizedEvents(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")
@@ -911,6 +959,23 @@ func TestValidateReportsInvalidEventTime(t *testing.T) {
 		t.Fatalf("expected invalid event time failure")
 	}
 	requireIssue(t, validation, "invalid_event_time")
+}
+
+type shortWriter struct{}
+
+func (shortWriter) Write(p []byte) (int, error) {
+	return len(p) - 1, nil
+}
+
+func TestCopyObjectRejectsShortWrite(t *testing.T) {
+	store := Store{root: t.TempDir()}
+	obj, err := store.PutText("payload")
+	if err != nil {
+		t.Fatalf("PutText: %v", err)
+	}
+	if err := CopyObject(shortWriter{}, store, obj.Digest); err != io.ErrShortWrite {
+		t.Fatalf("expected short write error, got %v", err)
+	}
 }
 
 func requireIssue(t *testing.T, result ValidationResult, code string) {
