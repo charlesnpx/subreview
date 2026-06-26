@@ -631,6 +631,13 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 		if packet.VerificationFindingID == "" {
 			return ResultRecord{}, errors.New("finding-level verification evidence requires a targeted verification packet")
 		}
+		for _, refutation := range input.DeterministicRefutations {
+			for _, obligationID := range refutation.ObligationIDs {
+				if strings.TrimSpace(obligationID) != "" {
+					return ResultRecord{}, errors.New("targeted verification packets cannot import obligation-level deterministic refutations")
+				}
+			}
+		}
 		seenOutcome := false
 		for _, outcome := range input.VerifierOutcomes {
 			if strings.TrimSpace(outcome.FindingID) != packet.VerificationFindingID {

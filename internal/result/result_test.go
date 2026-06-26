@@ -267,6 +267,51 @@ func TestImportRejectsFindingRefutationOnPrimaryPacket(t *testing.T) {
 	}
 }
 
+func TestImportRejectsObligationRefutationOnTargetedVerificationPacket(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("finding-one")},
+		}),
+		Now: time.Unix(234, 3),
+	}); err != nil {
+		t.Fatalf("Import finding: %v", err)
+	}
+	verificationPacket := buildVerificationResultPacket(t, stateDir, "finding-one")
+	before := readEvents(t, stateDir)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: verificationPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        verificationPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			DeterministicRefutations: []reviewresult.DeterministicRefutationInput{{
+				FindingID:     "finding-one",
+				ObligationIDs: []string{"coverage-alpha"},
+				EvidenceKind:  "test",
+				Summary:       "This attempts to use targeted finding context to refute a coverage obligation.",
+				Citations:     []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 1}},
+			}},
+		}),
+		Now: time.Unix(234, 4),
+	}); err == nil {
+		t.Fatal("targeted verification packet should not accept obligation-level deterministic refutations")
+	}
+	if after := readEvents(t, stateDir); len(after) != len(before) {
+		t.Fatalf("targeted obligation refutation should not append ledger event: before=%d after=%d", len(before), len(after))
+	}
+}
+
 func TestImportRejectsDiscoverySelfVerification(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	before := readEvents(t, stateDir)

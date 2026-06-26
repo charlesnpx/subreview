@@ -1227,6 +1227,8 @@ func renderVerificationStablePrefix(data verificationRenderData) string {
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "## Allowed Verification Outcomes")
 	fmt.Fprintln(&b, "- resolved, not_resolved, regression_introduced, insufficient_context, finding_invalid, unexpected_scope, deterministic_refuted")
+	fmt.Fprintln(&b, "- finding_invalid requires verifier_relation=fresh_blinded and relation_evidence=cli_witnessed|caller_asserted|external_asserted.")
+	fmt.Fprintln(&b, "- deterministic_refuted requires matching deterministic_refutations evidence for the same finding_id.")
 	return strings.TrimSpace(b.String())
 }
 
