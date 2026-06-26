@@ -446,21 +446,30 @@ func findTextOccurrences(body []byte, text, path, digest string) []AnchorLocatio
 	if text == "" {
 		return nil
 	}
-	content := string(body)
+	lines := splitLines(body)
+	needle := splitLines([]byte(text))
+	if len(needle) == 0 || len(needle) > len(lines) {
+		return nil
+	}
 	locations := []AnchorLocation{}
-	offset := 0
-	for {
-		index := strings.Index(content[offset:], text)
-		if index < 0 {
-			break
+	for i := 0; i <= len(lines)-len(needle); i++ {
+		if equalLines(lines[i:i+len(needle)], needle) {
+			locations = append(locations, AnchorLocation{Path: path, StartLine: i + 1, EndLine: i + len(needle), Digest: digest})
 		}
-		absolute := offset + index
-		start := 1 + strings.Count(content[:absolute], "\n")
-		end := start + textLineSpan(text) - 1
-		locations = append(locations, AnchorLocation{Path: path, StartLine: start, EndLine: end, Digest: digest})
-		offset = absolute + len(text)
 	}
 	return locations
+}
+
+func equalLines(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func textLineSpan(text string) int {

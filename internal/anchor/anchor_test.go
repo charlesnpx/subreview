@@ -129,6 +129,27 @@ func TestAnchorManifestReadSupportsObjectAndArrayForms(t *testing.T) {
 	}
 }
 
+func TestFindTextOccurrencesMatchesWholeLinesOnly(t *testing.T) {
+	locations := findTextOccurrences([]byte("foo\nfoobar\nbaz\n"), "bar\n", "target.txt", "sha256:test")
+	if len(locations) != 0 {
+		t.Fatalf("line anchor should not match substring inside changed line: %+v", locations)
+	}
+	locations = findTextOccurrences([]byte("foo\nbar\nbaz\n"), "bar\n", "target.txt", "sha256:test")
+	if len(locations) != 1 || locations[0].StartLine != 2 || locations[0].EndLine != 2 {
+		t.Fatalf("expected exact whole-line match, got %+v", locations)
+	}
+}
+
+func TestFindTextOccurrencesDetectsOverlappingRepeatedRanges(t *testing.T) {
+	locations := findTextOccurrences([]byte("a\na\na\n"), "a\na\n", "target.txt", "sha256:test")
+	if len(locations) != 2 {
+		t.Fatalf("expected overlapping repeated ranges to be detected, got %+v", locations)
+	}
+	if locations[0].StartLine != 1 || locations[0].EndLine != 2 || locations[1].StartLine != 2 || locations[1].EndLine != 3 {
+		t.Fatalf("unexpected overlapping locations: %+v", locations)
+	}
+}
+
 func projectGoldenResults(results []AnchorResult) []goldenAnchorResult {
 	projected := make([]goldenAnchorResult, 0, len(results))
 	for _, result := range results {
