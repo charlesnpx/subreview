@@ -286,7 +286,7 @@ func Build(opts BuildOptions) (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, err
 	}
-	if err := validateManifestPolicyFreshness(manifest, policyBinding); err != nil {
+	if err := validateManifestFreshness(store, events, binding.State, binding.Repo, manifest, policyBinding); err != nil {
 		return BuildResult{}, err
 	}
 	target, err := primaryTargetSnapshot(store, manifest, events, binding.Repo)
@@ -480,7 +480,46 @@ func NewTokenTelemetry(runKind, sourceCompleteness string) TokenTelemetry {
 	}
 }
 
-func validateManifestPolicyFreshness(manifest obligation.CoverageManifest, currentPolicy *boundPolicy) error {
+func validateManifestFreshness(store state.Store, events []state.Event, stateDir, repo string, manifest obligation.CoverageManifest, currentPolicy *boundPolicy) error {
+	for _, diff := range manifest.SourceDiffs {
+		latestFrom, err := latestSnapshotDigest(events, diff.FromKind, repo)
+		if err != nil {
+			return err
+		}
+		latestTo, err := latestSnapshotDigest(events, diff.ToKind, repo)
+		if err != nil {
+			return err
+		}
+		if diff.FromSnapshot != latestFrom || diff.ToSnapshot != latestTo {
+			return fmt.Errorf("coverage manifest is stale: source diff %s does not match latest snapshots; rerun obligations build", diff.Transition)
+		}
+		latestDiff, ok, err := latestTransitionDiff(events, stateDir, repo, diff.FromKind, diff.ToKind)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("coverage manifest is stale: source diff %s is missing latest captured diff; rerun obligations build", diff.Transition)
+		}
+		if latestDiff.FromSnapshot != latestFrom || latestDiff.ToSnapshot != latestTo {
+			return fmt.Errorf("coverage manifest is stale: latest diff %s does not match latest snapshots; rerun obligations build", diff.Transition)
+		}
+		if diff.Diff.Digest != latestDiff.Diff.Digest || diff.Patch.Digest != latestDiff.Patch.Digest {
+			return fmt.Errorf("coverage manifest is stale: source diff %s does not match latest captured diff; rerun obligations build", diff.Transition)
+		}
+		if _, err := store.Read(diff.Diff.Digest); err != nil {
+			return fmt.Errorf("coverage manifest is stale: source diff %s object is unreadable: %w", diff.Transition, err)
+		}
+		if _, err := store.Read(diff.Patch.Digest); err != nil {
+			return fmt.Errorf("coverage manifest is stale: source patch %s object is unreadable: %w", diff.Transition, err)
+		}
+	}
+	if !manifestHasTransition(manifest, "base", "final") {
+		if _, ok, err := latestTransitionDiff(events, stateDir, repo, "base", "final"); err != nil {
+			return err
+		} else if ok {
+			return errors.New("coverage manifest is stale: base->final diff was captured after this manifest was built; rerun obligations build")
+		}
+	}
 	switch {
 	case manifest.Policy == nil && currentPolicy != nil:
 		return errors.New("coverage manifest is stale after policy bind; rerun obligations build")
@@ -491,6 +530,78 @@ func validateManifestPolicyFreshness(manifest obligation.CoverageManifest, curre
 	default:
 		return nil
 	}
+}
+
+type latestDiffBinding struct {
+	FromKind     string
+	ToKind       string
+	FromSnapshot string
+	ToSnapshot   string
+	Diff         state.ObjectRef
+	Patch        state.ObjectRef
+}
+
+func latestSnapshotDigest(events []state.Event, kind, repo string) (string, error) {
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		if event.Type != "snapshot.captured" || event.Details["kind"] != kind {
+			continue
+		}
+		if event.Repo != repo {
+			return "", errors.New("malformed snapshot.captured event: repo mismatch")
+		}
+		digest := event.Details["snapshot"]
+		if strings.TrimSpace(digest) == "" {
+			return "", fmt.Errorf("malformed snapshot.captured event: missing snapshot for %s", kind)
+		}
+		return digest, nil
+	}
+	return "", fmt.Errorf("%s snapshot is not captured", kind)
+}
+
+func latestTransitionDiff(events []state.Event, stateDir, repo, fromKind, toKind string) (latestDiffBinding, bool, error) {
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		if event.Type != "diff.created" || event.Details["from_kind"] != fromKind || event.Details["to_kind"] != toKind {
+			continue
+		}
+		if event.Repo != repo {
+			return latestDiffBinding{}, false, fmt.Errorf("malformed diff.created event for %s->%s: repo mismatch", fromKind, toKind)
+		}
+		diffDigest := event.Details["diff"]
+		patchDigest := event.Details["patch"]
+		fromSnapshot := event.Details["from_snapshot"]
+		toSnapshot := event.Details["to_snapshot"]
+		if strings.TrimSpace(diffDigest) == "" || strings.TrimSpace(patchDigest) == "" || strings.TrimSpace(fromSnapshot) == "" || strings.TrimSpace(toSnapshot) == "" {
+			return latestDiffBinding{}, false, fmt.Errorf("malformed diff.created event for %s->%s", fromKind, toKind)
+		}
+		diffPath, err := objectPath(stateDir, diffDigest)
+		if err != nil {
+			return latestDiffBinding{}, false, err
+		}
+		patchPath, err := objectPath(stateDir, patchDigest)
+		if err != nil {
+			return latestDiffBinding{}, false, err
+		}
+		return latestDiffBinding{
+			FromKind:     fromKind,
+			ToKind:       toKind,
+			FromSnapshot: fromSnapshot,
+			ToSnapshot:   toSnapshot,
+			Diff:         state.ObjectRef{Digest: diffDigest, Path: diffPath},
+			Patch:        state.ObjectRef{Digest: patchDigest, Path: patchPath},
+		}, true, nil
+	}
+	return latestDiffBinding{}, false, nil
+}
+
+func manifestHasTransition(manifest obligation.CoverageManifest, fromKind, toKind string) bool {
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == fromKind && diff.ToKind == toKind {
+			return true
+		}
+	}
+	return false
 }
 
 func ReusedTokenTelemetry(runKind, sourceCompleteness, reusedFrom string, grossInputTokens int) TokenTelemetry {

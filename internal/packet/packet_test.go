@@ -98,6 +98,35 @@ func TestBuildRejectsPolicyRebindAfterCoverageManifest(t *testing.T) {
 	}
 }
 
+func TestBuildRejectsNewProposalDiffAfterCoverageManifest(t *testing.T) {
+	repo, stateDir := initializedPacketState(t, "one\n", "one\ntwo\n")
+	writeFile(t, repo, "alpha.txt", "one\ntwo\nthree\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture replacement proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff replacement proposal: %v", err)
+	}
+	_, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(100, 0)})
+	if err == nil || !strings.Contains(err.Error(), "does not match latest snapshots") {
+		t.Fatalf("expected stale manifest latest snapshot error, got %v", err)
+	}
+}
+
+func TestBuildRejectsUnrepresentedBaseFinalDiffAfterCoverageManifest(t *testing.T) {
+	repo, stateDir := initializedPacketState(t, "one\n", "one\ntwo\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	_, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(100, 0)})
+	if err == nil || !strings.Contains(err.Error(), "base->final diff") {
+		t.Fatalf("expected stale manifest base->final error, got %v", err)
+	}
+}
+
 func TestBuildPrimaryPacketHunkContextDoesNotAnchorPastEOF(t *testing.T) {
 	_, stateDir := initializedPacketState(t, "one\n", "one\ntwo\n")
 	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(100, 0)})
