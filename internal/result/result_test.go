@@ -174,6 +174,56 @@ func TestImportRejectsVerifierOutcomeForDifferentFindingThanPacket(t *testing.T)
 	}
 }
 
+func TestImportRejectsDeterministicRefutationForDifferentFindingThanPacket(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	secondFinding := validFinding("finding-two")
+	secondFinding.Claim = "alpha.txt can also expose a separate downstream ordering defect."
+	secondFinding.FailureScenario = "A consumer observes the second line before the first line is initialized."
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings: []reviewresult.FindingInput{
+				validFinding("finding-one"),
+				secondFinding,
+			},
+		}),
+		Now: time.Unix(233, 0),
+	}); err != nil {
+		t.Fatalf("Import findings: %v", err)
+	}
+	verificationPacket := buildVerificationResultPacket(t, stateDir, "finding-one")
+	before := readEvents(t, stateDir)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: verificationPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        verificationPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			DeterministicRefutations: []reviewresult.DeterministicRefutationInput{{
+				FindingID:    "finding-two",
+				EvidenceKind: "test",
+				Summary:      "This attempts to use finding-one context to refute finding-two.",
+				Citations:    []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 1}},
+			}},
+		}),
+		Now: time.Unix(234, 0),
+	}); err == nil {
+		t.Fatal("verification packet should reject deterministic refutations for another finding")
+	}
+	if after := readEvents(t, stateDir); len(after) != len(before) {
+		t.Fatalf("mismatched deterministic refutation import should not append ledger event: before=%d after=%d", len(before), len(after))
+	}
+}
+
 func TestImportRejectsDiscoverySelfVerification(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	before := readEvents(t, stateDir)

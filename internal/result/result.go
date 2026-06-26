@@ -630,6 +630,13 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 			}
 		}
 	}
+	if packet.VerificationFindingID != "" {
+		for _, refutation := range input.DeterministicRefutations {
+			if findingID := strings.TrimSpace(refutation.FindingID); findingID != "" && findingID != packet.VerificationFindingID {
+				return ResultRecord{}, fmt.Errorf("deterministic refutation finding_id %q does not match packet finding_id %q", refutation.FindingID, packet.VerificationFindingID)
+			}
+		}
+	}
 	outcome := strings.TrimSpace(input.Outcome)
 	if outcome == "" {
 		outcome = inferOutcome(input)
