@@ -202,6 +202,140 @@ func TestRestoreRejectsSnapshotEventTreeMismatch(t *testing.T) {
 	}
 }
 
+func TestRestoreRejectsSnapshotEventRepoMismatch(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	captured, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
+	if err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "snapshot.captured",
+		ObjectDigests: snapshotObjectDigests(captured.Snapshot.Digest, captured.Tree.Digest),
+		Repo:          repo + "-other",
+		Details: map[string]string{
+			"kind":     "base",
+			"snapshot": captured.Snapshot.Digest,
+			"tree":     captured.Tree.Digest,
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	restoreDir := filepath.Join(root, "restore")
+	_, err = Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: restoreDir})
+	if err == nil || !strings.Contains(err.Error(), "repo mismatch") {
+		t.Fatalf("expected repo mismatch error, got %v", err)
+	}
+	if _, statErr := os.Stat(restoreDir); !os.IsNotExist(statErr) {
+		t.Fatalf("restore should not create output after repo mismatch, stat err=%v", statErr)
+	}
+}
+
+func TestRestoreRejectsSnapshotEventExtraObjectDigest(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	captured, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
+	if err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	extra, err := store.PutText("extra\n")
+	if err != nil {
+		t.Fatalf("PutText extra: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "snapshot.captured",
+		ObjectDigests: append(snapshotObjectDigests(captured.Snapshot.Digest, captured.Tree.Digest), extra.Digest),
+		Repo:          repo,
+		Details: map[string]string{
+			"kind":     "base",
+			"snapshot": captured.Snapshot.Digest,
+			"tree":     captured.Tree.Digest,
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	_, err = Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: filepath.Join(root, "restore")})
+	if err == nil || !strings.Contains(err.Error(), "object_digests must contain only snapshot and tree") {
+		t.Fatalf("expected exact object digest error, got %v", err)
+	}
+}
+
+func TestRestoreRejectsSnapshotRecordRepoMismatch(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	captured, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
+	if err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	record := SnapshotRecord{
+		SchemaVersion:   SchemaVersion,
+		Kind:            "base",
+		Repo:            repo + "-other",
+		Source:          "test",
+		TreeDigest:      captured.Tree.Digest,
+		Tree:            captured.Tree,
+		EntryCount:      captured.EntryCount,
+		Reconstructable: true,
+		Provenance:      SnapshotProvenance{CaptureMode: "test"},
+	}
+	snapshotRef, err := store.PutJSON(record, "application/vnd.subreview.snapshot+json")
+	if err != nil {
+		t.Fatalf("PutJSON snapshot: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "snapshot.captured",
+		ObjectDigests: snapshotObjectDigests(snapshotRef.Digest, captured.Tree.Digest),
+		Repo:          repo,
+		Details: map[string]string{
+			"kind":     "base",
+			"snapshot": snapshotRef.Digest,
+			"tree":     captured.Tree.Digest,
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	restoreDir := filepath.Join(root, "restore")
+	_, err = Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: restoreDir})
+	if err == nil || !strings.Contains(err.Error(), "snapshot record repo mismatch") {
+		t.Fatalf("expected snapshot record repo mismatch error, got %v", err)
+	}
+	if _, statErr := os.Stat(restoreDir); !os.IsNotExist(statErr) {
+		t.Fatalf("restore should not create output after record repo mismatch, stat err=%v", statErr)
+	}
+}
+
 func TestRestoreDoesNotPartiallyWriteWhenBlobIsMissing(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")

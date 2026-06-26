@@ -267,11 +267,11 @@ func Restore(opts RestoreOptions) (RestoreResult, error) {
 	if err != nil {
 		return RestoreResult{}, err
 	}
-	binding, err := latestSnapshotBinding(stateDir, opts.Kind)
+	binding, err := latestSnapshotBinding(stateDir, opts.Kind, stateInfo.Repo)
 	if err != nil {
 		return RestoreResult{}, err
 	}
-	record, entries, err := readSnapshot(store, binding, opts.Kind)
+	record, entries, err := readSnapshot(store, binding, opts.Kind, stateInfo.Repo)
 	if err != nil {
 		return RestoreResult{}, err
 	}
@@ -318,19 +318,19 @@ func CreateDiff(opts DiffOptions) (DiffResult, error) {
 	if err != nil {
 		return DiffResult{}, err
 	}
-	fromBinding, err := latestSnapshotBinding(stateDir, opts.FromKind)
+	fromBinding, err := latestSnapshotBinding(stateDir, opts.FromKind, repo)
 	if err != nil {
 		return DiffResult{}, err
 	}
-	toBinding, err := latestSnapshotBinding(stateDir, opts.ToKind)
+	toBinding, err := latestSnapshotBinding(stateDir, opts.ToKind, repo)
 	if err != nil {
 		return DiffResult{}, err
 	}
-	fromRecord, fromEntries, err := readSnapshot(store, fromBinding, opts.FromKind)
+	fromRecord, fromEntries, err := readSnapshot(store, fromBinding, opts.FromKind, repo)
 	if err != nil {
 		return DiffResult{}, err
 	}
-	toRecord, toEntries, err := readSnapshot(store, toBinding, opts.ToKind)
+	toRecord, toEntries, err := readSnapshot(store, toBinding, opts.ToKind, repo)
 	if err != nil {
 		return DiffResult{}, err
 	}
@@ -649,7 +649,7 @@ func gitIndexModes(repo string) (map[string]string, error) {
 	return modes, nil
 }
 
-func latestSnapshotBinding(stateDir, kind string) (snapshotBinding, error) {
+func latestSnapshotBinding(stateDir, kind, repo string) (snapshotBinding, error) {
 	events, err := state.ReadEvents(stateDir)
 	if err != nil {
 		return snapshotBinding{}, err
@@ -659,13 +659,16 @@ func latestSnapshotBinding(stateDir, kind string) (snapshotBinding, error) {
 		if event.Type != "snapshot.captured" || event.Details["kind"] != kind {
 			continue
 		}
+		if event.Repo != repo {
+			return snapshotBinding{}, fmt.Errorf("malformed snapshot.captured event for kind %s: repo mismatch", kind)
+		}
 		digest := event.Details["snapshot"]
 		tree := event.Details["tree"]
 		if strings.TrimSpace(digest) == "" || strings.TrimSpace(tree) == "" {
 			return snapshotBinding{}, fmt.Errorf("malformed snapshot.captured event for kind %s", kind)
 		}
-		if len(event.ObjectDigests) < 2 || !containsDigest(event.ObjectDigests, digest) || !containsDigest(event.ObjectDigests, tree) {
-			return snapshotBinding{}, fmt.Errorf("malformed snapshot.captured event for kind %s: object_digests must include snapshot and tree", kind)
+		if len(event.ObjectDigests) != 2 || !containsDigest(event.ObjectDigests, digest) || !containsDigest(event.ObjectDigests, tree) {
+			return snapshotBinding{}, fmt.Errorf("malformed snapshot.captured event for kind %s: object_digests must contain only snapshot and tree", kind)
 		}
 		return snapshotBinding{Digest: digest, Kind: kind, Tree: tree}, nil
 	}
@@ -685,7 +688,7 @@ func containsDigest(values []string, digest string) bool {
 	return false
 }
 
-func readSnapshot(store state.Store, binding snapshotBinding, kind string) (SnapshotRecord, []TreeEntry, error) {
+func readSnapshot(store state.Store, binding snapshotBinding, kind, repo string) (SnapshotRecord, []TreeEntry, error) {
 	body, err := store.Read(binding.Digest)
 	if err != nil {
 		return SnapshotRecord{}, nil, err
@@ -694,7 +697,7 @@ func readSnapshot(store state.Store, binding snapshotBinding, kind string) (Snap
 	if err := decodeStrict(body, &record); err != nil {
 		return SnapshotRecord{}, nil, err
 	}
-	if err := validateSnapshotRecord(record, kind); err != nil {
+	if err := validateSnapshotRecord(record, kind, repo); err != nil {
 		return SnapshotRecord{}, nil, err
 	}
 	if record.TreeDigest != binding.Tree {
@@ -725,7 +728,7 @@ func readSnapshot(store state.Store, binding snapshotBinding, kind string) (Snap
 	return record, tree.Entries, nil
 }
 
-func validateSnapshotRecord(record SnapshotRecord, kind string) error {
+func validateSnapshotRecord(record SnapshotRecord, kind, repo string) error {
 	if record.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("unsupported snapshot schema_version: %d", record.SchemaVersion)
 	}
@@ -734,6 +737,9 @@ func validateSnapshotRecord(record SnapshotRecord, kind string) error {
 	}
 	if strings.TrimSpace(record.Repo) == "" || strings.TrimSpace(record.TreeDigest) == "" || strings.TrimSpace(record.Tree.Digest) == "" {
 		return errors.New("snapshot record is missing required reconstruction fields")
+	}
+	if record.Repo != repo {
+		return fmt.Errorf("snapshot record repo mismatch: %s != %s", record.Repo, repo)
 	}
 	if record.TreeDigest != record.Tree.Digest {
 		return errors.New("snapshot tree digest mismatch")
