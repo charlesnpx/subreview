@@ -149,13 +149,14 @@ type FindingBlocker struct {
 }
 
 type RunFacts struct {
-	DiscoveryRuns         int            `json:"discovery_runs"`
-	VerificationRuns      int            `json:"verification_runs"`
-	PrimaryRuns           int            `json:"primary_runs"`
-	IndependentFinalRuns  int            `json:"independent_final_runs"`
-	TargetedVerifications int            `json:"targeted_verifications"`
-	CompactFreshVerifies  int            `json:"compact_fresh_verifications"`
-	ByRoute               map[string]int `json:"by_route"`
+	DiscoveryRuns          int            `json:"discovery_runs"`
+	VerificationRuns       int            `json:"verification_runs"`
+	PrimaryRuns            int            `json:"primary_runs"`
+	IndependentFinalRuns   int            `json:"independent_final_runs"`
+	TargetedVerifications  int            `json:"targeted_verifications"`
+	CompactFreshVerifies   int            `json:"compact_fresh_verifications"`
+	ContextExpansionRounds int            `json:"context_expansion_rounds"`
+	ByRoute                map[string]int `json:"by_route"`
 }
 
 type TokenFacts struct {
@@ -706,6 +707,9 @@ func runAndTokenFacts(observations []reviewresult.EvidenceObservation, manifestD
 		switch record.Route {
 		case reviewresult.RoutePrimaryReview:
 			runs.PrimaryRuns++
+			if record.RunKind == reviewresult.RunKindDiscovery && record.Outcome == reviewresult.OutcomeNeedsContext {
+				runs.ContextExpansionRounds++
+			}
 		case reviewresult.RouteIndependentFinal:
 			runs.IndependentFinalRuns++
 		case reviewresult.RouteTargetedVerification:
@@ -761,7 +765,7 @@ func schedulerFacts(effective policy.EffectivePolicy, runs RunFacts) SchedulerFa
 		PrimarySemanticReviews: runs.PrimaryRuns,
 		TargetedVerifications:  runs.TargetedVerifications,
 		FreshFinalReviews:      runs.IndependentFinalRuns,
-		ContextExpansionRounds: 0,
+		ContextExpansionRounds: runs.ContextExpansionRounds,
 	}
 	facts := SchedulerFacts{
 		PolicyRouteLimits: effective.RouteLimits,

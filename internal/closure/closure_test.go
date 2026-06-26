@@ -199,6 +199,86 @@ func TestEvaluateEnforcesAllowedClosureBasis(t *testing.T) {
 	}
 }
 
+func TestEvaluateEnforcesContextExpansionRouteLimit(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initClosureGitRepo(t, repo)
+	writeClosureFile(t, repo, "alpha.txt", "one\n")
+	runClosureGit(t, repo, "add", ".")
+	runClosureGit(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo}); err != nil {
+		t.Fatalf("Init state: %v", err)
+	}
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writeClosurePolicy(t, root), Profile: "default"}); err != nil {
+		t.Fatalf("Bind policy: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	writeClosureFile(t, repo, "alpha.txt", "one\ntwo\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build obligations: %v", err)
+	}
+	primary, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary})
+	if err != nil {
+		t.Fatalf("Build primary packet: %v", err)
+	}
+	for _, question := range []string{"Please include alpha_test.txt.", "Please include beta_test.txt."} {
+		if _, err := reviewresult.Import(reviewresult.ImportOptions{
+			StateDir: stateDir,
+			PacketID: primary.Packet.Digest,
+			ResultPath: writeClosureWorkerResult(t, reviewresult.WorkerResult{
+				SchemaVersion: reviewresult.SchemaVersion,
+				Packet:        primary.Packet.Digest,
+				RunKind:       reviewresult.RunKindDiscovery,
+				Route:         reviewresult.RoutePrimaryReview,
+				Outcome:       reviewresult.OutcomeNeedsContext,
+				NeedsContext: []reviewresult.ContextRequest{{
+					Question: question,
+					Reason:   "More context is required before closure.",
+					Paths:    []string{"alpha.txt"},
+				}},
+			}),
+		}); err != nil {
+			t.Fatalf("Import needs-context result %q: %v", question, err)
+		}
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: primary.Packet.Digest,
+		ResultPath: writeClosureWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        primary.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable findings after context expansion.",
+		}),
+	}); err != nil {
+		t.Fatalf("Import clean result: %v", err)
+	}
+	blocked, err := closure.Evaluate(closure.EvaluateOptions{StateDir: stateDir, PolicyProfile: "default"})
+	if err != nil {
+		t.Fatalf("Evaluate closure: %v", err)
+	}
+	if blocked.Closed || !blocked.Scheduler.OverLimit || blocked.Scheduler.Observed.ContextExpansionRounds != 2 || !hasClosureBlocker(blocked.Blockers, "scheduler_route_limit_exceeded") {
+		t.Fatalf("context expansion route limit should block closure: %+v", blocked)
+	}
+}
+
 func writeClosurePolicy(t *testing.T, root string) string {
 	return writeClosurePolicyWithBasis(t, root, []string{"clean", "fixed", "deterministic_refutation"})
 }
