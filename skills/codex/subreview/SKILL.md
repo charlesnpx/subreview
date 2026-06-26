@@ -26,11 +26,14 @@ subreview gates record --state <dir> --catalog <path> --command-id <id> --snapsh
 subreview obligations build --state <dir> --json
 subreview obligations status --state <dir> --json
 subreview packet build --state <dir> --kind primary --json
+subreview packet build --state <dir> --kind verification --finding <id> --json
+subreview result import --state <dir> --packet <id> --result <file> --json
+subreview close --state <dir> --policy-profile <name> --json
 subreview install-skills --plan --target all --json
 ```
 
-V1 workflow commands are being implemented across later stories. Do not simulate unsupported `subreview` commands in prose. If a requested command is not present in `subreview --help`, say that it is not implemented in this installed version and stop before making closure claims.
+Do not simulate unsupported `subreview` commands in prose. If a requested command is not present in `subreview --help`, say that it is not implemented in this installed version and stop before making closure claims.
 
 For any command that accepts state, require an explicit `--state <dir>` path supplied by the operator or current task. Do not create hidden default state directories, and do not use `~/.subreview` or any other implicit hidden state path.
 
-Do not claim review closure from a clean reviewer response alone. Closure must come from the CLI's evidence and policy evaluation once those commands are available.
+Do not claim review closure from a clean reviewer response alone. Closure must come from `subreview close`, which evaluates the latest policy-bound ledger evidence and reports facts, blockers, gates, findings, discovery/verification runs, token telemetry, and scheduler status.

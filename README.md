@@ -24,6 +24,7 @@ subreview obligations status --state /tmp/subreview-state --json
 subreview packet build --state /tmp/subreview-state --kind primary --json
 subreview packet build --state /tmp/subreview-state --kind verification --finding finding-123 --json
 subreview result import --state /tmp/subreview-state --packet sha256:... --result /tmp/worker-result.json --json
+subreview close --state /tmp/subreview-state --policy-profile default --json
 subreview install-skills --plan --target all --json
 subreview install-skills --install --target all --json --install-root /tmp/subreview-stage
 subreview install-skills --uninstall --target all --json --install-root /tmp/subreview-stage
@@ -41,7 +42,7 @@ The delegated installer stages the self-contained CLI under `.local/bin/subrevie
 
 Real installs without `--install-root` target hidden home paths such as `~/.local`, `~/.codex`, and `~/.claude`. Environments that require explicit approval for hidden-file writes should obtain operator approval before running a real install. Tests and validation should use an explicit temporary install root.
 
-The installed skills are intentionally thin. They tell agents to invoke the CLI, require explicit `--state <dir>` paths for any command that accepts state, avoid hidden default state creation, and avoid claiming closure from a clean reviewer response alone. Later stories add the actual v1 workflow commands behind the CLI.
+The installed skills are intentionally thin. They tell agents to invoke the CLI, require explicit `--state <dir>` paths for any command that accepts state, avoid hidden default state creation, and avoid claiming closure from a clean reviewer response alone.
 
 `subreview state init` creates local state only at the supplied non-hidden `--state` path. The state layout contains `objects/sha256/`, `manifests/`, and `ledger.jsonl`. `subreview state validate` checks ledger JSONL, event linkage, referenced CAS objects, and digest integrity.
 
@@ -53,10 +54,12 @@ The installed skills are intentionally thin. They tell agents to invoke the CLI,
 
 `subreview gates check-catalog` validates an operator-authored trusted gate catalog and reports each command digest. Required policy gate requirements include the expected `command_digest`, so `subreview obligations status` only accepts evidence from the trusted command definition. `subreview gates run` executes only catalog command ids and stores CLI-witnessed gate evidence bound to the current policy and input snapshot. `subreview gates record` stores externally asserted gate evidence without executing commands. Gate evidence records replay class, environment pinning, repo-code execution, side-effect class, provenance, command digest, snapshot digest, outcome, and concise diagnostics. `subreview obligations status` consumes passing gate evidence for gate-requirement obligations and reports failed required gates as review blockers.
 
-`subreview obligations build` creates a CAS-backed coverage manifest from captured base-to-proposal and base-to-final diffs plus the bound policy. The manifest records hunk, file, path, gate-requirement, context-request placeholder, and policy-final-review obligations. `subreview obligations status` reports unsatisfied evidence slots and explicit blockers for missing gate evidence, missing review evidence, unresolved context, unresolved anchors, hidden final-state scope, and unsatisfied required checks. Story 007 intentionally records future evidence slots without importing review, gate, verification, or refutation adapters yet.
+`subreview obligations build` creates a CAS-backed coverage manifest from captured base-to-proposal and base-to-final diffs plus the bound policy. The manifest records hunk, file, path, gate-requirement, context-request placeholder, and policy-final-review obligations. `subreview obligations status` reports unsatisfied evidence slots and explicit blockers for missing gate evidence, missing review evidence, unresolved context, unresolved anchors, hidden final-state scope, and unsatisfied required checks.
 
 `subreview packet build --kind primary` creates a CAS-backed primary review packet and Markdown prompt from the latest coverage manifest. `subreview packet build --kind verification --finding <id>` creates a finding-targeted proposal-to-final verification packet when proposal and final snapshots plus a proposal-to-final diff are captured. Packets separate stable prefix and volatile suffix digests, include semantic dedupe keys, run-kind and route metadata, leakage checks for replay/evaluation labels, compact selected context, explicit omissions, and token telemetry fields for later worker result import.
 
 `subreview result import` ingests a bounded structured worker result for a built packet. It normalizes clean reviews, findings, context requests, verifier outcomes, deterministic refutations, and token telemetry into CAS, deduplicates findings, records lifecycle states, and lets `subreview obligations status` consume primary-review and deterministic-refutation evidence without treating open findings as closed.
+
+`subreview close` evaluates final-state closure from the latest ledger evidence and the requested bound policy profile. It persists a `closure.evaluated` report object and reports closure facts, blockers, gates, findings, discovery runs, verification runs, measured discovery/verification tokens, estimated full-cycle tokens when telemetry is available, and anti-thrash scheduler status. Closure succeeds only when the obligation engine has satisfied required gates, coverage obligations, context requests, active finding lifecycle requirements, and policy-triggered final review predicates; a clean primary reviewer response alone is not sufficient.
 
 The existing `research/` corpus and `scripts/` utilities are research inputs for policy design and evaluation. They are separate from the v1 runtime CLI and are not imported or executed by `subreview` commands.

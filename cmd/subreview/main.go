@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/charlesnpx/subreview/internal/anchor"
+	"github.com/charlesnpx/subreview/internal/closure"
 	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/install"
 	"github.com/charlesnpx/subreview/internal/obligation"
@@ -29,6 +30,8 @@ func main() {
 	switch os.Args[1] {
 	case "anchors":
 		err = anchorsCommand(os.Args[2:])
+	case "close":
+		err = closeCommand(os.Args[2:])
 	case "diff":
 		err = diffCommand(os.Args[2:])
 	case "gates":
@@ -63,6 +66,7 @@ func main() {
 func usage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> --anchors <path> [--json]
+  subreview close --state <dir> --policy-profile <name> [--json]
   subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--json]
   subreview gates check-catalog --catalog <path> --repo <path> [--json]
   subreview gates run --state <dir> --catalog <path> --command-id <id> --snapshot <base|proposal|final> [--json]
@@ -80,6 +84,44 @@ func usage(w io.Writer) {
   subreview state init --state <dir> --repo <path> [--json]
   subreview state validate --state <dir> [--json]
   subreview version`)
+}
+
+func closeCommand(args []string) error {
+	if hasHelpFlag(args) {
+		usageClose(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("close", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	profile := fs.String("policy-profile", "", "Bound policy profile to evaluate")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("close does not accept positional arguments")
+	}
+	result, err := closure.Evaluate(closure.EvaluateOptions{StateDir: *stateDir, PolicyProfile: *profile})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	status := "blocked"
+	if result.Closed {
+		status = "closed"
+	}
+	fmt.Printf("closure %s: %d blockers report=%s\n", status, len(result.Blockers), result.Report.Digest)
+	return nil
+}
+
+func usageClose(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview close --state <dir> --policy-profile <name> [--json]
+
+Evaluates final-state closure from policy-bound ledger evidence and writes an auditable closure report.`)
 }
 
 func packetCommand(args []string) error {
