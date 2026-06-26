@@ -87,6 +87,35 @@ func TestBuildPrimaryPacketReportsContextBudgetOmissions(t *testing.T) {
 	}
 }
 
+func TestBuildRejectsPolicyRebindAfterCoverageManifest(t *testing.T) {
+	_, stateDir := initializedPacketState(t, "one\n", "one\ntwo\n")
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfigWithID(t, t.TempDir(), "new-policy"), Profile: "default"}); err != nil {
+		t.Fatalf("Bind replacement policy: %v", err)
+	}
+	_, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(100, 0)})
+	if err == nil || !strings.Contains(err.Error(), "policy rebind") {
+		t.Fatalf("expected stale manifest policy rebind error, got %v", err)
+	}
+}
+
+func TestBuildPrimaryPacketHunkContextDoesNotAnchorPastEOF(t *testing.T) {
+	_, stateDir := initializedPacketState(t, "one\n", "one\ntwo\n")
+	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(100, 0)})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	record := readPacketRecord(t, stateDir, result.Packet.Digest)
+	for _, entry := range record.Context.Entries {
+		if entry.Path == "alpha.txt" && entry.Kind == "changed_hunk" {
+			if entry.EndLine != 2 {
+				t.Fatalf("hunk end line should clip to real EOF, got %+v", entry)
+			}
+			return
+		}
+	}
+	t.Fatalf("changed hunk context missing: %+v", record.Context.Entries)
+}
+
 func TestLeakageDetectionRejectsEvaluationLabels(t *testing.T) {
 	report := CheckLeakage("this packet mentions a true_miss adjudication")
 	if report.OK || len(report.ForbiddenTerms) == 0 {
@@ -457,9 +486,14 @@ func readPacketRecord(t *testing.T, stateDir, digest string) PacketRecord {
 
 func writePolicyConfig(t *testing.T, root string) string {
 	t.Helper()
+	return writePolicyConfigWithID(t, root, "test-policy")
+}
+
+func writePolicyConfigWithID(t *testing.T, root, policyID string) string {
+	t.Helper()
 	body := []byte(`{
   "schema_version": 1,
-  "policy_id": "test-policy",
+  "policy_id": "` + policyID + `",
   "profiles": {
     "default": {
       "gate_requirements": [],

@@ -286,6 +286,9 @@ func Build(opts BuildOptions) (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, err
 	}
+	if err := validateManifestPolicyFreshness(manifest, policyBinding); err != nil {
+		return BuildResult{}, err
+	}
 	target, err := primaryTargetSnapshot(store, manifest, events, binding.Repo)
 	if err != nil {
 		return BuildResult{}, err
@@ -309,8 +312,8 @@ func Build(opts BuildOptions) (BuildResult, error) {
 	var policyRef *PolicyRef
 	policyID := ""
 	policyDigest := ""
-	if policyBinding != nil {
-		ref := policyBinding.Ref
+	if manifest.Policy != nil {
+		ref := PolicyRef{Profile: manifest.Policy.Profile, PolicyID: manifest.Policy.PolicyID, Digest: manifest.Policy.Digest}
 		policyRef = &ref
 		policyID = ref.PolicyID
 		policyDigest = ref.Digest
@@ -463,6 +466,19 @@ func NewTokenTelemetry(runKind, sourceCompleteness string) TokenTelemetry {
 		RunKind:            runKind,
 		SourceCompleteness: sourceCompleteness,
 		TokenMeasurement:   "not_measured",
+	}
+}
+
+func validateManifestPolicyFreshness(manifest obligation.CoverageManifest, currentPolicy *boundPolicy) error {
+	switch {
+	case manifest.Policy == nil && currentPolicy != nil:
+		return errors.New("coverage manifest is stale after policy bind; rerun obligations build")
+	case manifest.Policy != nil && currentPolicy == nil:
+		return errors.New("coverage manifest references a policy but no policy is currently bound; rerun obligations build")
+	case manifest.Policy != nil && currentPolicy != nil && manifest.Policy.Digest != currentPolicy.Ref.Digest:
+		return errors.New("coverage manifest is stale after policy rebind; rerun obligations build")
+	default:
+		return nil
 	}
 }
 
@@ -691,7 +707,8 @@ func contextEntry(store state.Store, target SnapshotRef, tree map[string]snapsho
 	start := 0
 	end := 0
 	if hunk != nil {
-		lines := strings.Split(content, "\n")
+		lineContent := strings.TrimSuffix(content, "\n")
+		lines := strings.Split(lineContent, "\n")
 		if hunk.NewStart > 0 {
 			start = hunk.NewStart - defaultSnippetLines
 			if start < 1 {
