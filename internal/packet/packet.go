@@ -304,13 +304,7 @@ func Build(opts BuildOptions) (BuildResult, error) {
 		return BuildResult{}, err
 	}
 	context.AllowedContextDigest = digestJSON(contextDigestMaterial(context))
-	contentBundleHash := digestJSON(map[string]any{
-		"coverage_manifest": manifestRef.Digest,
-		"source_diffs":      sourceDiffDigestMaterial(sourceDiffs),
-		"target_state":      targetDigestMaterial(target),
-		"context":           context.AllowedContextDigest,
-		"gates":             gates,
-	})
+	contentBundleHash := digestJSON(contentBundleDigestMaterial(sourceDiffs, target, context.AllowedContextDigest, gates))
 	context.ContentBundleHash = contentBundleHash
 	var policyRef *PolicyRef
 	policyID := ""
@@ -1266,9 +1260,6 @@ type canonicalSourceDiff struct {
 	Transition   string             `json:"transition"`
 	FromKind     string             `json:"from_kind"`
 	ToKind       string             `json:"to_kind"`
-	FromSnapshot string             `json:"from_snapshot"`
-	ToSnapshot   string             `json:"to_snapshot"`
-	Diff         canonicalObjectRef `json:"diff"`
 	Patch        canonicalObjectRef `json:"patch"`
 	PatchDigest  string             `json:"patch_digest"`
 	HasChanges   bool               `json:"has_changes"`
@@ -1276,9 +1267,26 @@ type canonicalSourceDiff struct {
 	HunkCount    int                `json:"hunk_count"`
 }
 
+type canonicalGateSummary struct {
+	CommandID     string `json:"command_id"`
+	CommandDigest string `json:"command_digest"`
+	Outcome       string `json:"outcome"`
+	Provenance    string `json:"provenance"`
+	SnapshotKind  string `json:"snapshot_kind"`
+}
+
 type canonicalTargetState struct {
 	Kind string `json:"kind"`
 	Tree string `json:"tree,omitempty"`
+}
+
+func contentBundleDigestMaterial(sourceDiffs []SourceDiff, target SnapshotRef, allowedContextDigest string, gates []GateSummary) any {
+	return map[string]any{
+		"source_diffs": sourceDiffDigestMaterial(sourceDiffs),
+		"target_state": targetDigestMaterial(target),
+		"context":      allowedContextDigest,
+		"gates":        gateDigestMaterial(gates),
+	}
 }
 
 func targetDigestMaterial(target SnapshotRef) canonicalTargetState {
@@ -1301,9 +1309,6 @@ func sourceDiffDigestMaterial(sourceDiffs []SourceDiff) []canonicalSourceDiff {
 			Transition:   diff.Transition,
 			FromKind:     diff.FromKind,
 			ToKind:       diff.ToKind,
-			FromSnapshot: diff.FromSnapshot,
-			ToSnapshot:   diff.ToSnapshot,
-			Diff:         canonicalObject(diff.Diff),
 			Patch:        canonicalObject(diff.Patch),
 			PatchDigest:  diff.PatchDigest,
 			HasChanges:   diff.HasChanges,
@@ -1312,6 +1317,29 @@ func sourceDiffDigestMaterial(sourceDiffs []SourceDiff) []canonicalSourceDiff {
 		})
 	}
 	sort.Slice(canonical, func(i, j int) bool { return canonical[i].Transition < canonical[j].Transition })
+	return canonical
+}
+
+func gateDigestMaterial(gates []GateSummary) []canonicalGateSummary {
+	canonical := make([]canonicalGateSummary, 0, len(gates))
+	for _, gate := range gates {
+		canonical = append(canonical, canonicalGateSummary{
+			CommandID:     gate.CommandID,
+			CommandDigest: gate.CommandDigest,
+			Outcome:       gate.Outcome,
+			Provenance:    gate.Provenance,
+			SnapshotKind:  gate.SnapshotKind,
+		})
+	}
+	sort.Slice(canonical, func(i, j int) bool {
+		if canonical[i].CommandID == canonical[j].CommandID {
+			if canonical[i].SnapshotKind == canonical[j].SnapshotKind {
+				return canonical[i].CommandDigest < canonical[j].CommandDigest
+			}
+			return canonical[i].SnapshotKind < canonical[j].SnapshotKind
+		}
+		return canonical[i].CommandID < canonical[j].CommandID
+	})
 	return canonical
 }
 

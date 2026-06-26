@@ -123,14 +123,14 @@ func TestSemanticDedupeAndReusedTelemetryHelpers(t *testing.T) {
 	}
 }
 
-func TestSourceDiffDigestMaterialIgnoresObjectPaths(t *testing.T) {
+func TestContentBundleDigestMaterialIgnoresCASRecordIdentities(t *testing.T) {
 	first := []SourceDiff{{
 		Transition:   "base->proposal",
 		FromKind:     "base",
 		ToKind:       "proposal",
-		FromSnapshot: "sha256:base",
-		ToSnapshot:   "sha256:proposal",
-		Diff:         state.ObjectRef{Digest: "sha256:diff", MediaType: "application/json", Size: 12, Path: "/tmp/one/diff"},
+		FromSnapshot: "sha256:volatile-base-one",
+		ToSnapshot:   "sha256:volatile-proposal-one",
+		Diff:         state.ObjectRef{Digest: "sha256:volatile-diff-one", MediaType: "application/vnd.subreview.diff+json", Size: 12, Path: "/tmp/one/diff"},
 		Patch:        state.ObjectRef{Digest: "sha256:patch", MediaType: "text/x-patch", Size: 34, Path: "/tmp/one/patch"},
 		PatchDigest:  "sha256:patch",
 		HasChanges:   true,
@@ -141,17 +141,43 @@ func TestSourceDiffDigestMaterialIgnoresObjectPaths(t *testing.T) {
 		Transition:   "base->proposal",
 		FromKind:     "base",
 		ToKind:       "proposal",
-		FromSnapshot: "sha256:base",
-		ToSnapshot:   "sha256:proposal",
-		Diff:         state.ObjectRef{Digest: "sha256:diff", MediaType: "application/json", Size: 12, Path: "/tmp/two/diff"},
+		FromSnapshot: "sha256:volatile-base-two",
+		ToSnapshot:   "sha256:volatile-proposal-two",
+		Diff:         state.ObjectRef{Digest: "sha256:volatile-diff-two", MediaType: "application/vnd.subreview.diff+json", Size: 12, Path: "/tmp/two/diff"},
 		Patch:        state.ObjectRef{Digest: "sha256:patch", MediaType: "text/x-patch", Size: 34, Path: "/tmp/two/patch"},
 		PatchDigest:  "sha256:patch",
 		HasChanges:   true,
 		ChangedPaths: []string{"alpha.txt", "beta.txt"},
 		HunkCount:    2,
 	}}
-	if got, want := digestJSON(sourceDiffDigestMaterial(first)), digestJSON(sourceDiffDigestMaterial(second)); got != want {
-		t.Fatalf("canonical source diff material should ignore object paths and path ordering: got %s want %s", got, want)
+	firstGates := []GateSummary{{
+		CommandID:     "go_test_all",
+		CommandDigest: "sha256:command",
+		Outcome:       "pass",
+		Provenance:    "cli_witnessed",
+		SnapshotKind:  "proposal",
+		Snapshot:      "sha256:volatile-snapshot-one",
+		PolicyDigest:  "sha256:volatile-policy-one",
+		Evidence:      "sha256:volatile-evidence-one",
+		EventID:       "event-one",
+	}}
+	secondGates := []GateSummary{{
+		CommandID:     "go_test_all",
+		CommandDigest: "sha256:command",
+		Outcome:       "pass",
+		Provenance:    "cli_witnessed",
+		SnapshotKind:  "proposal",
+		Snapshot:      "sha256:volatile-snapshot-two",
+		PolicyDigest:  "sha256:volatile-policy-two",
+		Evidence:      "sha256:volatile-evidence-two",
+		EventID:       "event-two",
+	}}
+	targetOne := SnapshotRef{Kind: "proposal", Digest: "sha256:volatile-target-one", Tree: "sha256:tree"}
+	targetTwo := SnapshotRef{Kind: "proposal", Digest: "sha256:volatile-target-two", Tree: "sha256:tree"}
+	got := digestJSON(contentBundleDigestMaterial(first, targetOne, "sha256:context", firstGates))
+	want := digestJSON(contentBundleDigestMaterial(second, targetTwo, "sha256:context", secondGates))
+	if got != want {
+		t.Fatalf("content bundle material should ignore volatile CAS record identities: got %s want %s", got, want)
 	}
 }
 
