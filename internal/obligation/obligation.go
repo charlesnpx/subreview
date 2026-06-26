@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/subreview/internal/anchor"
+	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/policy"
 	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
@@ -328,6 +329,10 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		return StatusResult{}, err
 	}
 	blockers = append(blockers, anchorBlockers...)
+	gateEvidence, err := gate.EvidenceByCommand(store, events, binding.Repo)
+	if err != nil {
+		return StatusResult{}, err
+	}
 
 	statuses := make([]ObligationStatus, 0, len(manifest.Obligations))
 	unsatisfiedKinds := map[string]struct{}{}
@@ -345,12 +350,38 @@ func Status(opts StatusOptions) (StatusResult, error) {
 			status.UnsatisfiedSatisfactionKinds = []string{}
 		}
 		if obligation.Kind == KindGateRequirement && obligation.Required {
-			status.Blockers = append(status.Blockers, Blocker{
-				Code:         "unsatisfied_required_check",
-				Message:      "required gate evidence is not recorded yet",
-				ObligationID: obligation.ID,
-				Path:         obligation.Path,
-			})
+			evidence, ok, sawStale := latestGateEvidenceForManifest(gateEvidence[obligation.CommandID], manifest, expectedGateCommandDigest(obligation))
+			switch {
+			case !ok && sawStale:
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "stale_gate_evidence",
+					Message:      "gate evidence does not match this coverage manifest",
+					ObligationID: obligation.ID,
+				})
+			case !ok:
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "unsatisfied_required_check",
+					Message:      "required gate evidence is not recorded yet",
+					ObligationID: obligation.ID,
+					Path:         obligation.Path,
+				})
+			case evidence.Record.Outcome == gate.OutcomePass:
+				status.Satisfied = true
+				status.SatisfiedBy = append(status.SatisfiedBy, EvidenceRef{Kind: SatisfactionGateEvidence, EventID: evidence.EventID, Digest: evidence.Digest})
+				status.UnsatisfiedSatisfactionKinds = removeString(status.UnsatisfiedSatisfactionKinds, SatisfactionGateEvidence)
+			case evidence.Record.Outcome == gate.OutcomeFail:
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "gate_failed_blocks_review",
+					Message:      "required gate failed: " + evidence.Record.Diagnostics.Summary,
+					ObligationID: obligation.ID,
+				})
+			default:
+				status.Blockers = append(status.Blockers, Blocker{
+					Code:         "gate_error_blocks_review",
+					Message:      "required gate errored: " + evidence.Record.Diagnostics.Summary,
+					ObligationID: obligation.ID,
+				})
+			}
 		}
 		if isCoverageObligation(obligation) && obligation.Required {
 			status.Blockers = append(status.Blockers, Blocker{
@@ -391,6 +422,66 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		Blockers:                     blockers,
 		Obligations:                  statuses,
 	}, nil
+}
+
+func latestGateEvidenceForManifest(observations []gate.EvidenceObservation, manifest CoverageManifest, expectedCommandDigest string) (gate.EvidenceObservation, bool, bool) {
+	sawStale := false
+	for _, observation := range observations {
+		if expectedCommandDigest == "" || observation.Record.CommandDigest != expectedCommandDigest || !gateEvidenceMatchesSnapshot(observation.Record, manifest) || !gateEvidenceMatchesPolicy(observation.Record, manifest.Policy) {
+			sawStale = true
+			continue
+		}
+		return observation, true, sawStale
+	}
+	return gate.EvidenceObservation{}, false, sawStale
+}
+
+func expectedGateCommandDigest(obligation Obligation) string {
+	if obligation.Metadata == nil {
+		return ""
+	}
+	return obligation.Metadata["command_digest"]
+}
+
+func gateEvidenceMatchesSnapshot(evidence gate.EvidenceRecord, manifest CoverageManifest) bool {
+	kind, digest := requiredGateSnapshot(manifest)
+	return kind != "" && evidence.InputSnapshot.Kind == kind && evidence.InputSnapshot.Digest == digest
+}
+
+func requiredGateSnapshot(manifest CoverageManifest) (string, string) {
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == "base" && diff.ToKind == "final" {
+			return diff.ToKind, diff.ToSnapshot
+		}
+	}
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == "base" && diff.ToKind == "proposal" {
+			return diff.ToKind, diff.ToSnapshot
+		}
+	}
+	for _, diff := range manifest.SourceDiffs {
+		if diff.ToKind != "" && diff.ToSnapshot != "" {
+			return diff.ToKind, diff.ToSnapshot
+		}
+	}
+	return "", ""
+}
+
+func gateEvidenceMatchesPolicy(evidence gate.EvidenceRecord, manifestPolicy *PolicyRef) bool {
+	if manifestPolicy == nil {
+		return evidence.Policy == nil
+	}
+	return evidence.Policy != nil && evidence.Policy.Digest == manifestPolicy.Digest
+}
+
+func removeString(values []string, remove string) []string {
+	filtered := values[:0]
+	for _, value := range values {
+		if value != remove {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
 }
 
 func transitionDiff(binding diffBinding) TransitionDiff {
@@ -488,6 +579,9 @@ func policyObligations(effective policy.EffectivePolicy) []Obligation {
 			CommandID:                 gate.CommandID,
 			Fact:                      "required_gates_satisfied",
 			RequiredSatisfactionKinds: []string{SatisfactionGateEvidence},
+			Metadata: map[string]string{
+				"command_digest": gate.CommandDigest,
+			},
 		})
 	}
 	if policyRequiresIndependentFinal(effective) {

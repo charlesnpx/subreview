@@ -11,6 +11,9 @@ import (
 	"github.com/charlesnpx/subreview/internal/state"
 )
 
+const testCommandDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+const testSecondCommandDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
 func TestCheckExpandsValidConfig(t *testing.T) {
 	root := t.TempDir()
 	configPath := writePolicyConfig(t, root, validPolicyConfig())
@@ -43,6 +46,28 @@ func TestCheckRejectsUnknownCommand(t *testing.T) {
 	_, err := Check(CheckOptions{ConfigPath: writePolicyConfig(t, root, cfg), RepoPath: root})
 	if err == nil || !strings.Contains(err.Error(), "unknown command_id") {
 		t.Fatalf("expected unknown command error, got %v", err)
+	}
+}
+
+func TestCheckRejectsMissingRequiredGateDigest(t *testing.T) {
+	root := t.TempDir()
+	cfg := validPolicyConfig()
+	profile := cfg["profiles"].(map[string]any)["default"].(map[string]any)
+	profile["gate_requirements"] = []any{map[string]any{"command_id": "go_test_all", "required": true}}
+	_, err := Check(CheckOptions{ConfigPath: writePolicyConfig(t, root, cfg), RepoPath: root})
+	if err == nil || !strings.Contains(err.Error(), "requires command_digest") {
+		t.Fatalf("expected missing command digest error, got %v", err)
+	}
+}
+
+func TestCheckRejectsInvalidGateDigest(t *testing.T) {
+	root := t.TempDir()
+	cfg := validPolicyConfig()
+	profile := cfg["profiles"].(map[string]any)["default"].(map[string]any)
+	profile["gate_requirements"] = []any{map[string]any{"command_id": "go_test_all", "command_digest": "sha256:not-hex", "required": true}}
+	_, err := Check(CheckOptions{ConfigPath: writePolicyConfig(t, root, cfg), RepoPath: root})
+	if err == nil || !strings.Contains(err.Error(), "invalid command_digest") {
+		t.Fatalf("expected invalid command digest error, got %v", err)
 	}
 }
 
@@ -351,8 +376,8 @@ func validPolicyConfig() map[string]any {
 func validProfile() Profile {
 	return Profile{
 		GateRequirements: []GateRequirement{
-			{CommandID: "go_test_all", Required: true},
-			{CommandID: "subreview_state_validate", Required: true},
+			{CommandID: "go_test_all", CommandDigest: testCommandDigest, Required: true},
+			{CommandID: "subreview_state_validate", CommandDigest: testSecondCommandDigest, Required: true},
 		},
 		RouteLimits: RouteLimits{
 			PrimarySemanticReviews: 1,
@@ -380,8 +405,8 @@ func validProfile() Profile {
 func validProfileConfig() map[string]any {
 	return map[string]any{
 		"gate_requirements": []any{
-			map[string]any{"command_id": "go_test_all", "required": true},
-			map[string]any{"command_id": "subreview_state_validate", "required": true},
+			map[string]any{"command_id": "go_test_all", "command_digest": testCommandDigest, "required": true},
+			map[string]any{"command_id": "subreview_state_validate", "command_digest": testSecondCommandDigest, "required": true},
 		},
 		"route_limits": map[string]any{
 			"primary_semantic_reviews": float64(1),

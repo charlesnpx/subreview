@@ -71,8 +71,9 @@ type Profile struct {
 }
 
 type GateRequirement struct {
-	CommandID string `json:"command_id"`
-	Required  bool   `json:"required"`
+	CommandID     string `json:"command_id"`
+	CommandDigest string `json:"command_digest,omitempty"`
+	Required      bool   `json:"required"`
 }
 
 type RouteLimits struct {
@@ -375,6 +376,12 @@ func validateConfig(cfg Config) error {
 			if _, ok := knownCommandIDs[gate.CommandID]; !ok {
 				return fmt.Errorf("profile %s references unknown command_id: %s", name, gate.CommandID)
 			}
+			if gate.Required && strings.TrimSpace(gate.CommandDigest) == "" {
+				return fmt.Errorf("profile %s required gate %s requires command_digest", name, gate.CommandID)
+			}
+			if strings.TrimSpace(gate.CommandDigest) != "" && !validCommandDigest(gate.CommandDigest) {
+				return fmt.Errorf("profile %s gate %s has invalid command_digest: %s", name, gate.CommandID, gate.CommandDigest)
+			}
 		}
 		if err := validateRouteLimits(name, profile.RouteLimits); err != nil {
 			return err
@@ -402,6 +409,19 @@ func validateConfig(cfg Config) error {
 		}
 	}
 	return nil
+}
+
+func validCommandDigest(value string) bool {
+	const prefix = "sha256:"
+	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+64 {
+		return false
+	}
+	for _, ch := range value[len(prefix):] {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func validateRouteLimits(profile string, limits RouteLimits) error {
