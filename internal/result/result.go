@@ -252,10 +252,17 @@ type PacketRef struct {
 	PromptDigest          string          `json:"prompt_digest"`
 	StableDigest          string          `json:"stable_digest"`
 	SemanticDedupeDigest  string          `json:"semantic_dedupe_digest"`
+	Policy                *PolicyRef      `json:"policy,omitempty"`
 	CoverageManifest      state.ObjectRef `json:"coverage_manifest"`
 	TargetState           SnapshotRef     `json:"target_state"`
 	SourceCompleteness    string          `json:"source_completeness"`
 	VerificationFindingID string          `json:"verification_finding_id,omitempty"`
+}
+
+type PolicyRef struct {
+	Profile  string `json:"profile"`
+	PolicyID string `json:"policy_id"`
+	Digest   string `json:"digest"`
 }
 
 type SnapshotRef struct {
@@ -333,6 +340,7 @@ type packetRecord struct {
 	RunKind           string          `json:"run_kind"`
 	Route             string          `json:"route"`
 	Repo              string          `json:"repo"`
+	Policy            *PolicyRef      `json:"policy,omitempty"`
 	CoverageManifest  state.ObjectRef `json:"coverage_manifest"`
 	TargetState       SnapshotRef     `json:"target_state"`
 	StableDigest      string          `json:"stable_digest"`
@@ -496,13 +504,13 @@ func LatestPrimaryReviewForManifest(observations []EvidenceObservation, manifest
 	return EvidenceObservation{}, false
 }
 
-func LatestPrimaryReviewForTargetState(observations []EvidenceObservation, targetDigest string) (EvidenceObservation, bool) {
+func LatestPrimaryReviewForTargetState(observations []EvidenceObservation, targetDigest, policyDigest string) (EvidenceObservation, bool) {
 	for _, observation := range observations {
 		record := observation.Record
 		if record.Packet.TargetState.Digest != targetDigest {
 			continue
 		}
-		if record.Evidence.PrimaryReviewEvidence {
+		if record.Evidence.PrimaryReviewEvidence && packetPolicyMatches(record.Packet.Policy, policyDigest) {
 			return observation, true
 		}
 	}
@@ -539,14 +547,24 @@ func DeterministicRefutationsForObligation(observations []EvidenceObservation, m
 }
 
 func ActiveFindingBlockers(observations []EvidenceObservation, manifestDigest string) []FindingBlocker {
-	return findingBlockers(observations, manifestDigest, false)
+	return findingBlockers(observations, func(record ResultRecord) bool {
+		return record.Packet.CoverageManifest.Digest == manifestDigest
+	})
 }
 
-func ClosureFindingBlockers(observations []EvidenceObservation, manifestDigest string) []FindingBlocker {
-	return findingBlockers(observations, manifestDigest, true)
+func ClosureFindingBlockers(observations []EvidenceObservation, manifestDigest, proposalDigest, policyDigest string) []FindingBlocker {
+	return findingBlockers(observations, func(record ResultRecord) bool {
+		if record.Packet.CoverageManifest.Digest == manifestDigest {
+			return true
+		}
+		return record.Evidence.PrimaryReviewEvidence &&
+			record.Packet.TargetState.Kind == "proposal" &&
+			record.Packet.TargetState.Digest == proposalDigest &&
+			packetPolicyMatches(record.Packet.Policy, policyDigest)
+	})
 }
 
-func findingBlockers(observations []EvidenceObservation, manifestDigest string, carryForward bool) []FindingBlocker {
+func findingBlockers(observations []EvidenceObservation, applies func(ResultRecord) bool) []FindingBlocker {
 	type lifecycle struct {
 		finding FindingRecord
 		state   string
@@ -557,7 +575,7 @@ func findingBlockers(observations []EvidenceObservation, manifestDigest string, 
 	for i := len(observations) - 1; i >= 0; i-- {
 		observation := observations[i]
 		record := observation.Record
-		if !carryForward && record.Packet.CoverageManifest.Digest != manifestDigest {
+		if !applies(record) {
 			continue
 		}
 		for _, finding := range record.Findings {
@@ -612,6 +630,14 @@ func findingBlockers(observations []EvidenceObservation, manifestDigest string, 
 		return severityRank(blockers[i].Severity) > severityRank(blockers[j].Severity)
 	})
 	return blockers
+}
+
+func packetPolicyMatches(policy *PolicyRef, policyDigest string) bool {
+	policyDigest = strings.TrimSpace(policyDigest)
+	if policyDigest == "" {
+		return policy == nil || strings.TrimSpace(policy.Digest) == ""
+	}
+	return policy != nil && policy.Digest == policyDigest
 }
 
 func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, now time.Time, existingDigests map[string]struct{}, existingIDs map[string]string) (ResultRecord, error) {
@@ -1330,6 +1356,7 @@ func resolvePacket(store state.Store, events []state.Event, stateDir, repo, pack
 			PromptDigest:          record.PromptDigest,
 			StableDigest:          record.StableDigest,
 			SemanticDedupeDigest:  record.SemanticDedupeKey.Digest,
+			Policy:                copyPolicyRef(record.Policy),
 			VerificationFindingID: strings.TrimSpace(record.Verification.Finding.ID),
 			CoverageManifest: state.ObjectRef{
 				Digest:    record.CoverageManifest.Digest,
@@ -1342,6 +1369,14 @@ func resolvePacket(store state.Store, events []state.Event, stateDir, repo, pack
 		}, nil
 	}
 	return PacketRef{}, fmt.Errorf("packet not found in state: %s", packetID)
+}
+
+func copyPolicyRef(policy *PolicyRef) *PolicyRef {
+	if policy == nil {
+		return nil
+	}
+	ref := *policy
+	return &ref
 }
 
 func readBoundedRegularFile(path string) ([]byte, error) {

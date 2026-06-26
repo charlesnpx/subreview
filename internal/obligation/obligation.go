@@ -340,12 +340,12 @@ func Status(opts StatusOptions) (StatusResult, error) {
 	primaryReviewEvidence, hasPrimaryReviewEvidence := reviewresult.LatestPrimaryReviewForManifest(resultEvidence, manifestRef.Digest)
 	if !hasPrimaryReviewEvidence {
 		if proposalDigest := proposalTargetDigest(manifest); proposalDigest != "" {
-			primaryReviewEvidence, hasPrimaryReviewEvidence = reviewresult.LatestPrimaryReviewForTargetState(resultEvidence, proposalDigest)
+			primaryReviewEvidence, hasPrimaryReviewEvidence = reviewresult.LatestPrimaryReviewForTargetState(resultEvidence, proposalDigest, policyDigest(manifest.Policy))
 		}
 	}
 	independentFinalEvidence, hasIndependentFinalEvidence := reviewresult.LatestIndependentFinalReviewForManifest(resultEvidence, manifestRef.Digest)
 	blockers = append(blockers, contextBlockers(resultEvidence, manifestRef.Digest)...)
-	for _, finding := range reviewresult.ClosureFindingBlockers(resultEvidence, manifestRef.Digest) {
+	for _, finding := range reviewresult.ClosureFindingBlockers(resultEvidence, manifestRef.Digest, proposalTargetDigest(manifest), policyDigest(manifest.Policy)) {
 		blockers = append(blockers, Blocker{
 			Code:    "open_finding",
 			Message: "blocking finding remains " + finding.State + ": " + finding.Claim,
@@ -503,6 +503,13 @@ func proposalTargetDigest(manifest CoverageManifest) string {
 		}
 	}
 	return ""
+}
+
+func policyDigest(policy *PolicyRef) string {
+	if policy == nil {
+		return ""
+	}
+	return policy.Digest
 }
 
 func gateEvidenceMatchesPolicy(evidence gate.EvidenceRecord, manifestPolicy *PolicyRef) bool {

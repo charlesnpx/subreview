@@ -583,6 +583,81 @@ func TestTopLevelNeedsContextCanBeResolvedByLaterDiscovery(t *testing.T) {
 	}
 }
 
+func TestCarriedPrimaryReviewMustMatchPolicy(t *testing.T) {
+	repo, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable findings under the original policy.",
+		}),
+		Now: time.Unix(240, 0),
+	}); err != nil {
+		t.Fatalf("Import original-policy clean result: %v", err)
+	}
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfigWithID(t, t.TempDir(), "replacement-policy"), Profile: "default"}); err != nil {
+		t.Fatalf("Bind replacement policy: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build replacement-policy obligations: %v", err)
+	}
+	_, manifest := readLatestCoverageManifest(t, stateDir)
+	observations := readObservations(t, stateDir)
+	if _, ok := reviewresult.LatestPrimaryReviewForTargetState(observations, proposalDigestFromManifest(t, manifest), manifest.Policy.Digest); ok {
+		t.Fatal("primary review from prior policy should not carry into replacement policy")
+	}
+	status, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Closed {
+		t.Fatalf("replacement policy should require fresh primary review evidence for %s: %+v", repo, status)
+	}
+}
+
+func TestClosureFindingCarryForwardMustMatchPolicy(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("old-policy-finding")},
+		}),
+		Now: time.Unix(241, 0),
+	}); err != nil {
+		t.Fatalf("Import original-policy finding result: %v", err)
+	}
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfigWithID(t, t.TempDir(), "replacement-policy"), Profile: "default"}); err != nil {
+		t.Fatalf("Bind replacement policy: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build replacement-policy obligations: %v", err)
+	}
+	manifestRef, manifest := readLatestCoverageManifest(t, stateDir)
+	observations := readObservations(t, stateDir)
+	blockers := reviewresult.ClosureFindingBlockers(observations, manifestRef.Digest, proposalDigestFromManifest(t, manifest), manifest.Policy.Digest)
+	if len(blockers) != 0 {
+		t.Fatalf("finding from prior policy should not carry into replacement policy: %+v", blockers)
+	}
+	status, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if hasStatusBlocker(status, "open_finding") {
+		t.Fatalf("replacement policy should not inherit old-policy finding blocker: %+v", status.Blockers)
+	}
+}
+
 func TestVerificationOutcomeVocabularyMapsToLifecycle(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	if _, err := reviewresult.Import(reviewresult.ImportOptions{
@@ -1310,6 +1385,38 @@ func readObservations(t *testing.T, stateDir string) []reviewresult.EvidenceObse
 	return observations
 }
 
+func readLatestCoverageManifest(t *testing.T, stateDir string) (state.ObjectRef, obligation.CoverageManifest) {
+	t.Helper()
+	status, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	body, err := store.Read(status.Manifest.Digest)
+	if err != nil {
+		t.Fatalf("Read latest manifest: %v", err)
+	}
+	var manifest obligation.CoverageManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		t.Fatalf("Unmarshal latest manifest: %v", err)
+	}
+	return status.Manifest, manifest
+}
+
+func proposalDigestFromManifest(t *testing.T, manifest obligation.CoverageManifest) string {
+	t.Helper()
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == "base" && diff.ToKind == "proposal" {
+			return diff.ToSnapshot
+		}
+	}
+	t.Fatalf("manifest has no base->proposal transition: %+v", manifest.SourceDiffs)
+	return ""
+}
+
 func firstCoverageObligationID(t *testing.T, manifest obligation.CoverageManifest) string {
 	t.Helper()
 	for _, item := range manifest.Obligations {
@@ -1332,9 +1439,14 @@ func hasStatusBlocker(status obligation.StatusResult, code string) bool {
 
 func writePolicyConfig(t *testing.T, root string) string {
 	t.Helper()
-	body := []byte(`{
+	return writePolicyConfigWithID(t, root, "test-policy")
+}
+
+func writePolicyConfigWithID(t *testing.T, root, policyID string) string {
+	t.Helper()
+	body := []byte(strings.ReplaceAll(`{
   "schema_version": 1,
-  "policy_id": "test-policy",
+  "policy_id": "$POLICY_ID",
   "profiles": {
     "default": {
       "gate_requirements": [],
@@ -1345,8 +1457,8 @@ func writePolicyConfig(t *testing.T, root string) string {
     }
   }
 }
-`)
-	path := filepath.Join(root, "policy.json")
+`, "$POLICY_ID", policyID))
+	path := filepath.Join(root, policyID+".json")
 	if err := os.WriteFile(path, body, 0o644); err != nil {
 		t.Fatalf("write policy: %v", err)
 	}

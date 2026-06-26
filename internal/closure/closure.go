@@ -261,11 +261,11 @@ func Evaluate(opts EvaluateOptions) (Result, error) {
 	}
 
 	proposalDigest := proposalTargetDigest(manifest)
-	findingFacts := findingFacts(observations, status.Manifest.Digest, proposalDigest)
-	runFacts, tokens := runAndTokenFacts(observations, status.Manifest.Digest, proposalDigest)
+	findingFacts := findingFacts(observations, status.Manifest.Digest, proposalDigest, policyDigest)
+	runFacts, tokens := runAndTokenFacts(observations, status.Manifest.Digest, proposalDigest, policyDigest)
 	obligationFacts := obligationFacts(status)
 	gateFacts := gateFacts(gateEvidence, obligationFacts.RequiredGateCount)
-	facts := factsFromEvidence(status, manifest, observations, status.Manifest.Digest, proposalDigest, findingFacts)
+	facts := factsFromEvidence(status, manifest, observations, status.Manifest.Digest, proposalDigest, policyDigest, findingFacts)
 	scheduler := schedulerFacts(effective, runFacts)
 	if scheduler.OverLimit {
 		blockers = append(blockers, Blocker{
@@ -383,13 +383,13 @@ func readEffectivePolicy(store state.Store, manifest obligation.CoverageManifest
 	return effective, nil
 }
 
-func factsFromEvidence(status obligation.StatusResult, manifest obligation.CoverageManifest, observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest string, findings FindingFacts) Facts {
+func factsFromEvidence(status obligation.StatusResult, manifest obligation.CoverageManifest, observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string, findings FindingFacts) Facts {
 	_, hasPrimary := reviewresult.LatestPrimaryReviewForManifest(observations, manifestDigest)
 	if !hasPrimary && proposalDigest != "" {
-		_, hasPrimary = reviewresult.LatestPrimaryReviewForTargetState(observations, proposalDigest)
+		_, hasPrimary = reviewresult.LatestPrimaryReviewForTargetState(observations, proposalDigest, policyDigest)
 	}
 	_, hasFinal := reviewresult.LatestIndependentFinalReviewForManifest(observations, manifestDigest)
-	evidence := evidenceFacts(observations, manifestDigest, proposalDigest)
+	evidence := evidenceFacts(observations, manifestDigest, proposalDigest, policyDigest)
 	facts := Facts{
 		PolicyBound:                    manifest.Policy != nil,
 		RequiredGatesSatisfied:         obligationsSatisfied(status, obligation.KindGateRequirement),
@@ -420,11 +420,11 @@ func contextRequestsResolved(observations []reviewresult.EvidenceObservation, ma
 	return true
 }
 
-func evidenceFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest string) Facts {
+func evidenceFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string) Facts {
 	facts := Facts{}
 	for _, observation := range observations {
 		record := observation.Record
-		if !closureObservationApplies(record, manifestDigest, proposalDigest) {
+		if !closureObservationApplies(record, manifestDigest, proposalDigest, policyDigest) {
 			continue
 		}
 		if record.RunKind == reviewresult.RunKindDiscovery && record.Route == reviewresult.RoutePrimaryReview && record.Outcome == reviewresult.OutcomeClean {
@@ -450,11 +450,15 @@ func evidenceFacts(observations []reviewresult.EvidenceObservation, manifestDige
 	return facts
 }
 
-func closureObservationApplies(record reviewresult.ResultRecord, manifestDigest, proposalDigest string) bool {
+func closureObservationApplies(record reviewresult.ResultRecord, manifestDigest, proposalDigest, policyDigest string) bool {
 	if record.Packet.CoverageManifest.Digest == manifestDigest {
 		return true
 	}
-	return record.Evidence.PrimaryReviewEvidence && proposalDigest != "" && record.Packet.TargetState.Digest == proposalDigest
+	return record.Evidence.PrimaryReviewEvidence &&
+		proposalDigest != "" &&
+		record.Packet.TargetState.Kind == "proposal" &&
+		record.Packet.TargetState.Digest == proposalDigest &&
+		packetPolicyMatches(record.Packet.Policy, policyDigest)
 }
 
 func proposalTargetDigest(manifest obligation.CoverageManifest) string {
@@ -464,6 +468,14 @@ func proposalTargetDigest(manifest obligation.CoverageManifest) string {
 		}
 	}
 	return ""
+}
+
+func packetPolicyMatches(policy *reviewresult.PolicyRef, policyDigest string) bool {
+	policyDigest = strings.TrimSpace(policyDigest)
+	if policyDigest == "" {
+		return policy == nil || strings.TrimSpace(policy.Digest) == ""
+	}
+	return policy != nil && policy.Digest == policyDigest
 }
 
 func policyFactBlockers(effective policy.EffectivePolicy, facts Facts) []Blocker {
@@ -636,11 +648,11 @@ func gateFacts(evidence map[string][]gate.EvidenceObservation, requiredCount int
 	return facts
 }
 
-func findingFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest string) FindingFacts {
+func findingFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string) FindingFacts {
 	facts := FindingFacts{ActiveBlockingFindings: []FindingBlocker{}}
 	for _, observation := range observations {
 		record := observation.Record
-		if !closureObservationApplies(record, manifestDigest, proposalDigest) {
+		if !closureObservationApplies(record, manifestDigest, proposalDigest, policyDigest) {
 			continue
 		}
 		for _, finding := range record.Findings {
@@ -651,7 +663,7 @@ func findingFacts(observations []reviewresult.EvidenceObservation, manifestDiges
 		facts.VerifierOutcomeCount += len(record.VerifierOutcomes)
 		facts.DeterministicRefutes += len(record.DeterministicRefutations)
 	}
-	blockers := reviewresult.ClosureFindingBlockers(observations, manifestDigest)
+	blockers := reviewresult.ClosureFindingBlockers(observations, manifestDigest, proposalDigest, policyDigest)
 	facts.OpenBlockingCount = len(blockers)
 	for _, blocker := range blockers {
 		facts.ActiveBlockingFindings = append(facts.ActiveBlockingFindings, FindingBlocker{
@@ -667,12 +679,12 @@ func findingFacts(observations []reviewresult.EvidenceObservation, manifestDiges
 	return facts
 }
 
-func runAndTokenFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest string) (RunFacts, TokenFacts) {
+func runAndTokenFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string) (RunFacts, TokenFacts) {
 	runs := RunFacts{ByRoute: map[string]int{}}
 	tokens := TokenFacts{}
 	for _, observation := range observations {
 		record := observation.Record
-		if !closureObservationApplies(record, manifestDigest, proposalDigest) {
+		if !closureObservationApplies(record, manifestDigest, proposalDigest, policyDigest) {
 			continue
 		}
 		runs.ByRoute[record.Route]++
