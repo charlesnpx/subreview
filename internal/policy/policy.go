@@ -241,7 +241,7 @@ func Explain(opts ExplainOptions) (ExplainResult, error) {
 	if err != nil {
 		return ExplainResult{}, err
 	}
-	stateDir, _, err := stateManifestBinding(opts.StateDir)
+	stateDir, repo, err := stateManifestBinding(opts.StateDir)
 	if err != nil {
 		return ExplainResult{}, err
 	}
@@ -255,7 +255,10 @@ func Explain(opts ExplainOptions) (ExplainResult, error) {
 		if event.Type != "policy.bound" || event.Details["profile"] != opts.Profile {
 			continue
 		}
-		digest = event.Details["policy"]
+		digest, err = boundPolicyDigest(event, opts.Profile)
+		if err != nil {
+			return ExplainResult{}, err
+		}
 		break
 	}
 	if digest == "" {
@@ -267,6 +270,9 @@ func Explain(opts ExplainOptions) (ExplainResult, error) {
 	}
 	var effective EffectivePolicy
 	if err := decodeStrict(body, &effective); err != nil {
+		return ExplainResult{}, err
+	}
+	if err := validateBoundEffectivePolicy(effective, opts.Profile, repo); err != nil {
 		return ExplainResult{}, err
 	}
 	return ExplainResult{
@@ -470,6 +476,36 @@ func stateManifestBinding(stateDir string) (string, string, error) {
 		return "", "", fmt.Errorf("state first event is not state.initialized: %s", first.Type)
 	}
 	return root, first.Repo, nil
+}
+
+func boundPolicyDigest(event state.Event, profile string) (string, error) {
+	digest := event.Details["policy"]
+	if strings.TrimSpace(digest) == "" {
+		return "", fmt.Errorf("malformed policy.bound event for profile %s: missing policy digest", profile)
+	}
+	if len(event.ObjectDigests) != 1 || event.ObjectDigests[0] != digest {
+		return "", fmt.Errorf("malformed policy.bound event for profile %s: object_digests must contain only policy digest %s", profile, digest)
+	}
+	return digest, nil
+}
+
+func validateBoundEffectivePolicy(effective EffectivePolicy, profile, repo string) error {
+	if effective.SchemaVersion != SchemaVersion {
+		return fmt.Errorf("bound policy object does not match profile %s: unsupported schema_version %d", profile, effective.SchemaVersion)
+	}
+	if effective.Profile != profile {
+		return fmt.Errorf("bound policy object does not match profile %s: object profile is %s", profile, effective.Profile)
+	}
+	if effective.Repo != repo {
+		return fmt.Errorf("bound policy object does not match profile %s: object repo is %s", profile, effective.Repo)
+	}
+	if strings.TrimSpace(effective.PolicyID) == "" {
+		return fmt.Errorf("bound policy object does not match profile %s: policy_id is required", profile)
+	}
+	if len(effective.RequiredEvidenceFacts) == 0 || len(effective.ClosurePredicates) == 0 {
+		return fmt.Errorf("bound policy object does not match profile %s: evidence facts and closure predicates are required", profile)
+	}
+	return nil
 }
 
 func stateValidationError(result state.ValidationResult) error {

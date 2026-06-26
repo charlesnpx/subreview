@@ -127,37 +127,157 @@ func TestBindRejectsInvalidStateBeforeWritingPolicyEvent(t *testing.T) {
 	}
 }
 
+func TestExplainRejectsPolicyEventWithMismatchedObjectDigest(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	cfg := Config{
+		SchemaVersion: SchemaVersion,
+		PolicyID:      "v1-default",
+		Profiles:      map[string]Profile{"default": validProfile()},
+	}
+	effective, err := Effective(cfg, "default", root)
+	if err != nil {
+		t.Fatalf("Effective: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	first, err := store.PutJSON(map[string]any{"kind": "first"}, "application/json")
+	if err != nil {
+		t.Fatalf("PutJSON first: %v", err)
+	}
+	policyObject, err := store.PutJSON(effective, "application/vnd.subreview.policy+json")
+	if err != nil {
+		t.Fatalf("PutJSON policy: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "policy.bound",
+		ObjectDigests: []string{first.Digest},
+		Repo:          root,
+		Details: map[string]string{
+			"profile":   "default",
+			"policy":    policyObject.Digest,
+			"policy_id": "v1-default",
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	_, err = Explain(ExplainOptions{StateDir: stateDir, Profile: "default"})
+	if err == nil || !strings.Contains(err.Error(), "malformed policy.bound event") {
+		t.Fatalf("expected malformed policy.bound error, got %v", err)
+	}
+}
+
+func TestExplainRejectsPolicyObjectForDifferentProfile(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	cfg := Config{
+		SchemaVersion: SchemaVersion,
+		PolicyID:      "v1-default",
+		Profiles:      map[string]Profile{"default": validProfile()},
+	}
+	effective, err := Effective(cfg, "default", root)
+	if err != nil {
+		t.Fatalf("Effective: %v", err)
+	}
+	effective.Profile = "other"
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	policyObject, err := store.PutJSON(effective, "application/vnd.subreview.policy+json")
+	if err != nil {
+		t.Fatalf("PutJSON policy: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "policy.bound",
+		ObjectDigests: []string{policyObject.Digest},
+		Repo:          root,
+		Details: map[string]string{
+			"profile":   "default",
+			"policy":    policyObject.Digest,
+			"policy_id": "v1-default",
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	_, err = Explain(ExplainOptions{StateDir: stateDir, Profile: "default"})
+	if err == nil || !strings.Contains(err.Error(), "bound policy object does not match profile") {
+		t.Fatalf("expected profile mismatch error, got %v", err)
+	}
+}
+
 func validPolicyConfig() map[string]any {
 	return map[string]any{
 		"schema_version": float64(SchemaVersion),
 		"policy_id":      "v1-default",
 		"profiles": map[string]any{
-			"default": map[string]any{
-				"gate_requirements": []any{
-					map[string]any{"command_id": "go_test_all", "required": true},
-					map[string]any{"command_id": "subreview_state_validate", "required": true},
-				},
-				"route_limits": map[string]any{
-					"primary_semantic_reviews": float64(1),
-					"targeted_verifications":   float64(1),
-					"fresh_final_reviews":      float64(0),
-					"context_expansion_rounds": float64(1),
-				},
-				"required_evidence_facts": []any{
-					"required_gates_satisfied",
-					"primary_review_completed",
-					"blocking_findings_verified",
-					"coverage_obligations_satisfied",
-					"policy_bound",
-				},
-				"risk_routing": []any{
-					map[string]any{"risk_tier": "high", "review_effort": "medium", "require_independent_final": true},
-				},
-				"closure_basis": map[string]any{
-					"allowed_basis":                []any{"clean", "fixed", "deterministic_refutation"},
-					"require_basis_for_unresolved": true,
-				},
-			},
+			"default": validProfileConfig(),
+		},
+	}
+}
+
+func validProfile() Profile {
+	return Profile{
+		GateRequirements: []GateRequirement{
+			{CommandID: "go_test_all", Required: true},
+			{CommandID: "subreview_state_validate", Required: true},
+		},
+		RouteLimits: RouteLimits{
+			PrimarySemanticReviews: 1,
+			TargetedVerifications:  1,
+			FreshFinalReviews:      0,
+			ContextExpansionRounds: 1,
+		},
+		RequiredEvidenceFacts: []string{
+			"required_gates_satisfied",
+			"primary_review_completed",
+			"blocking_findings_verified",
+			"coverage_obligations_satisfied",
+			"policy_bound",
+		},
+		RiskRouting: []RiskRoute{
+			{RiskTier: "high", ReviewEffort: "medium", RequireIndependentFinal: true},
+		},
+		ClosureBasis: ClosureBasis{
+			AllowedBasis:              []string{"clean", "fixed", "deterministic_refutation"},
+			RequireBasisForUnresolved: true,
+		},
+	}
+}
+
+func validProfileConfig() map[string]any {
+	return map[string]any{
+		"gate_requirements": []any{
+			map[string]any{"command_id": "go_test_all", "required": true},
+			map[string]any{"command_id": "subreview_state_validate", "required": true},
+		},
+		"route_limits": map[string]any{
+			"primary_semantic_reviews": float64(1),
+			"targeted_verifications":   float64(1),
+			"fresh_final_reviews":      float64(0),
+			"context_expansion_rounds": float64(1),
+		},
+		"required_evidence_facts": []any{
+			"required_gates_satisfied",
+			"primary_review_completed",
+			"blocking_findings_verified",
+			"coverage_obligations_satisfied",
+			"policy_bound",
+		},
+		"risk_routing": []any{
+			map[string]any{"risk_tier": "high", "review_effort": "medium", "require_independent_final": true},
+		},
+		"closure_basis": map[string]any{
+			"allowed_basis":                []any{"clean", "fixed", "deterministic_refutation"},
+			"require_basis_for_unresolved": true,
 		},
 	}
 }
