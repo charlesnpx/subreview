@@ -37,6 +37,7 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 	writeFile(t, repo, "ambiguous.txt", "dup\n")
 	writeFile(t, repo, "source.txt", "move-me\nstay\n")
 	writeFile(t, repo, "copy-source.txt", "copy-me\n")
+	writeFile(t, repo, "file-copy.txt", "original\n")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-m", "initial")
 	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
@@ -58,6 +59,8 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 	writeFile(t, repo, "source.txt", "stay\n")
 	writeFile(t, repo, "dest.txt", "move-me\n")
 	writeFile(t, repo, "copy-dest.txt", "copy-me\n")
+	writeFile(t, repo, "file-copy.txt", "replacement\n")
+	writeFile(t, repo, "file-copy-moved.txt", "original\n")
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
 		t.Fatalf("Capture proposal: %v", err)
 	}
@@ -78,6 +81,7 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 			{ID: "hunk_ambiguous", Kind: KindHunk, Path: "ambiguous.txt", StartLine: 1, EndLine: 1, Text: "dup\n"},
 			{ID: "hunk_moved_to_other_file", Kind: KindHunk, Path: "source.txt", StartLine: 1, EndLine: 1, Text: "move-me\n"},
 			{ID: "hunk_copied_elsewhere", Kind: KindHunk, Path: "copy-source.txt", StartLine: 1, EndLine: 1, Text: "copy-me\n"},
+			{ID: "file_replaced_and_copied", Kind: KindFile, Path: "file-copy.txt"},
 			{ID: "file_unresolved", Kind: KindFile, Path: "missing.txt"},
 		},
 	})
@@ -87,7 +91,7 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 	if result.EventID == "" || result.Migration.Digest == "" || result.AnchorManifest.Digest == "" {
 		t.Fatalf("expected migration ledger and CAS refs: %+v", result)
 	}
-	if len(result.ClosureBlockers) != 3 {
+	if len(result.ClosureBlockers) != 4 {
 		t.Fatalf("expected ambiguous and unresolved closure blockers, got %+v", result.ClosureBlockers)
 	}
 	for _, blocker := range result.ClosureBlockers {
@@ -107,6 +111,13 @@ func TestAnchorMigrationGoldenCases(t *testing.T) {
 	}
 	if !bytes.Equal(bytes.TrimSpace(gotJSON), bytes.TrimSpace(want)) {
 		t.Fatalf("golden mismatch\nwant:\n%s\n\ngot:\n%s", want, gotJSON)
+	}
+}
+
+func TestMigrateRejectsEmptyAnchorInput(t *testing.T) {
+	_, err := Migrate(MigrateOptions{StateDir: "unused", FromKind: "base", ToKind: "proposal"})
+	if err == nil || !strings.Contains(err.Error(), "at least one anchor is required") {
+		t.Fatalf("expected empty anchor input error, got %v", err)
 	}
 }
 
@@ -180,6 +191,10 @@ func projectGoldenResults(results []AnchorResult) []goldenAnchorResult {
 			item.ToEndLine = result.To.EndLine
 		}
 		for _, candidate := range result.Candidates {
+			if candidate.StartLine == 0 && candidate.EndLine == 0 {
+				item.Candidates = append(item.Candidates, candidate.Path)
+				continue
+			}
 			item.Candidates = append(item.Candidates, candidate.Path+":"+strconv.Itoa(candidate.StartLine)+"-"+strconv.Itoa(candidate.EndLine))
 		}
 		projected = append(projected, item)

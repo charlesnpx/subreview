@@ -151,6 +151,9 @@ func Migrate(opts MigrateOptions) (MigrateResult, error) {
 	if opts.FromKind == opts.ToKind {
 		return MigrateResult{}, errors.New("--from and --to must be different snapshot kinds")
 	}
+	if strings.TrimSpace(opts.AnchorPath) == "" && len(opts.Anchors) == 0 {
+		return MigrateResult{}, errors.New("at least one anchor is required")
+	}
 	binding, err := stateBindingFromState(opts.StateDir)
 	if err != nil {
 		return MigrateResult{}, err
@@ -167,6 +170,9 @@ func Migrate(opts MigrateOptions) (MigrateResult, error) {
 			return MigrateResult{}, err
 		}
 		anchors = manifest.Anchors
+	}
+	if len(anchors) == 0 {
+		return MigrateResult{}, errors.New("at least one anchor is required")
 	}
 	anchors, err = normalizeAnchors(anchors)
 	if err != nil {
@@ -326,16 +332,20 @@ func migrateFileAnchor(anchor Anchor, from, to snapshotView, toByDigest map[stri
 		return unresolved(anchor, "anchor file is absent from source snapshot")
 	}
 	fromLoc := AnchorLocation{Path: anchor.Path, Digest: fromFile.Digest}
+	matches := locationsForDigest(toByDigest[fromFile.Digest])
 	if toFile, ok := to.Files[anchor.Path]; ok {
 		status := StatusUnchanged
 		reason := "file content is unchanged"
 		if toFile.Digest != fromFile.Digest {
+			if len(matches) > 0 {
+				candidates := append([]AnchorLocation{{Path: anchor.Path, Digest: toFile.Digest}}, matches...)
+				return blocker(AnchorResult{Anchor: anchor, Status: StatusAmbiguous, From: fromLoc, Candidates: candidates, Reason: "file path changed while original content appears at other target paths"})
+			}
 			status = StatusModified
 			reason = "file exists at the same path with modified content"
 		}
 		return AnchorResult{Anchor: anchor, Status: status, From: fromLoc, To: ptr(AnchorLocation{Path: anchor.Path, Digest: toFile.Digest}), Reason: reason}
 	}
-	matches := locationsForDigest(toByDigest[fromFile.Digest])
 	switch len(matches) {
 	case 0:
 		return AnchorResult{Anchor: anchor, Status: StatusDeleted, From: fromLoc, Reason: "file is absent from target snapshot"}

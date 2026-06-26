@@ -50,7 +50,7 @@ func main() {
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--anchors <path>] [--json]
+  subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> --anchors <path> [--json]
   subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--json]
   subreview install-skills [--plan|--install|--uninstall] [--target tools|claude|codex|all] [--json] [--install-root <dir>]
   subreview policy check --config <path> --repo <path> [--json]
@@ -89,7 +89,7 @@ func anchorsMigrate(args []string) error {
 	stateDir := fs.String("state", "", "Explicit state directory")
 	fromKind := fs.String("from", "", "Snapshot kind to migrate from")
 	toKind := fs.String("to", "", "Snapshot kind to migrate to")
-	anchorsPath := fs.String("anchors", "", "Optional JSON anchor manifest path")
+	anchorsPath := fs.String("anchors", "", "JSON anchor manifest path")
 	asJSON := fs.Bool("json", false, "Emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -110,12 +110,12 @@ func anchorsMigrate(args []string) error {
 
 func usageAnchors(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--anchors <path>] [--json]`)
+  subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> --anchors <path> [--json]`)
 }
 
 func usageAnchorsMigrate(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--anchors <path>] [--json]
+  subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> --anchors <path> [--json]
 
 Migrates file, path, and hunk anchors across an already captured snapshot diff.`)
 }

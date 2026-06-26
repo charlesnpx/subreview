@@ -19,7 +19,7 @@ subreview policy explain --state <dir> --profile <name> --json
 subreview snapshot capture --state <dir> --kind <base|proposal|final> --repo <path> [--ref <ref>] --json
 subreview snapshot restore --state <dir> --kind <base|proposal|final> --output <dir> --json
 subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> --json
-subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--anchors <path>] --json
+subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> --anchors <path> --json
 subreview install-skills --plan --target all --json
 ```
 

@@ -57,6 +57,15 @@
     "blocks_closure": true
   },
   {
+    "id": "file_replaced_and_copied",
+    "status": "ambiguous",
+    "candidates": [
+      "file-copy.txt",
+      "file-copy-moved.txt"
+    ],
+    "blocks_closure": true
+  },
+  {
     "id": "file_unresolved",
     "status": "unresolved",
     "blocks_closure": true
