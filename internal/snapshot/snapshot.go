@@ -670,6 +670,9 @@ func readSnapshot(store state.Store, binding snapshotBinding, kind string) (Snap
 	if len(tree.Entries) != record.EntryCount {
 		return SnapshotRecord{}, nil, fmt.Errorf("snapshot tree entry count mismatch: %d != %d", len(tree.Entries), record.EntryCount)
 	}
+	if err := validateTreeTopology(tree.Entries); err != nil {
+		return SnapshotRecord{}, nil, err
+	}
 	for _, entry := range tree.Entries {
 		if err := validateTreeEntry(entry); err != nil {
 			return SnapshotRecord{}, nil, err
@@ -699,6 +702,33 @@ func validateSnapshotRecord(record SnapshotRecord, kind string) error {
 	}
 	if record.EntryCount < 0 {
 		return errors.New("snapshot entry_count must not be negative")
+	}
+	return nil
+}
+
+func validateTreeTopology(entries []TreeEntry) error {
+	seen := map[string]struct{}{}
+	for _, entry := range entries {
+		rel, err := cleanRepoPath(entry.Path)
+		if err != nil {
+			return err
+		}
+		if _, ok := seen[rel]; ok {
+			return fmt.Errorf("duplicate tree entry path: %s", rel)
+		}
+		for existing := range seen {
+			if strings.HasPrefix(existing, rel+"/") {
+				return fmt.Errorf("tree entry path conflicts with file descendant: %s", rel)
+			}
+		}
+		seen[rel] = struct{}{}
+		parts := strings.Split(rel, "/")
+		for i := 1; i < len(parts); i++ {
+			parent := strings.Join(parts[:i], "/")
+			if _, ok := seen[parent]; ok {
+				return fmt.Errorf("tree entry path conflicts with file parent: %s", rel)
+			}
+		}
 	}
 	return nil
 }

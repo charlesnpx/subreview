@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -256,6 +257,38 @@ func TestRestoreDoesNotPartiallyWriteWhenBlobIsMissing(t *testing.T) {
 	}
 }
 
+func TestRestoreRejectsMalformedTreeTopologyBeforeWriting(t *testing.T) {
+	tests := map[string][]string{
+		"duplicate":               {"a.txt", "a.txt"},
+		"file_parent_first":       {"a", "a/b.txt"},
+		"file_parent_second":      {"a/b.txt", "a"},
+		"nested_file_parent_late": {"a/b/c.txt", "a/b"},
+	}
+	for name, paths := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			repo := filepath.Join(root, "repo")
+			stateDir := filepath.Join(root, "state")
+			initGitRepo(t, repo)
+			writeFile(t, repo, "seed.txt", "seed\n")
+			git(t, repo, "add", "seed.txt")
+			git(t, repo, "commit", "-m", "initial")
+			if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+				t.Fatalf("Init: %v", err)
+			}
+			appendMalformedSnapshot(t, stateDir, repo, "base", paths)
+			restoreDir := filepath.Join(root, "restore")
+			_, err := Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: restoreDir})
+			if err == nil || !strings.Contains(err.Error(), "tree entry path") && !strings.Contains(err.Error(), "duplicate tree entry") {
+				t.Fatalf("expected tree topology error, got %v", err)
+			}
+			if _, statErr := os.Stat(restoreDir); !os.IsNotExist(statErr) {
+				t.Fatalf("restore should not create output for malformed topology, stat err=%v", statErr)
+			}
+		})
+	}
+}
+
 func TestCaptureRejectsStateInsideRepo(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "repo")
 	stateDir := filepath.Join(repo, "subreview-state")
@@ -308,6 +341,53 @@ func readFile(t *testing.T, root, rel string) string {
 		t.Fatalf("read %s: %v", rel, err)
 	}
 	return string(body)
+}
+
+func appendMalformedSnapshot(t *testing.T, stateDir, repo, kind string, paths []string) {
+	t.Helper()
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	entries := make([]TreeEntry, 0, len(paths))
+	for i, path := range paths {
+		ref, err := store.PutText(fmt.Sprintf("body-%d\n", i))
+		if err != nil {
+			t.Fatalf("PutText: %v", err)
+		}
+		entries = append(entries, TreeEntry{Path: path, Mode: "100644", Digest: ref.Digest, Size: ref.Size})
+	}
+	tree, err := store.PutJSON(TreeManifest{SchemaVersion: SchemaVersion, Entries: entries}, "application/vnd.subreview.snapshot-tree+json")
+	if err != nil {
+		t.Fatalf("PutJSON tree: %v", err)
+	}
+	record := SnapshotRecord{
+		SchemaVersion:   SchemaVersion,
+		Kind:            kind,
+		Repo:            repo,
+		Source:          "test",
+		TreeDigest:      tree.Digest,
+		Tree:            tree,
+		EntryCount:      len(entries),
+		Reconstructable: true,
+		Provenance:      SnapshotProvenance{CaptureMode: "test"},
+	}
+	snapshotRef, err := store.PutJSON(record, "application/vnd.subreview.snapshot+json")
+	if err != nil {
+		t.Fatalf("PutJSON snapshot: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "snapshot.captured",
+		ObjectDigests: snapshotObjectDigests(snapshotRef.Digest, tree.Digest, entries),
+		Repo:          repo,
+		Details: map[string]string{
+			"kind":     kind,
+			"snapshot": snapshotRef.Digest,
+			"tree":     tree.Digest,
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
 }
 
 func objectPathForTest(stateDir, digest string) string {
