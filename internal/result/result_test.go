@@ -310,6 +310,29 @@ func TestImportRejectsObligationRefutationOnTargetedVerificationPacket(t *testin
 	if after := readEvents(t, stateDir); len(after) != len(before) {
 		t.Fatalf("targeted obligation refutation should not append ledger event: before=%d after=%d", len(before), len(after))
 	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: verificationPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        verificationPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			DeterministicRefutations: []reviewresult.DeterministicRefutationInput{{
+				ObligationIDs: []string{"coverage-beta"},
+				EvidenceKind:  "test",
+				Summary:       "This attempts to use targeted finding context to refute only a coverage obligation.",
+				Citations:     []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 1}},
+			}},
+		}),
+		Now: time.Unix(234, 5),
+	}); err == nil {
+		t.Fatal("targeted verification packet should not accept obligation-only deterministic refutations")
+	}
+	if after := readEvents(t, stateDir); len(after) != len(before) {
+		t.Fatalf("targeted obligation-only refutation should not append ledger event: before=%d after=%d", len(before), len(after))
+	}
 }
 
 func TestImportRejectsDiscoverySelfVerification(t *testing.T) {

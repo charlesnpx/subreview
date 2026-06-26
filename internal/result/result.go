@@ -624,7 +624,8 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 			break
 		}
 	}
-	if len(input.VerifierOutcomes) > 0 || hasFindingRefutation {
+	isTargetedVerificationPacket := packet.RunKind == RunKindVerification && packet.Route == RouteTargetedVerification
+	if len(input.VerifierOutcomes) > 0 || hasFindingRefutation || isTargetedVerificationPacket {
 		if packet.RunKind != runKind || packet.Route != route {
 			return ResultRecord{}, fmt.Errorf("verification result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
 		}
