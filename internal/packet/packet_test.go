@@ -12,6 +12,7 @@ import (
 	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/obligation"
 	"github.com/charlesnpx/subreview/internal/policy"
+	reviewresult "github.com/charlesnpx/subreview/internal/result"
 	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
 )
@@ -295,6 +296,32 @@ func TestLeakageScanIgnoresContextEntryContent(t *testing.T) {
 	}
 }
 
+func TestVerificationLeakageScanIncludesFindingText(t *testing.T) {
+	material := recordLeakageMaterial{
+		Repo: "repo",
+		Target: SnapshotRef{
+			Kind:   "final",
+			Digest: "sha256:target",
+		},
+		Manifest:       state.ObjectRef{Digest: "sha256:manifest"},
+		Dedupe:         NewSemanticDedupeKey(SemanticDedupeFields{Route: RouteVerification, RunKind: RunKindVerification}),
+		SourceComplete: "complete",
+		TokenTelemetry: NewTokenTelemetry(RunKindVerification, "complete"),
+	}
+	report := CheckLeakage(verificationLeakageScanText(material, VerificationRecord{
+		Finding: reviewresult.FindingRecord{
+			ID:              "finding-one",
+			Severity:        "high",
+			Class:           "correctness",
+			Claim:           "This claim mentions true_miss.",
+			FailureScenario: "The verifier should reject leaked evaluation terms.",
+		},
+	}))
+	if report.OK || len(report.ForbiddenTerms) == 0 {
+		t.Fatalf("verification leakage scan should include finding text: %+v", report)
+	}
+}
+
 func TestRenderStablePrefixEscapesPathMetadata(t *testing.T) {
 	markdown := renderStablePrefix(stableRenderData{
 		Repo: "repo",
@@ -415,6 +442,34 @@ func TestContentBundleDigestMaterialIgnoresCASRecordIdentities(t *testing.T) {
 	want := digestJSON(contentBundleDigestMaterial(second, targetTwo, "sha256:context", secondGates))
 	if got != want {
 		t.Fatalf("content bundle material should ignore volatile CAS record identities: got %s want %s", got, want)
+	}
+}
+
+func TestVerificationContentBundleIncludesExpectedFixSurface(t *testing.T) {
+	baseFinding := reviewresult.FindingRecord{
+		ID:           "finding-one",
+		DedupeDigest: "sha256:finding",
+		Severity:     "high",
+		Class:        "correctness",
+		ExpectedFixSurface: []reviewresult.FixSurface{{
+			Kind:      "file",
+			Path:      "alpha.txt",
+			StartLine: 1,
+			EndLine:   2,
+		}},
+	}
+	changedFinding := baseFinding
+	changedFinding.ExpectedFixSurface = []reviewresult.FixSurface{{
+		Kind:      "file",
+		Path:      "beta.txt",
+		StartLine: 3,
+		EndLine:   4,
+	}}
+	target := SnapshotRef{Kind: "final", Digest: "sha256:target", Tree: "sha256:tree"}
+	first := digestJSON(verificationContentBundleDigestMaterial(nil, target, "sha256:context", nil, baseFinding))
+	second := digestJSON(verificationContentBundleDigestMaterial(nil, target, "sha256:context", nil, changedFinding))
+	if first == second {
+		t.Fatalf("verification content bundle digest should include expected fix surface: %s", first)
 	}
 }
 
@@ -544,6 +599,48 @@ func TestBuildPrimaryPacketFiltersStaleGateEvidence(t *testing.T) {
 		t.Fatalf("Build current packet: %v", err)
 	}
 	assertHasGateEvidence(t, currentResult, stateDir, currentEvidence.Evidence.Digest)
+}
+
+func TestBuildVerificationPacketUsesProposalFinalState(t *testing.T) {
+	_, stateDir, findingID := initializedVerificationPacketState(t, true)
+	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindVerification, FindingID: findingID, Now: time.Unix(200, 0)})
+	if err != nil {
+		t.Fatalf("Build verification packet: %v", err)
+	}
+	if result.Kind != KindVerification || result.RunKind != RunKindVerification || result.Route != RouteVerification || result.Verification == nil {
+		t.Fatalf("bad verification result: %+v", result)
+	}
+	if result.Verification.FindingID != findingID || result.Verification.ProposalState == "" || result.Verification.FinalState == "" || result.Verification.ProposalFinalPatch == "" || len(result.Verification.Questions) == 0 {
+		t.Fatalf("verification summary incomplete: %+v", result.Verification)
+	}
+	record := readPacketRecord(t, stateDir, result.Packet.Digest)
+	if record.Verification == nil || record.Verification.Finding.ID != findingID || record.TargetState.Kind != "final" {
+		t.Fatalf("verification record incomplete: %+v", record.Verification)
+	}
+	if record.SemanticDedupeKey.RunKind != RunKindVerification || record.SemanticDedupeKey.Route != RouteVerification {
+		t.Fatalf("verification dedupe key should be route-specific: %+v", record.SemanticDedupeKey)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	markdown, err := store.Read(result.Markdown.Digest)
+	if err != nil {
+		t.Fatalf("Read markdown: %v", err)
+	}
+	for _, want := range []string{"# Subreview Verification Packet", "## Verification Questions", "proposal-to-final", "resolved, not_resolved, regression_introduced", "finding_invalid requires verifier_relation=fresh_blinded", "deterministic_refuted requires matching deterministic_refutations", "- citations:", "- anchors:", "\"alpha.txt\":1-2", "kind=hunk"} {
+		if !strings.Contains(string(markdown), want) {
+			t.Fatalf("verification markdown missing %q:\n%s", want, markdown)
+		}
+	}
+}
+
+func TestBuildVerificationPacketRequiresProposalFinalDiff(t *testing.T) {
+	_, stateDir, findingID := initializedVerificationPacketState(t, false)
+	_, err := Build(BuildOptions{StateDir: stateDir, Kind: KindVerification, FindingID: findingID, Now: time.Unix(200, 0)})
+	if err == nil || !strings.Contains(err.Error(), "proposal->final diff") {
+		t.Fatalf("expected missing proposal->final diff error, got %v", err)
+	}
 }
 
 func TestParsePatchHandlesQuotedAndSeparatorPaths(t *testing.T) {
@@ -718,6 +815,95 @@ func initializedBinaryPacketState(t *testing.T) (string, string) {
 		t.Fatalf("Build obligations: %v", err)
 	}
 	return repo, stateDir
+}
+
+func initializedVerificationPacketState(t *testing.T, withProposalFinalDiff bool) (string, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	writeFile(t, repo, "alpha_test.txt", "package fixture\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(10, 0)}); err != nil {
+		t.Fatalf("Init state: %v", err)
+	}
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfig(t, root), Profile: "default"}); err != nil {
+		t.Fatalf("Bind policy: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	writeFile(t, repo, "alpha.txt", "one\nbug\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	writeFile(t, repo, "alpha.txt", "one\nfixed\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if withProposalFinalDiff {
+		if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "proposal", ToKind: "final"}); err != nil {
+			t.Fatalf("CreateDiff proposal->final: %v", err)
+		}
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build obligations: %v", err)
+	}
+	primary, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(20, 0)})
+	if err != nil {
+		t.Fatalf("Build primary packet: %v", err)
+	}
+	findingID := "finding-alpha"
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: primary.Packet.Digest,
+		ResultPath: writePacketWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        primary.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings: []reviewresult.FindingInput{{
+				ID:              findingID,
+				Severity:        "high",
+				Class:           "correctness",
+				Claim:           "alpha.txt leaves the proposal bug visible to readers.",
+				FailureScenario: "A reader sees the literal bug marker in the proposal output.",
+				Citations:       []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 2}},
+				Anchors:         []reviewresult.AnchorRef{{Kind: "hunk", Path: "alpha.txt", StartLine: 1, EndLine: 2}},
+				ExpectedFixSurface: []reviewresult.FixSurface{{
+					Kind: "file",
+					Path: "alpha.txt",
+				}},
+			}},
+		}),
+		Now: time.Unix(30, 0),
+	}); err != nil {
+		t.Fatalf("Import finding result: %v", err)
+	}
+	return repo, stateDir, findingID
+}
+
+func writePacketWorkerResult(t *testing.T, value reviewresult.WorkerResult) string {
+	t.Helper()
+	body, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatalf("Marshal worker result: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "worker-result.json")
+	if err := os.WriteFile(path, append(body, '\n'), 0o644); err != nil {
+		t.Fatalf("write worker result: %v", err)
+	}
+	return path
 }
 
 func assertNoGateEvidence(t *testing.T, result BuildResult, stateDir, evidenceDigest string) {

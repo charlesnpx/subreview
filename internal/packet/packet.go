@@ -19,6 +19,7 @@ import (
 	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/obligation"
 	"github.com/charlesnpx/subreview/internal/policy"
+	reviewresult "github.com/charlesnpx/subreview/internal/result"
 	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
 )
@@ -28,10 +29,13 @@ const SchemaVersion = 1
 const (
 	EventTypePacketBuilt = "packet.built"
 
-	KindPrimary = "primary"
+	KindPrimary      = "primary"
+	KindVerification = "verification"
 
-	RunKindDiscovery = "discovery"
-	RoutePrimary     = "primary_review"
+	RunKindDiscovery    = "discovery"
+	RunKindVerification = "verification"
+	RoutePrimary        = "primary_review"
+	RouteVerification   = "targeted_verification"
 
 	MediaTypePacket   = "application/vnd.subreview.packet+json"
 	MediaTypeMarkdown = "text/markdown; charset=utf-8"
@@ -58,56 +62,60 @@ var (
 type BuildOptions struct {
 	StateDir        string
 	Kind            string
+	Route           string
+	FindingID       string
 	Now             time.Time
 	MaxContextBytes int
 }
 
 type BuildResult struct {
-	SchemaVersion      int               `json:"schema_version"`
-	State              string            `json:"state"`
-	Repo               string            `json:"repo"`
-	Kind               string            `json:"kind"`
-	RunKind            string            `json:"run_kind"`
-	Route              string            `json:"route"`
-	Packet             state.ObjectRef   `json:"packet"`
-	Markdown           state.ObjectRef   `json:"markdown"`
-	StableDigest       string            `json:"stable_digest"`
-	VolatileDigest     string            `json:"volatile_digest"`
-	PromptDigest       string            `json:"prompt_digest"`
-	SemanticDedupeKey  SemanticDedupeKey `json:"semantic_dedupe_key"`
-	Context            ContextSummary    `json:"context"`
-	Leakage            LeakageReport     `json:"leakage"`
-	TokenTelemetry     TokenTelemetry    `json:"token_telemetry"`
-	EventID            string            `json:"event_id"`
-	GeneratedAt        string            `json:"generated_at"`
-	CoverageManifest   state.ObjectRef   `json:"coverage_manifest"`
-	Policy             *PolicyRef        `json:"policy,omitempty"`
-	TargetState        SnapshotRef       `json:"target_state"`
-	SourceCompleteness string            `json:"source_completeness"`
+	SchemaVersion      int                  `json:"schema_version"`
+	State              string               `json:"state"`
+	Repo               string               `json:"repo"`
+	Kind               string               `json:"kind"`
+	RunKind            string               `json:"run_kind"`
+	Route              string               `json:"route"`
+	Packet             state.ObjectRef      `json:"packet"`
+	Markdown           state.ObjectRef      `json:"markdown"`
+	StableDigest       string               `json:"stable_digest"`
+	VolatileDigest     string               `json:"volatile_digest"`
+	PromptDigest       string               `json:"prompt_digest"`
+	SemanticDedupeKey  SemanticDedupeKey    `json:"semantic_dedupe_key"`
+	Context            ContextSummary       `json:"context"`
+	Leakage            LeakageReport        `json:"leakage"`
+	TokenTelemetry     TokenTelemetry       `json:"token_telemetry"`
+	EventID            string               `json:"event_id"`
+	GeneratedAt        string               `json:"generated_at"`
+	CoverageManifest   state.ObjectRef      `json:"coverage_manifest"`
+	Policy             *PolicyRef           `json:"policy,omitempty"`
+	TargetState        SnapshotRef          `json:"target_state"`
+	SourceCompleteness string               `json:"source_completeness"`
+	Verification       *VerificationSummary `json:"verification,omitempty"`
 }
 
 type PacketRecord struct {
-	SchemaVersion      int               `json:"schema_version"`
-	Kind               string            `json:"kind"`
-	RunKind            string            `json:"run_kind"`
-	Route              string            `json:"route"`
-	Repo               string            `json:"repo"`
-	GeneratedAt        string            `json:"generated_at"`
-	Policy             *PolicyRef        `json:"policy,omitempty"`
-	TargetState        SnapshotRef       `json:"target_state"`
-	CoverageManifest   state.ObjectRef   `json:"coverage_manifest"`
-	SourceDiffs        []SourceDiff      `json:"source_diffs"`
-	Context            ContextBundle     `json:"context"`
-	Gates              []GateSummary     `json:"gates"`
-	StablePrefix       string            `json:"stable_prefix"`
-	VolatileSuffix     string            `json:"volatile_suffix"`
-	StableDigest       string            `json:"stable_digest"`
-	VolatileDigest     string            `json:"volatile_digest"`
-	PromptDigest       string            `json:"prompt_digest"`
-	SemanticDedupeKey  SemanticDedupeKey `json:"semantic_dedupe_key"`
-	Leakage            LeakageReport     `json:"leakage"`
-	TokenTelemetry     TokenTelemetry    `json:"token_telemetry"`
-	SourceCompleteness string            `json:"source_completeness"`
+	SchemaVersion      int                 `json:"schema_version"`
+	Kind               string              `json:"kind"`
+	RunKind            string              `json:"run_kind"`
+	Route              string              `json:"route"`
+	Repo               string              `json:"repo"`
+	GeneratedAt        string              `json:"generated_at"`
+	Policy             *PolicyRef          `json:"policy,omitempty"`
+	TargetState        SnapshotRef         `json:"target_state"`
+	CoverageManifest   state.ObjectRef     `json:"coverage_manifest"`
+	SourceDiffs        []SourceDiff        `json:"source_diffs"`
+	Context            ContextBundle       `json:"context"`
+	Gates              []GateSummary       `json:"gates"`
+	StablePrefix       string              `json:"stable_prefix"`
+	VolatileSuffix     string              `json:"volatile_suffix"`
+	StableDigest       string              `json:"stable_digest"`
+	VolatileDigest     string              `json:"volatile_digest"`
+	PromptDigest       string              `json:"prompt_digest"`
+	SemanticDedupeKey  SemanticDedupeKey   `json:"semantic_dedupe_key"`
+	Leakage            LeakageReport       `json:"leakage"`
+	TokenTelemetry     TokenTelemetry      `json:"token_telemetry"`
+	SourceCompleteness string              `json:"source_completeness"`
+	Verification       *VerificationRecord `json:"verification,omitempty"`
 }
 
 type PolicyRef struct {
@@ -187,6 +195,28 @@ type GateSummary struct {
 	EventID       string `json:"event_id"`
 }
 
+type VerificationSummary struct {
+	FindingID          string   `json:"finding_id"`
+	ProposalState      string   `json:"proposal_state"`
+	FinalState         string   `json:"final_state"`
+	ProposalFinalPatch string   `json:"proposal_final_patch"`
+	Questions          []string `json:"questions"`
+}
+
+type VerificationRecord struct {
+	Finding            reviewresult.FindingRecord `json:"finding"`
+	ProposalState      SnapshotRef                `json:"proposal_state"`
+	FinalState         SnapshotRef                `json:"final_state"`
+	ProposalFinalDiff  SourceDiff                 `json:"proposal_final_diff"`
+	ExpectedFixSurface []reviewresult.FixSurface  `json:"expected_fix_surface"`
+	Questions          []VerificationQuestion     `json:"questions"`
+}
+
+type VerificationQuestion struct {
+	ID       string `json:"id"`
+	Question string `json:"question"`
+}
+
 type SemanticDedupeKey struct {
 	SchemaVersion        int    `json:"schema_version"`
 	PolicyID             string `json:"policy_id"`
@@ -257,9 +287,17 @@ func Build(opts BuildOptions) (BuildResult, error) {
 	if opts.Kind == "" {
 		opts.Kind = KindPrimary
 	}
-	if opts.Kind != KindPrimary {
+	switch opts.Kind {
+	case KindPrimary:
+		return buildPrimary(opts)
+	case KindVerification:
+		return buildVerification(opts)
+	default:
 		return BuildResult{}, fmt.Errorf("unsupported packet kind: %s", opts.Kind)
 	}
+}
+
+func buildPrimary(opts BuildOptions) (BuildResult, error) {
 	maxContextBytes := opts.MaxContextBytes
 	if maxContextBytes <= 0 {
 		maxContextBytes = defaultContextBytes
@@ -437,6 +475,229 @@ func Build(opts BuildOptions) (BuildResult, error) {
 		Policy:             policyRef,
 		TargetState:        target,
 		SourceCompleteness: sourceCompleteness,
+	}, nil
+}
+
+func buildVerification(opts BuildOptions) (BuildResult, error) {
+	maxContextBytes := opts.MaxContextBytes
+	if maxContextBytes <= 0 {
+		maxContextBytes = defaultContextBytes
+	}
+	route := strings.TrimSpace(opts.Route)
+	if route == "" {
+		route = RouteVerification
+	}
+	if route != RouteVerification {
+		return BuildResult{}, fmt.Errorf("unsupported verification route: %s", route)
+	}
+	now := opts.Now.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	binding, err := stateBindingFromState(opts.StateDir)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	store, err := state.Open(binding.State)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	events, err := state.ReadEvents(binding.State)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	manifestRef, manifest, err := latestCoverageManifest(store, events, binding.State, binding.Repo)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	policyBinding, err := latestBoundPolicy(store, events, binding.Repo)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	if err := validateManifestFreshness(store, events, binding.State, binding.Repo, manifest, policyBinding); err != nil {
+		return BuildResult{}, err
+	}
+	finding, err := latestFindingForVerification(store, events, binding.Repo, manifestRef.Digest, opts.FindingID)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	proposal, err := snapshotForManifestTransition(store, events, binding.Repo, manifest, "base", "proposal")
+	if err != nil {
+		return BuildResult{}, err
+	}
+	final, err := snapshotForManifestTransition(store, events, binding.Repo, manifest, "base", "final")
+	if err != nil {
+		return BuildResult{}, err
+	}
+	finalTree, err := readSnapshotTree(store, final)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	proposalFinal, err := proposalFinalSourceDiff(store, events, binding.State, binding.Repo, proposal.Digest, final.Digest)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	patchFiles, err := patchFilesForDiff(store, proposalFinal)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	context := buildContext(store, final, finalTree, patchFiles, maxContextBytes)
+	gates, err := gateSummaries(store, events, binding.Repo, manifest)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	context.AllowedContextDigest = digestJSON(contextDigestMaterial(context))
+	questions := verificationQuestions(finding)
+	verification := VerificationRecord{
+		Finding:            finding,
+		ProposalState:      proposal,
+		FinalState:         final,
+		ProposalFinalDiff:  proposalFinal,
+		ExpectedFixSurface: append([]reviewresult.FixSurface(nil), finding.ExpectedFixSurface...),
+		Questions:          questions,
+	}
+	contentBundleHash := digestJSON(verificationContentBundleDigestMaterial([]SourceDiff{proposalFinal}, final, context.AllowedContextDigest, gates, finding))
+	context.ContentBundleHash = contentBundleHash
+	var policyRef *PolicyRef
+	policyID := ""
+	policyDigest := ""
+	if manifest.Policy != nil {
+		ref := PolicyRef{Profile: manifest.Policy.Profile, PolicyID: manifest.Policy.PolicyID, Digest: manifest.Policy.Digest}
+		policyRef = &ref
+		policyID = ref.PolicyID
+		policyDigest = ref.Digest
+	}
+	dedupe := NewSemanticDedupeKey(SemanticDedupeFields{
+		PolicyID:             policyID,
+		PolicyDigest:         policyDigest,
+		Route:                route,
+		TargetState:          targetDedupeID(final),
+		ContentBundleHash:    contentBundleHash,
+		RunKind:              RunKindVerification,
+		AllowedContextBundle: context.AllowedContextDigest,
+	})
+	sourceCompleteness := sourceCompleteness(context)
+	tokenTelemetry := NewTokenTelemetry(RunKindVerification, sourceCompleteness)
+	stable := renderVerificationStablePrefix(verificationRenderData{
+		Repo:           binding.Repo,
+		Policy:         policyRef,
+		Target:         final,
+		Manifest:       manifestRef,
+		SourceDiffs:    []SourceDiff{proposalFinal},
+		Context:        context,
+		Gates:          gates,
+		Dedupe:         dedupe,
+		SourceComplete: sourceCompleteness,
+		TokenTelemetry: tokenTelemetry,
+		Verification:   verification,
+	})
+	volatile := renderVolatileSuffix(binding.State, now)
+	stableDigest := digestString(stable)
+	volatileDigest := digestString(volatile)
+	markdown := stable + "\n\n" + volatile + "\n"
+	promptDigest := digestString(markdown)
+	leakageMaterial := recordLeakageMaterial{
+		Repo:           binding.Repo,
+		Policy:         policyRef,
+		Target:         final,
+		Manifest:       manifestRef,
+		SourceDiffs:    []SourceDiff{proposalFinal},
+		Context:        context,
+		Gates:          gates,
+		Dedupe:         dedupe,
+		SourceComplete: sourceCompleteness,
+		TokenTelemetry: tokenTelemetry,
+	}
+	leakage := CheckLeakage(verificationLeakageScanText(leakageMaterial, verification))
+	if !leakage.OK {
+		return BuildResult{}, fmt.Errorf("packet leakage check failed: %s", strings.Join(leakage.ForbiddenTerms, ", "))
+	}
+	record := PacketRecord{
+		SchemaVersion:      SchemaVersion,
+		Kind:               KindVerification,
+		RunKind:            RunKindVerification,
+		Route:              route,
+		Repo:               binding.Repo,
+		GeneratedAt:        now.Format(time.RFC3339Nano),
+		Policy:             policyRef,
+		TargetState:        final,
+		CoverageManifest:   manifestRef,
+		SourceDiffs:        []SourceDiff{proposalFinal},
+		Context:            context,
+		Gates:              gates,
+		StablePrefix:       stable,
+		VolatileSuffix:     volatile,
+		StableDigest:       stableDigest,
+		VolatileDigest:     volatileDigest,
+		PromptDigest:       promptDigest,
+		SemanticDedupeKey:  dedupe,
+		Leakage:            leakage,
+		TokenTelemetry:     tokenTelemetry,
+		SourceCompleteness: sourceCompleteness,
+		Verification:       &verification,
+	}
+	packetRef, err := store.PutJSON(record, MediaTypePacket)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	markdownRef, err := store.PutBytes([]byte(markdown), MediaTypeMarkdown)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	event, err := state.AppendEvent(binding.State, state.Event{
+		Type:          EventTypePacketBuilt,
+		ObjectDigests: []string{packetRef.Digest, markdownRef.Digest},
+		Repo:          binding.Repo,
+		Details: map[string]string{
+			"kind":                   KindVerification,
+			"run_kind":               RunKindVerification,
+			"route":                  route,
+			"packet":                 packetRef.Digest,
+			"markdown":               markdownRef.Digest,
+			"coverage_manifest":      manifestRef.Digest,
+			"stable_digest":          stableDigest,
+			"volatile_digest":        volatileDigest,
+			"prompt_digest":          promptDigest,
+			"semantic_dedupe_digest": dedupe.Digest,
+			"target_state":           final.Digest,
+			"finding_id":             finding.ID,
+			"proposal_state":         proposal.Digest,
+			"final_state":            final.Digest,
+			"proposal_final_patch":   proposalFinal.Patch.Digest,
+		},
+	})
+	if err != nil {
+		return BuildResult{}, err
+	}
+	return BuildResult{
+		SchemaVersion:      SchemaVersion,
+		State:              binding.State,
+		Repo:               binding.Repo,
+		Kind:               KindVerification,
+		RunKind:            RunKindVerification,
+		Route:              route,
+		Packet:             packetRef,
+		Markdown:           markdownRef,
+		StableDigest:       stableDigest,
+		VolatileDigest:     volatileDigest,
+		PromptDigest:       promptDigest,
+		SemanticDedupeKey:  dedupe,
+		Context:            contextSummary(context),
+		Leakage:            leakage,
+		TokenTelemetry:     tokenTelemetry,
+		EventID:            event.EventID,
+		GeneratedAt:        now.Format(time.RFC3339Nano),
+		CoverageManifest:   manifestRef,
+		Policy:             policyRef,
+		TargetState:        final,
+		SourceCompleteness: sourceCompleteness,
+		Verification: &VerificationSummary{
+			FindingID:          finding.ID,
+			ProposalState:      proposal.Digest,
+			FinalState:         final.Digest,
+			ProposalFinalPatch: proposalFinal.Patch.Digest,
+			Questions:          questionStrings(questions),
+		},
 	}, nil
 }
 
@@ -685,6 +946,27 @@ func leakageScanText(data recordLeakageMaterial) string {
 	return string(body)
 }
 
+func verificationLeakageScanText(data recordLeakageMaterial, verification VerificationRecord) string {
+	questionText := make([]string, 0, len(verification.Questions))
+	for _, question := range verification.Questions {
+		questionText = append(questionText, question.Question)
+	}
+	body, err := json.Marshal(map[string]any{
+		"base": leakageScanText(data),
+		"finding": map[string]string{
+			"claim":            verification.Finding.Claim,
+			"failure_scenario": verification.Finding.FailureScenario,
+			"severity":         verification.Finding.Severity,
+			"class":            verification.Finding.Class,
+		},
+		"questions": questionText,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
+}
+
 type sourceDiffLeakageMetadata struct {
 	Transition  string             `json:"transition"`
 	FromKind    string             `json:"from_kind"`
@@ -829,6 +1111,174 @@ func renderStablePrefix(data stableRenderData) string {
 	fmt.Fprintln(&b, "- gross_input_tokens, incremental_input_tokens, cached_input_tokens, output_tokens, reasoning_tokens")
 	fmt.Fprintln(&b, "- latency_ms, backend, model, effort, source_completeness")
 	return strings.TrimSpace(b.String())
+}
+
+type verificationRenderData struct {
+	Repo           string
+	Policy         *PolicyRef
+	Target         SnapshotRef
+	Manifest       state.ObjectRef
+	SourceDiffs    []SourceDiff
+	Context        ContextBundle
+	Gates          []GateSummary
+	Dedupe         SemanticDedupeKey
+	SourceComplete string
+	TokenTelemetry TokenTelemetry
+	Verification   VerificationRecord
+}
+
+func renderVerificationStablePrefix(data verificationRenderData) string {
+	var b strings.Builder
+	fmt.Fprintln(&b, "# Subreview Verification Packet")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Verification Contract")
+	fmt.Fprintln(&b, "- Verify whether the proposal-to-final changes resolved the referenced finding.")
+	fmt.Fprintln(&b, "- Use only the included proposal-to-final diff, final-state context, gate evidence, and explicit omissions.")
+	fmt.Fprintln(&b, "- Return exactly one verification outcome for the finding unless deterministic refutation evidence is supplied.")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Identity")
+	fmt.Fprintf(&b, "- route: %s\n", data.Dedupe.Route)
+	fmt.Fprintf(&b, "- run_kind: %s\n", RunKindVerification)
+	fmt.Fprintf(&b, "- repo: %s\n", data.Repo)
+	if data.Policy != nil {
+		fmt.Fprintf(&b, "- policy_id: %s\n", data.Policy.PolicyID)
+		fmt.Fprintf(&b, "- policy_digest: %s\n", data.Policy.Digest)
+	}
+	fmt.Fprintf(&b, "- target_state: %s %s\n", data.Target.Kind, data.Target.Digest)
+	fmt.Fprintf(&b, "- coverage_manifest: %s\n", data.Manifest.Digest)
+	fmt.Fprintf(&b, "- semantic_dedupe_digest: %s\n", data.Dedupe.Digest)
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Finding Under Verification")
+	fmt.Fprintf(&b, "- finding_id: %s\n", data.Verification.Finding.ID)
+	fmt.Fprintf(&b, "- severity: %s\n", data.Verification.Finding.Severity)
+	fmt.Fprintf(&b, "- class: %s\n", data.Verification.Finding.Class)
+	fmt.Fprintf(&b, "- claim: %s\n", markdownJSONString(data.Verification.Finding.Claim))
+	fmt.Fprintf(&b, "- failure_scenario: %s\n", markdownJSONString(data.Verification.Finding.FailureScenario))
+	renderLineRefs(&b, "citations", data.Verification.Finding.Citations)
+	renderAnchorRefs(&b, "anchors", data.Verification.Finding.Anchors)
+	if len(data.Verification.ExpectedFixSurface) > 0 {
+		fmt.Fprintln(&b, "- expected_fix_surface:")
+		for _, surface := range data.Verification.ExpectedFixSurface {
+			fmt.Fprintf(&b, "  - %s", markdownJSONString(surface.Path))
+			if surface.StartLine > 0 {
+				fmt.Fprintf(&b, ":%d-%d", surface.StartLine, surface.EndLine)
+			}
+			if surface.Kind != "" {
+				fmt.Fprintf(&b, " kind=%s", surface.Kind)
+			}
+			fmt.Fprintln(&b)
+		}
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Verification Questions")
+	for _, question := range data.Verification.Questions {
+		fmt.Fprintf(&b, "- %s: %s\n", question.ID, question.Question)
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Proposal To Final Diff")
+	diff := data.Verification.ProposalFinalDiff
+	fmt.Fprintf(&b, "- proposal: %s\n", data.Verification.ProposalState.Digest)
+	fmt.Fprintf(&b, "- final: %s\n", data.Verification.FinalState.Digest)
+	fmt.Fprintf(&b, "- patch: %s, changed_paths=%d, hunks=%d\n", diff.Patch.Digest, len(diff.ChangedPaths), diff.HunkCount)
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Gate Evidence")
+	if len(data.Gates) == 0 {
+		fmt.Fprintln(&b, "- none recorded")
+	} else {
+		for _, gate := range data.Gates {
+			fmt.Fprintf(&b, "- %s: %s, snapshot=%s:%s, evidence=%s\n", gate.CommandID, gate.Outcome, gate.SnapshotKind, gate.Snapshot, gate.Evidence)
+		}
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Context Budget")
+	fmt.Fprintf(&b, "- max_bytes: %d\n", data.Context.MaxBytes)
+	fmt.Fprintf(&b, "- used_bytes: %d\n", data.Context.UsedBytes)
+	fmt.Fprintf(&b, "- source_completeness: %s\n", data.SourceComplete)
+	fmt.Fprintf(&b, "- allowed_context_digest: %s\n", data.Context.AllowedContextDigest)
+	fmt.Fprintf(&b, "- content_bundle_hash: %s\n", data.Context.ContentBundleHash)
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Selected Context")
+	if len(data.Context.Entries) == 0 {
+		fmt.Fprintln(&b, "- no context entries selected")
+	}
+	for _, entry := range data.Context.Entries {
+		fmt.Fprintf(&b, "### %s %s", entry.Kind, markdownJSONString(entry.Path))
+		if entry.StartLine > 0 {
+			fmt.Fprintf(&b, ":%d-%d", entry.StartLine, entry.EndLine)
+		}
+		fmt.Fprintln(&b)
+		fmt.Fprintf(&b, "digest: %s\n\n", entry.Digest)
+		fence := markdownFence(entry.Content)
+		fmt.Fprintln(&b, fence)
+		fmt.Fprintln(&b, entry.Content)
+		fmt.Fprintln(&b, fence)
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Explicit Omissions")
+	if len(data.Context.Omissions) == 0 {
+		fmt.Fprintln(&b, "- none")
+	} else {
+		for _, omission := range data.Context.Omissions {
+			if omission.Path != "" {
+				fmt.Fprintf(&b, "- %s %s: %s\n", omission.Code, markdownJSONString(omission.Path), omission.Message)
+			} else {
+				fmt.Fprintf(&b, "- %s: %s\n", omission.Code, omission.Message)
+			}
+		}
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Allowed Verification Outcomes")
+	fmt.Fprintln(&b, "- resolved, not_resolved, regression_introduced, insufficient_context, finding_invalid, unexpected_scope, deterministic_refuted")
+	fmt.Fprintln(&b, "- finding_invalid requires verifier_relation=fresh_blinded and relation_evidence=cli_witnessed|caller_asserted|external_asserted.")
+	fmt.Fprintln(&b, "- deterministic_refuted requires matching deterministic_refutations evidence for the same finding_id.")
+	return strings.TrimSpace(b.String())
+}
+
+func renderLineRefs(b *strings.Builder, label string, refs []reviewresult.LineRef) {
+	if len(refs) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "- %s:\n", label)
+	for _, ref := range refs {
+		fmt.Fprintf(b, "  - %s", markdownJSONString(ref.Path))
+		renderLineRange(b, ref.StartLine, ref.EndLine)
+		if ref.Quote != "" {
+			fmt.Fprintf(b, " quote=%s", markdownJSONString(ref.Quote))
+		}
+		if ref.Digest != "" {
+			fmt.Fprintf(b, " digest=%s", ref.Digest)
+		}
+		fmt.Fprintln(b)
+	}
+}
+
+func renderAnchorRefs(b *strings.Builder, label string, refs []reviewresult.AnchorRef) {
+	if len(refs) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "- %s:\n", label)
+	for _, ref := range refs {
+		fmt.Fprintf(b, "  - %s", markdownJSONString(ref.Path))
+		renderLineRange(b, ref.StartLine, ref.EndLine)
+		if ref.Kind != "" {
+			fmt.Fprintf(b, " kind=%s", ref.Kind)
+		}
+		if ref.ObligationID != "" {
+			fmt.Fprintf(b, " obligation_id=%s", ref.ObligationID)
+		}
+		fmt.Fprintln(b)
+	}
+}
+
+func renderLineRange(b *strings.Builder, startLine, endLine int) {
+	if startLine <= 0 {
+		return
+	}
+	if endLine <= 0 {
+		fmt.Fprintf(b, ":%d", startLine)
+		return
+	}
+	fmt.Fprintf(b, ":%d-%d", startLine, endLine)
 }
 
 func renderVolatileSuffix(stateDir string, now time.Time) string {
@@ -1332,6 +1782,104 @@ func primaryTargetSnapshot(store state.Store, manifest obligation.CoverageManife
 	return SnapshotRef{}, errors.New("base->proposal diff is required for primary packet")
 }
 
+func snapshotForManifestTransition(store state.Store, events []state.Event, repo string, manifest obligation.CoverageManifest, fromKind, toKind string) (SnapshotRef, error) {
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == fromKind && diff.ToKind == toKind {
+			binding, err := snapshotBindingFromDigest(store, events, repo, diff.ToKind, diff.ToSnapshot)
+			if err != nil {
+				return SnapshotRef{}, err
+			}
+			return SnapshotRef{Kind: binding.Kind, Digest: binding.Digest, Tree: binding.Tree}, nil
+		}
+	}
+	return SnapshotRef{}, fmt.Errorf("%s->%s diff is required for verification packet", fromKind, toKind)
+}
+
+func latestFindingForVerification(store state.Store, events []state.Event, repo, manifestDigest, findingID string) (reviewresult.FindingRecord, error) {
+	findingID = strings.TrimSpace(findingID)
+	if findingID == "" {
+		return reviewresult.FindingRecord{}, errors.New("--finding is required for verification packets")
+	}
+	observations, err := reviewresult.Observations(store, events, repo)
+	if err != nil {
+		return reviewresult.FindingRecord{}, err
+	}
+	for _, observation := range observations {
+		if observation.Record.Packet.CoverageManifest.Digest != manifestDigest {
+			continue
+		}
+		for _, finding := range observation.Record.Findings {
+			if finding.ID == findingID && finding.Accepted {
+				return finding, nil
+			}
+		}
+	}
+	return reviewresult.FindingRecord{}, fmt.Errorf("accepted finding not found for verification: %s", findingID)
+}
+
+func proposalFinalSourceDiff(store state.Store, events []state.Event, stateDir, repo, proposalDigest, finalDigest string) (SourceDiff, error) {
+	binding, ok, err := latestTransitionDiff(events, stateDir, repo, "proposal", "final")
+	if err != nil {
+		return SourceDiff{}, err
+	}
+	if !ok {
+		return SourceDiff{}, errors.New("proposal->final diff is required for verification packets")
+	}
+	if binding.FromSnapshot != proposalDigest || binding.ToSnapshot != finalDigest {
+		return SourceDiff{}, errors.New("proposal->final diff does not match the current proposal and final snapshots")
+	}
+	patchBody, err := store.Read(binding.Patch.Digest)
+	if err != nil {
+		return SourceDiff{}, err
+	}
+	files := parsePatch(patchBody)
+	paths := make([]string, 0, len(files))
+	hunks := 0
+	for _, file := range files {
+		paths = append(paths, file.Path)
+		hunks += len(file.Hunks)
+	}
+	sort.Strings(paths)
+	return SourceDiff{
+		Transition:   "proposal->final",
+		FromKind:     "proposal",
+		ToKind:       "final",
+		FromSnapshot: binding.FromSnapshot,
+		ToSnapshot:   binding.ToSnapshot,
+		Diff:         state.ObjectRef{Digest: binding.Diff.Digest, MediaType: "application/vnd.subreview.diff+json", Path: binding.Diff.Path},
+		Patch:        state.ObjectRef{Digest: binding.Patch.Digest, MediaType: "text/x-diff; charset=utf-8", Size: int64(len(patchBody)), Path: binding.Patch.Path},
+		PatchDigest:  binding.Patch.Digest,
+		HasChanges:   len(files) > 0,
+		ChangedPaths: paths,
+		HunkCount:    hunks,
+	}, nil
+}
+
+func patchFilesForDiff(store state.Store, diff SourceDiff) ([]patchFile, error) {
+	body, err := store.Read(diff.Patch.Digest)
+	if err != nil {
+		return nil, err
+	}
+	return parsePatch(body), nil
+}
+
+func verificationQuestions(finding reviewresult.FindingRecord) []VerificationQuestion {
+	return []VerificationQuestion{
+		{ID: "resolution", Question: "Did the proposal-to-final changes resolve the referenced finding in the final state?"},
+		{ID: "regression", Question: "Did the fix introduce a new regression or unexpected scope change?"},
+		{ID: "context", Question: "Is the included context sufficient to verify the outcome?"},
+		{ID: "deterministic", Question: "Is there deterministic or executable evidence that refutes the finding?"},
+	}
+}
+
+func questionStrings(questions []VerificationQuestion) []string {
+	values := make([]string, 0, len(questions))
+	for _, question := range questions {
+		values = append(values, question.Question)
+	}
+	return values
+}
+
 func snapshotBindingFromDigest(store state.Store, events []state.Event, repo, kind, digest string) (snapshotBinding, error) {
 	for i := len(events) - 1; i >= 0; i-- {
 		event := events[i]
@@ -1625,6 +2173,22 @@ func contentBundleDigestMaterial(sourceDiffs []SourceDiff, target SnapshotRef, a
 		"target_state": targetDigestMaterial(target),
 		"context":      allowedContextDigest,
 		"gates":        gateDigestMaterial(gates),
+	}
+}
+
+func verificationContentBundleDigestMaterial(sourceDiffs []SourceDiff, target SnapshotRef, allowedContextDigest string, gates []GateSummary, finding reviewresult.FindingRecord) any {
+	return map[string]any{
+		"source_diffs": sourceDiffDigestMaterial(sourceDiffs),
+		"target_state": targetDigestMaterial(target),
+		"context":      allowedContextDigest,
+		"gates":        gateDigestMaterial(gates),
+		"finding": map[string]any{
+			"id":                   finding.ID,
+			"dedupe_digest":        finding.DedupeDigest,
+			"severity":             finding.Severity,
+			"class":                finding.Class,
+			"expected_fix_surface": finding.ExpectedFixSurface,
+		},
 	}
 }
 
