@@ -145,6 +145,42 @@ func TestBuildPrimaryPacketHunkContextDoesNotAnchorPastEOF(t *testing.T) {
 	t.Fatalf("changed hunk context missing: %+v", record.Context.Entries)
 }
 
+func TestBuildPrimaryPacketIncludesPatchContextForExistingFileHunks(t *testing.T) {
+	_, stateDir := initializedPacketState(t, "keep\nremove\n", "keep\n")
+	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(100, 0)})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	record := readPacketRecord(t, stateDir, result.Packet.Digest)
+	hasTargetContext := false
+	for _, entry := range record.Context.Entries {
+		if entry.Path != "alpha.txt" {
+			continue
+		}
+		if entry.Kind == "changed_hunk" {
+			hasTargetContext = true
+		}
+		if entry.Kind == "patch_hunk" {
+			if !strings.Contains(entry.Content, "-remove") {
+				t.Fatalf("patch hunk should include deleted lines: %+v", entry)
+			}
+			if !hasTargetContext {
+				for _, candidate := range record.Context.Entries {
+					if candidate.Path == "alpha.txt" && candidate.Kind == "changed_hunk" {
+						hasTargetContext = true
+						break
+					}
+				}
+			}
+			if !hasTargetContext {
+				t.Fatalf("existing file hunk should include target context as well as patch context: %+v", record.Context.Entries)
+			}
+			return
+		}
+	}
+	t.Fatalf("patch hunk context missing for existing file: %+v", record.Context.Entries)
+}
+
 func TestLeakageDetectionRejectsEvaluationLabels(t *testing.T) {
 	report := CheckLeakage("this packet mentions a true_miss adjudication")
 	if report.OK || len(report.ForbiddenTerms) == 0 {
@@ -161,13 +197,27 @@ func TestLeakageScanIgnoresContextEntryContent(t *testing.T) {
 			Tree:   "sha256:tree",
 		},
 		Manifest: state.ObjectRef{Digest: "sha256:manifest", MediaType: "application/json", Size: 1},
+		SourceDiffs: []SourceDiff{{
+			Transition:   "base->proposal",
+			FromKind:     "base",
+			ToKind:       "proposal",
+			Patch:        state.ObjectRef{Digest: "sha256:patch", MediaType: "text/x-patch", Size: 10},
+			PatchDigest:  "sha256:patch",
+			HasChanges:   true,
+			ChangedPaths: []string{"false_positive_test.go"},
+			HunkCount:    1,
+		}},
 		Context: ContextBundle{Entries: []ContextEntry{{
 			Kind:         "changed_file",
-			Path:         "docs/review.md",
+			Path:         "scripts/apply_verification_adjudications.py",
 			SnapshotKind: "proposal",
 			Digest:       "sha256:source",
 			Bytes:        64,
 			Content:      "This legitimate source mentions false_positive and adjudication.",
+		}}, Omissions: []Omission{{
+			Code:    "path_not_in_target_snapshot",
+			Path:    "gold label notes.md",
+			Message: "source path omitted",
 		}}},
 		Dedupe:         NewSemanticDedupeKey(SemanticDedupeFields{Route: RoutePrimary, RunKind: RunKindDiscovery}),
 		SourceComplete: "complete",
@@ -175,7 +225,7 @@ func TestLeakageScanIgnoresContextEntryContent(t *testing.T) {
 	}
 	report := CheckLeakage(leakageScanText(material))
 	if !report.OK {
-		t.Fatalf("source content should be excluded from leakage scan: %+v", report)
+		t.Fatalf("source content and paths should be excluded from leakage scan: %+v", report)
 	}
 }
 

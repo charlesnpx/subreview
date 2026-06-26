@@ -647,7 +647,6 @@ type recordLeakageMaterial struct {
 func leakageScanText(data recordLeakageMaterial) string {
 	type contextEntryMetadata struct {
 		Kind         string `json:"kind"`
-		Path         string `json:"path"`
 		SnapshotKind string `json:"snapshot_kind"`
 		Digest       string `json:"digest"`
 		StartLine    int    `json:"start_line,omitempty"`
@@ -658,7 +657,6 @@ func leakageScanText(data recordLeakageMaterial) string {
 	for _, entry := range data.Context.Entries {
 		entries = append(entries, contextEntryMetadata{
 			Kind:         entry.Kind,
-			Path:         entry.Path,
 			SnapshotKind: entry.SnapshotKind,
 			Digest:       entry.Digest,
 			StartLine:    entry.StartLine,
@@ -671,9 +669,9 @@ func leakageScanText(data recordLeakageMaterial) string {
 		"policy":            data.Policy,
 		"target":            data.Target,
 		"manifest":          canonicalObject(data.Manifest),
-		"source_diffs":      sourceDiffDigestMaterial(data.SourceDiffs),
+		"source_diffs":      sourceDiffLeakageMaterial(data.SourceDiffs),
 		"context_metadata":  entries,
-		"context_omissions": data.Context.Omissions,
+		"context_omissions": omissionLeakageMaterial(data.Context.Omissions),
 		"gates":             gateDigestMaterial(data.Gates),
 		"dedupe":            data.Dedupe,
 		"source_complete":   data.SourceComplete,
@@ -683,6 +681,52 @@ func leakageScanText(data recordLeakageMaterial) string {
 		panic(err)
 	}
 	return string(body)
+}
+
+type sourceDiffLeakageMetadata struct {
+	Transition  string             `json:"transition"`
+	FromKind    string             `json:"from_kind"`
+	ToKind      string             `json:"to_kind"`
+	Patch       canonicalObjectRef `json:"patch"`
+	PatchDigest string             `json:"patch_digest"`
+	HasChanges  bool               `json:"has_changes"`
+	HunkCount   int                `json:"hunk_count"`
+}
+
+func sourceDiffLeakageMaterial(sourceDiffs []SourceDiff) []sourceDiffLeakageMetadata {
+	material := make([]sourceDiffLeakageMetadata, 0, len(sourceDiffs))
+	for _, diff := range sourceDiffs {
+		material = append(material, sourceDiffLeakageMetadata{
+			Transition:  diff.Transition,
+			FromKind:    diff.FromKind,
+			ToKind:      diff.ToKind,
+			Patch:       canonicalObject(diff.Patch),
+			PatchDigest: diff.PatchDigest,
+			HasChanges:  diff.HasChanges,
+			HunkCount:   diff.HunkCount,
+		})
+	}
+	sort.Slice(material, func(i, j int) bool { return material[i].Transition < material[j].Transition })
+	return material
+}
+
+type omissionLeakageMetadata struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func omissionLeakageMaterial(omissions []Omission) []omissionLeakageMetadata {
+	material := make([]omissionLeakageMetadata, 0, len(omissions))
+	for _, omission := range omissions {
+		material = append(material, omissionLeakageMetadata{Code: omission.Code, Message: omission.Message})
+	}
+	sort.Slice(material, func(i, j int) bool {
+		if material[i].Code == material[j].Code {
+			return material[i].Message < material[j].Message
+		}
+		return material[i].Code < material[j].Code
+	})
+	return material
 }
 
 func markdownJSONString(value string) string {
@@ -851,7 +895,10 @@ func buildContext(store state.Store, target SnapshotRef, tree map[string]snapsho
 		}
 		for _, hunk := range file.Hunks {
 			h := hunk
-			addEntry("changed_hunk", file.Path, &h)
+			addEntry("patch_hunk", file.Path, &h)
+			if _, existsInTarget := tree[file.Path]; existsInTarget {
+				addEntry("changed_hunk", file.Path, &h)
+			}
 		}
 	}
 	for _, path := range nearbyPaths(tree, files) {
@@ -868,19 +915,19 @@ func buildContext(store state.Store, target SnapshotRef, tree map[string]snapsho
 }
 
 func contextEntry(store state.Store, target SnapshotRef, tree map[string]snapshot.TreeEntry, kind, path string, hunk *patchHunk) (ContextEntry, bool, Omission) {
+	if kind == "patch_hunk" && hunk != nil && hunk.Patch != "" {
+		content := strings.TrimRight(hunk.Patch, "\n")
+		return ContextEntry{
+			Kind:         kind,
+			Path:         path,
+			SnapshotKind: "patch",
+			Digest:       digestString(content),
+			Bytes:        len([]byte(content)),
+			Content:      content,
+		}, true, Omission{}
+	}
 	entry, ok := tree[path]
 	if !ok {
-		if hunk != nil && hunk.Patch != "" {
-			content := strings.TrimRight(hunk.Patch, "\n")
-			return ContextEntry{
-				Kind:         "patch_hunk",
-				Path:         path,
-				SnapshotKind: "patch",
-				Digest:       digestString(content),
-				Bytes:        len([]byte(content)),
-				Content:      content,
-			}, true, Omission{}
-		}
 		return ContextEntry{}, false, Omission{Code: "path_not_in_target_snapshot", Path: path, Message: "changed path is absent from target snapshot"}
 	}
 	body, err := store.Read(entry.Digest)
