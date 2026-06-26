@@ -707,6 +707,9 @@ func TestResultImportCLI(t *testing.T) {
 	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "final", "--json").CombinedOutput(); err != nil {
 		t.Fatalf("diff base->final failed: %v\n%s", err, out)
 	}
+	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "proposal", "--to", "final", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("diff proposal->final failed: %v\n%s", err, out)
+	}
 	if out, err := exec.Command(bin, "obligations", "build", "--state", stateDir, "--json").CombinedOutput(); err != nil {
 		t.Fatalf("obligations build failed: %v\n%s", err, out)
 	}
@@ -779,6 +782,29 @@ func TestResultImportCLI(t *testing.T) {
 	}
 	if findingResult.FindingCount != 1 || findingResult.AcceptedFindingCount != 1 {
 		t.Fatalf("bad finding result import: %s", findingOut)
+	}
+	verificationOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "verification", "--finding", "finding-cli", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("verification packet build failed: %v\n%s", err, verificationOut)
+	}
+	var verificationResult struct {
+		Kind    string `json:"kind"`
+		RunKind string `json:"run_kind"`
+		Route   string `json:"route"`
+		Packet  struct {
+			Digest string `json:"digest"`
+		} `json:"packet"`
+		Verification struct {
+			FindingID          string   `json:"finding_id"`
+			ProposalFinalPatch string   `json:"proposal_final_patch"`
+			Questions          []string `json:"questions"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal(verificationOut, &verificationResult); err != nil {
+		t.Fatalf("verification packet output is not json: %v\n%s", err, verificationOut)
+	}
+	if verificationResult.Kind != "verification" || verificationResult.RunKind != "verification" || verificationResult.Route != "targeted_verification" || verificationResult.Packet.Digest == "" || verificationResult.Verification.FindingID != "finding-cli" || verificationResult.Verification.ProposalFinalPatch == "" || len(verificationResult.Verification.Questions) == 0 {
+		t.Fatalf("bad verification packet output: %s", verificationOut)
 	}
 
 	needsContextOut, err := exec.Command(bin, "result", "import", "--state", stateDir, "--packet", packetResult.Packet.Digest, "--result", writeCLIWorkerResult(t, reviewresult.WorkerResult{

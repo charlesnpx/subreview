@@ -40,6 +40,14 @@ const (
 	OutcomeNeedsContext = "needs_context"
 	OutcomeVerification = "verification"
 
+	VerificationResolved             = "resolved"
+	VerificationNotResolved          = "not_resolved"
+	VerificationRegressionIntroduced = "regression_introduced"
+	VerificationInsufficientContext  = "insufficient_context"
+	VerificationFindingInvalid       = "finding_invalid"
+	VerificationUnexpectedScope      = "unexpected_scope"
+	VerificationDeterministicRefuted = "deterministic_refuted"
+
 	StateOpen               = "open"
 	StateResolved           = "resolved"
 	StateVerified           = "verified"
@@ -172,6 +180,7 @@ type RequiredCheck struct {
 
 type VerifierOutcomeInput struct {
 	FindingID        string `json:"finding_id"`
+	Outcome          string `json:"outcome,omitempty"`
 	State            string `json:"state"`
 	Basis            string `json:"basis"`
 	Summary          string `json:"summary"`
@@ -274,6 +283,7 @@ type FindingRecord struct {
 
 type VerifierOutcome struct {
 	FindingID        string `json:"finding_id"`
+	Outcome          string `json:"outcome"`
 	State            string `json:"state"`
 	Basis            string `json:"basis"`
 	Summary          string `json:"summary"`
@@ -601,6 +611,9 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 	if runKind == RunKindDiscovery && (packet.RunKind != runKind || packet.Route != route) {
 		return ResultRecord{}, fmt.Errorf("discovery result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
 	}
+	if len(input.VerifierOutcomes) > 0 && (packet.RunKind != runKind || packet.Route != route) {
+		return ResultRecord{}, fmt.Errorf("verification result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
+	}
 	outcome := strings.TrimSpace(input.Outcome)
 	if outcome == "" {
 		outcome = inferOutcome(input)
@@ -677,6 +690,9 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 	}
 	refutations, err := normalizeDeterministicRefutations(input.DeterministicRefutations)
 	if err != nil {
+		return ResultRecord{}, err
+	}
+	if err := validateVerifierOutcomeEvidence(verifierOutcomes, refutations); err != nil {
 		return ResultRecord{}, err
 	}
 	telemetry, err := normalizeTelemetry(input.Telemetry)
@@ -955,11 +971,21 @@ func normalizeVerifierOutcomes(input []VerifierOutcomeInput) ([]VerifierOutcome,
 		if !idPattern.MatchString(findingID) {
 			return nil, fmt.Errorf("invalid verifier outcome finding_id: %s", outcome.FindingID)
 		}
+		outcomeValue := strings.TrimSpace(outcome.Outcome)
+		if outcomeValue != "" && !validVerificationOutcome(outcomeValue) {
+			return nil, fmt.Errorf("invalid verification outcome: %s", outcome.Outcome)
+		}
 		stateValue := strings.TrimSpace(outcome.State)
+		if stateValue == "" && outcomeValue != "" {
+			stateValue = stateForVerificationOutcome(outcomeValue)
+		}
 		if !validLifecycleState(stateValue) || stateValue == StateOpen || stateValue == StateRejectedStructural || stateValue == StateDuplicate {
 			return nil, fmt.Errorf("invalid verifier outcome state: %s", outcome.State)
 		}
 		basis := strings.TrimSpace(outcome.Basis)
+		if basis == "" && outcomeValue != "" {
+			basis = basisForVerificationOutcome(outcomeValue)
+		}
 		if !validVerifierBasis(basis) {
 			return nil, fmt.Errorf("invalid verifier outcome basis: %s", outcome.Basis)
 		}
@@ -980,8 +1006,12 @@ func normalizeVerifierOutcomes(input []VerifierOutcomeInput) ([]VerifierOutcome,
 		if stateValue == StateInvalidated && basis != BasisFreshSemantic && basis != BasisDeterministicRefutation && basis != BasisExecutableRefutation {
 			return nil, fmt.Errorf("invalidated finding requires deterministic, executable, or fresh semantic basis: %s", basis)
 		}
+		if outcomeValue == "" {
+			outcomeValue = verificationOutcomeForState(stateValue, basis)
+		}
 		out = append(out, VerifierOutcome{
 			FindingID:        findingID,
+			Outcome:          outcomeValue,
 			State:            stateValue,
 			Basis:            basis,
 			Summary:          summary,
@@ -1061,6 +1091,28 @@ func normalizeDeterministicRefutations(input []DeterministicRefutationInput) ([]
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+func validateVerifierOutcomeEvidence(outcomes []VerifierOutcome, refutations []DeterministicRefutation) error {
+	refutedFindings := map[string]struct{}{}
+	for _, refutation := range refutations {
+		if refutation.FindingID == "" {
+			continue
+		}
+		refutedFindings[refutation.FindingID] = struct{}{}
+	}
+	for _, outcome := range outcomes {
+		if outcome.State != StateInvalidated {
+			continue
+		}
+		if outcome.Basis != BasisDeterministicRefutation && outcome.Basis != BasisExecutableRefutation {
+			continue
+		}
+		if _, ok := refutedFindings[outcome.FindingID]; !ok {
+			return fmt.Errorf("deterministic verifier outcome for %s requires matching deterministic refutation evidence", outcome.FindingID)
+		}
+	}
+	return nil
 }
 
 func normalizeEvidenceRefs(input []EvidenceRef) ([]EvidenceRef, error) {
@@ -1422,6 +1474,59 @@ func validVerifierBasis(value string) bool {
 	default:
 		return false
 	}
+}
+
+func validVerificationOutcome(value string) bool {
+	switch value {
+	case VerificationResolved, VerificationNotResolved, VerificationRegressionIntroduced, VerificationInsufficientContext, VerificationFindingInvalid, VerificationUnexpectedScope, VerificationDeterministicRefuted:
+		return true
+	default:
+		return false
+	}
+}
+
+func stateForVerificationOutcome(value string) string {
+	switch value {
+	case VerificationResolved:
+		return StateVerified
+	case VerificationFindingInvalid, VerificationDeterministicRefuted:
+		return StateInvalidated
+	case VerificationInsufficientContext:
+		return StateNeedsContext
+	case VerificationNotResolved, VerificationRegressionIntroduced, VerificationUnexpectedScope:
+		return StateNeedsConfirmation
+	default:
+		return StateNeedsConfirmation
+	}
+}
+
+func basisForVerificationOutcome(value string) string {
+	switch value {
+	case VerificationResolved, VerificationNotResolved, VerificationRegressionIntroduced, VerificationInsufficientContext, VerificationUnexpectedScope:
+		return BasisFixVerification
+	case VerificationFindingInvalid:
+		return BasisFreshSemantic
+	case VerificationDeterministicRefuted:
+		return BasisDeterministicRefutation
+	default:
+		return BasisFixVerification
+	}
+}
+
+func verificationOutcomeForState(stateValue, basis string) string {
+	if stateValue == StateVerified {
+		return VerificationResolved
+	}
+	if stateValue == StateNeedsContext {
+		return VerificationInsufficientContext
+	}
+	if stateValue == StateInvalidated && (basis == BasisDeterministicRefutation || basis == BasisExecutableRefutation) {
+		return VerificationDeterministicRefuted
+	}
+	if stateValue == StateInvalidated {
+		return VerificationFindingInvalid
+	}
+	return VerificationNotResolved
 }
 
 func validRelationEvidence(value string) bool {

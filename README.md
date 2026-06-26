@@ -22,6 +22,7 @@ subreview gates record --state /tmp/subreview-state --catalog /tmp/subreview-gat
 subreview obligations build --state /tmp/subreview-state --json
 subreview obligations status --state /tmp/subreview-state --json
 subreview packet build --state /tmp/subreview-state --kind primary --json
+subreview packet build --state /tmp/subreview-state --kind verification --finding finding-123 --json
 subreview result import --state /tmp/subreview-state --packet sha256:... --result /tmp/worker-result.json --json
 subreview install-skills --plan --target all --json
 subreview install-skills --install --target all --json --install-root /tmp/subreview-stage
@@ -54,7 +55,7 @@ The installed skills are intentionally thin. They tell agents to invoke the CLI,
 
 `subreview obligations build` creates a CAS-backed coverage manifest from captured base-to-proposal and base-to-final diffs plus the bound policy. The manifest records hunk, file, path, gate-requirement, context-request placeholder, and policy-final-review obligations. `subreview obligations status` reports unsatisfied evidence slots and explicit blockers for missing gate evidence, missing review evidence, unresolved context, unresolved anchors, hidden final-state scope, and unsatisfied required checks. Story 007 intentionally records future evidence slots without importing review, gate, verification, or refutation adapters yet.
 
-`subreview packet build --kind primary` creates a CAS-backed primary review packet and Markdown prompt from the latest coverage manifest. Packets separate stable prefix and volatile suffix digests, include semantic dedupe keys, run-kind and route metadata, leakage checks for replay/evaluation labels, compact selected context, explicit omissions, and token telemetry fields for later worker result import.
+`subreview packet build --kind primary` creates a CAS-backed primary review packet and Markdown prompt from the latest coverage manifest. `subreview packet build --kind verification --finding <id>` creates a finding-targeted proposal-to-final verification packet when proposal and final snapshots plus a proposal-to-final diff are captured. Packets separate stable prefix and volatile suffix digests, include semantic dedupe keys, run-kind and route metadata, leakage checks for replay/evaluation labels, compact selected context, explicit omissions, and token telemetry fields for later worker result import.
 
 `subreview result import` ingests a bounded structured worker result for a built packet. It normalizes clean reviews, findings, context requests, verifier outcomes, deterministic refutations, and token telemetry into CAS, deduplicates findings, records lifecycle states, and lets `subreview obligations status` consume primary-review and deterministic-refutation evidence without treating open findings as closed.
 

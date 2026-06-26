@@ -70,7 +70,7 @@ func usage(w io.Writer) {
   subreview install-skills [--plan|--install|--uninstall] [--target tools|claude|codex|all] [--json] [--install-root <dir>]
   subreview obligations build --state <dir> [--json]
   subreview obligations status --state <dir> [--json]
-  subreview packet build --state <dir> --kind primary [--json]
+  subreview packet build --state <dir> --kind <primary|verification> [--finding <id>] [--route targeted_verification] [--json]
   subreview policy check --config <path> --repo <path> [--json]
   subreview policy bind --state <dir> --config <path> --profile <name> [--json]
   subreview policy explain --state <dir> --profile <name> [--json]
@@ -107,6 +107,8 @@ func packetBuild(args []string) error {
 	fs.SetOutput(io.Discard)
 	stateDir := fs.String("state", "", "Explicit state directory")
 	kind := fs.String("kind", packet.KindPrimary, "Packet kind")
+	findingID := fs.String("finding", "", "Finding id for verification packets")
+	route := fs.String("route", "", "Optional packet route")
 	asJSON := fs.Bool("json", false, "Emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -114,7 +116,7 @@ func packetBuild(args []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("packet build does not accept positional arguments")
 	}
-	result, err := packet.Build(packet.BuildOptions{StateDir: *stateDir, Kind: *kind})
+	result, err := packet.Build(packet.BuildOptions{StateDir: *stateDir, Kind: *kind, FindingID: *findingID, Route: *route})
 	if err != nil {
 		return err
 	}
@@ -127,14 +129,14 @@ func packetBuild(args []string) error {
 
 func usagePacket(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  subreview packet build --state <dir> --kind primary [--json]`)
+  subreview packet build --state <dir> --kind <primary|verification> [--finding <id>] [--route targeted_verification] [--json]`)
 }
 
 func usagePacketBuild(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  subreview packet build --state <dir> --kind primary [--json]
+  subreview packet build --state <dir> --kind <primary|verification> [--finding <id>] [--route targeted_verification] [--json]
 
-Builds a canonical primary review packet with stable and volatile prompt sections.`)
+Builds a canonical primary or finding-targeted verification packet with stable and volatile prompt sections.`)
 }
 
 func resultCommand(args []string) error {
