@@ -260,11 +260,12 @@ func Evaluate(opts EvaluateOptions) (Result, error) {
 		}
 	}
 
-	findingFacts := findingFacts(observations, status.Manifest.Digest)
-	runFacts, tokens := runAndTokenFacts(observations, status.Manifest.Digest)
+	proposalDigest := proposalTargetDigest(manifest)
+	findingFacts := findingFacts(observations, status.Manifest.Digest, proposalDigest)
+	runFacts, tokens := runAndTokenFacts(observations, status.Manifest.Digest, proposalDigest)
 	obligationFacts := obligationFacts(status)
 	gateFacts := gateFacts(gateEvidence, obligationFacts.RequiredGateCount)
-	facts := factsFromEvidence(status, manifest, observations, status.Manifest.Digest, findingFacts, blockers)
+	facts := factsFromEvidence(status, manifest, observations, status.Manifest.Digest, proposalDigest, findingFacts)
 	scheduler := schedulerFacts(effective, runFacts)
 	if scheduler.OverLimit {
 		blockers = append(blockers, Blocker{
@@ -273,6 +274,7 @@ func Evaluate(opts EvaluateOptions) (Result, error) {
 		})
 	}
 	blockers = append(blockers, policyFactBlockers(effective, facts)...)
+	blockers = append(blockers, closureBasisBlockers(effective.ClosureBasis, facts)...)
 	closed := status.Closed && facts.PolicyBound && len(blockers) == 0
 
 	sortBlockers(blockers)
@@ -381,17 +383,20 @@ func readEffectivePolicy(store state.Store, manifest obligation.CoverageManifest
 	return effective, nil
 }
 
-func factsFromEvidence(status obligation.StatusResult, manifest obligation.CoverageManifest, observations []reviewresult.EvidenceObservation, manifestDigest string, findings FindingFacts, blockers []Blocker) Facts {
+func factsFromEvidence(status obligation.StatusResult, manifest obligation.CoverageManifest, observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest string, findings FindingFacts) Facts {
 	_, hasPrimary := reviewresult.LatestPrimaryReviewForManifest(observations, manifestDigest)
+	if !hasPrimary && proposalDigest != "" {
+		_, hasPrimary = reviewresult.LatestPrimaryReviewForTargetState(observations, proposalDigest)
+	}
 	_, hasFinal := reviewresult.LatestIndependentFinalReviewForManifest(observations, manifestDigest)
-	evidence := evidenceFacts(observations, manifestDigest)
+	evidence := evidenceFacts(observations, manifestDigest, proposalDigest)
 	facts := Facts{
 		PolicyBound:                    manifest.Policy != nil,
 		RequiredGatesSatisfied:         obligationsSatisfied(status, obligation.KindGateRequirement),
 		PrimaryReviewCompleted:         hasPrimary,
 		BlockingFindingsVerified:       findings.OpenBlockingCount == 0,
 		CoverageObligationsSatisfied:   coverageSatisfied(status),
-		ContextRequestsResolved:        !hasBlockerCode(blockers, "needs_context"),
+		ContextRequestsResolved:        contextRequestsResolved(observations, manifestDigest),
 		IndependentFinalCompleted:      hasFinal,
 		FreshBlindedReview:             evidence.FreshBlindedReview,
 		CLIWitnessed:                   evidence.CLIWitnessed,
@@ -404,11 +409,22 @@ func factsFromEvidence(status obligation.StatusResult, manifest obligation.Cover
 	return facts
 }
 
-func evidenceFacts(observations []reviewresult.EvidenceObservation, manifestDigest string) Facts {
+func contextRequestsResolved(observations []reviewresult.EvidenceObservation, manifestDigest string) bool {
+	for _, observation := range observations {
+		record := observation.Record
+		if record.Packet.CoverageManifest.Digest != manifestDigest || record.RunKind != reviewresult.RunKindDiscovery {
+			continue
+		}
+		return record.Outcome != reviewresult.OutcomeNeedsContext && len(record.NeedsContext) == 0
+	}
+	return true
+}
+
+func evidenceFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest string) Facts {
 	facts := Facts{}
 	for _, observation := range observations {
 		record := observation.Record
-		if record.Packet.CoverageManifest.Digest != manifestDigest {
+		if !closureObservationApplies(record, manifestDigest, proposalDigest) {
 			continue
 		}
 		if record.RunKind == reviewresult.RunKindDiscovery && record.Route == reviewresult.RoutePrimaryReview && record.Outcome == reviewresult.OutcomeClean {
@@ -434,6 +450,22 @@ func evidenceFacts(observations []reviewresult.EvidenceObservation, manifestDige
 	return facts
 }
 
+func closureObservationApplies(record reviewresult.ResultRecord, manifestDigest, proposalDigest string) bool {
+	if record.Packet.CoverageManifest.Digest == manifestDigest {
+		return true
+	}
+	return record.Evidence.PrimaryReviewEvidence && proposalDigest != "" && record.Packet.TargetState.Digest == proposalDigest
+}
+
+func proposalTargetDigest(manifest obligation.CoverageManifest) string {
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == "base" && diff.ToKind == "proposal" {
+			return diff.ToSnapshot
+		}
+	}
+	return ""
+}
+
 func policyFactBlockers(effective policy.EffectivePolicy, facts Facts) []Blocker {
 	blockers := []Blocker{}
 	for _, fact := range effective.RequiredEvidenceFacts {
@@ -447,6 +479,49 @@ func policyFactBlockers(effective policy.EffectivePolicy, facts Facts) []Blocker
 		})
 	}
 	return blockers
+}
+
+func closureBasisBlockers(basis policy.ClosureBasis, facts Facts) []Blocker {
+	allowed := map[string]struct{}{}
+	for _, item := range basis.AllowedBasis {
+		allowed[strings.TrimSpace(item)] = struct{}{}
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	for item := range allowed {
+		if basisSatisfied(item, facts) {
+			return nil
+		}
+	}
+	return []Blocker{{
+		Code:    "unsatisfied_closure_basis",
+		Message: "no allowed closure basis is satisfied: " + strings.Join(sortedBasis(allowed), ", "),
+	}}
+}
+
+func basisSatisfied(basis string, facts Facts) bool {
+	switch basis {
+	case "clean":
+		return facts.BasisClean
+	case "fixed":
+		return facts.BasisFixed
+	case "accepted_risk":
+		return facts.BasisAcceptedRisk
+	case "deterministic_refutation":
+		return facts.BasisDeterministicRefutation
+	default:
+		return false
+	}
+}
+
+func sortedBasis(values map[string]struct{}) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func factSatisfied(fact string, facts Facts) bool {
@@ -561,11 +636,11 @@ func gateFacts(evidence map[string][]gate.EvidenceObservation, requiredCount int
 	return facts
 }
 
-func findingFacts(observations []reviewresult.EvidenceObservation, manifestDigest string) FindingFacts {
+func findingFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest string) FindingFacts {
 	facts := FindingFacts{ActiveBlockingFindings: []FindingBlocker{}}
 	for _, observation := range observations {
 		record := observation.Record
-		if record.Packet.CoverageManifest.Digest != manifestDigest {
+		if !closureObservationApplies(record, manifestDigest, proposalDigest) {
 			continue
 		}
 		for _, finding := range record.Findings {
@@ -576,7 +651,7 @@ func findingFacts(observations []reviewresult.EvidenceObservation, manifestDiges
 		facts.VerifierOutcomeCount += len(record.VerifierOutcomes)
 		facts.DeterministicRefutes += len(record.DeterministicRefutations)
 	}
-	blockers := reviewresult.ActiveFindingBlockers(observations, manifestDigest)
+	blockers := reviewresult.ClosureFindingBlockers(observations, manifestDigest)
 	facts.OpenBlockingCount = len(blockers)
 	for _, blocker := range blockers {
 		facts.ActiveBlockingFindings = append(facts.ActiveBlockingFindings, FindingBlocker{
@@ -592,12 +667,12 @@ func findingFacts(observations []reviewresult.EvidenceObservation, manifestDiges
 	return facts
 }
 
-func runAndTokenFacts(observations []reviewresult.EvidenceObservation, manifestDigest string) (RunFacts, TokenFacts) {
+func runAndTokenFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest string) (RunFacts, TokenFacts) {
 	runs := RunFacts{ByRoute: map[string]int{}}
 	tokens := TokenFacts{}
 	for _, observation := range observations {
 		record := observation.Record
-		if record.Packet.CoverageManifest.Digest != manifestDigest {
+		if !closureObservationApplies(record, manifestDigest, proposalDigest) {
 			continue
 		}
 		runs.ByRoute[record.Route]++

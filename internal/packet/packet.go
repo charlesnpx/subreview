@@ -1804,15 +1804,23 @@ func latestFindingForVerification(store state.Store, events []state.Event, repo,
 	if err != nil {
 		return reviewresult.FindingRecord{}, err
 	}
+	var carried *reviewresult.FindingRecord
 	for _, observation := range observations {
-		if observation.Record.Packet.CoverageManifest.Digest != manifestDigest {
-			continue
-		}
 		for _, finding := range observation.Record.Findings {
-			if finding.ID == findingID && finding.Accepted {
+			if finding.ID != findingID || !finding.Accepted {
+				continue
+			}
+			if observation.Record.Packet.CoverageManifest.Digest == manifestDigest {
 				return finding, nil
 			}
+			if carried == nil {
+				value := finding
+				carried = &value
+			}
 		}
+	}
+	if carried != nil {
+		return *carried, nil
 	}
 	return reviewresult.FindingRecord{}, fmt.Errorf("accepted finding not found for verification: %s", findingID)
 }

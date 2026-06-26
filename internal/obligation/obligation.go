@@ -324,7 +324,6 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		return StatusResult{}, err
 	}
 	blockers = append(blockers, freshnessBlockers...)
-	blockers = append(blockers, contextBlockers(events)...)
 	anchorBlockers, err := unresolvedAnchorBlockers(store, events, binding.Repo, manifest.SourceDiffs)
 	if err != nil {
 		return StatusResult{}, err
@@ -339,8 +338,14 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		return StatusResult{}, err
 	}
 	primaryReviewEvidence, hasPrimaryReviewEvidence := reviewresult.LatestPrimaryReviewForManifest(resultEvidence, manifestRef.Digest)
+	if !hasPrimaryReviewEvidence {
+		if proposalDigest := proposalTargetDigest(manifest); proposalDigest != "" {
+			primaryReviewEvidence, hasPrimaryReviewEvidence = reviewresult.LatestPrimaryReviewForTargetState(resultEvidence, proposalDigest)
+		}
+	}
 	independentFinalEvidence, hasIndependentFinalEvidence := reviewresult.LatestIndependentFinalReviewForManifest(resultEvidence, manifestRef.Digest)
-	for _, finding := range reviewresult.ActiveFindingBlockers(resultEvidence, manifestRef.Digest) {
+	blockers = append(blockers, contextBlockers(resultEvidence, manifestRef.Digest)...)
+	for _, finding := range reviewresult.ClosureFindingBlockers(resultEvidence, manifestRef.Digest) {
 		blockers = append(blockers, Blocker{
 			Code:    "open_finding",
 			Message: "blocking finding remains " + finding.State + ": " + finding.Claim,
@@ -489,6 +494,15 @@ func requiredGateSnapshot(manifest CoverageManifest) (string, string) {
 		}
 	}
 	return "", ""
+}
+
+func proposalTargetDigest(manifest CoverageManifest) string {
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == "base" && diff.ToKind == "proposal" {
+			return diff.ToSnapshot
+		}
+	}
+	return ""
 }
 
 func gateEvidenceMatchesPolicy(evidence gate.EvidenceRecord, manifestPolicy *PolicyRef) bool {
@@ -1226,17 +1240,21 @@ func transitionKey(fromKind, toKind, fromSnapshot, toSnapshot string) string {
 	return fromKind + "\x00" + toKind + "\x00" + fromSnapshot + "\x00" + toSnapshot
 }
 
-func contextBlockers(events []state.Event) []Blocker {
-	blockers := []Blocker{}
-	for _, event := range events {
-		if event.Type == "context.requested" || event.Type == "review.needs_context" || event.Details["needs_context"] == "true" {
-			blockers = append(blockers, Blocker{
-				Code:    "needs_context",
-				Message: "a context request is recorded and must be resolved before closure",
-			})
+func contextBlockers(observations []reviewresult.EvidenceObservation, manifestDigest string) []Blocker {
+	for _, observation := range observations {
+		record := observation.Record
+		if record.Packet.CoverageManifest.Digest != manifestDigest || record.RunKind != reviewresult.RunKindDiscovery {
+			continue
 		}
+		if record.Outcome == reviewresult.OutcomeNeedsContext || len(record.NeedsContext) > 0 {
+			return []Blocker{{
+				Code:    "needs_context",
+				Message: "latest discovery review requested context and must be resolved before closure",
+			}}
+		}
+		return nil
 	}
-	return blockers
+	return nil
 }
 
 func stateBindingFromState(stateDir string) (stateBinding, error) {

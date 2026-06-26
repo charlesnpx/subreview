@@ -911,21 +911,11 @@ func TestCloseCLIEndToEndSmoke(t *testing.T) {
 	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "proposal", "--json").CombinedOutput(); err != nil {
 		t.Fatalf("diff base->proposal failed: %v\n%s", err, out)
 	}
-	writeCLIFile(t, repo, "alpha.txt", "one\nfixed\n")
-	if out, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "final", "--repo", repo, "--json").CombinedOutput(); err != nil {
-		t.Fatalf("snapshot final failed: %v\n%s", err, out)
-	}
-	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "final", "--json").CombinedOutput(); err != nil {
-		t.Fatalf("diff base->final failed: %v\n%s", err, out)
-	}
-	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "proposal", "--to", "final", "--json").CombinedOutput(); err != nil {
-		t.Fatalf("diff proposal->final failed: %v\n%s", err, out)
-	}
 	if out, err := exec.Command(bin, "obligations", "build", "--state", stateDir, "--json").CombinedOutput(); err != nil {
-		t.Fatalf("obligations build failed: %v\n%s", err, out)
+		t.Fatalf("proposal obligations build failed: %v\n%s", err, out)
 	}
-	if out, err := exec.Command(bin, "gates", "run", "--state", stateDir, "--catalog", catalogPath, "--command-id", "go_test_all", "--snapshot", "final", "--json").CombinedOutput(); err != nil {
-		t.Fatalf("gate run failed: %v\n%s", err, out)
+	if out, err := exec.Command(bin, "gates", "run", "--state", stateDir, "--catalog", catalogPath, "--command-id", "go_test_all", "--snapshot", "proposal", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("proposal gate run failed: %v\n%s", err, out)
 	}
 	packetOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "primary", "--json").CombinedOutput()
 	if err != nil {
@@ -966,6 +956,22 @@ func TestCloseCLIEndToEndSmoke(t *testing.T) {
 	}), "--json").CombinedOutput()
 	if err != nil {
 		t.Fatalf("finding result import failed: %v\n%s", err, findingOut)
+	}
+	writeCLIFile(t, repo, "alpha.txt", "one\nfixed\n")
+	if out, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "final", "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("snapshot final failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "final", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("diff base->final failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "proposal", "--to", "final", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("diff proposal->final failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "obligations", "build", "--state", stateDir, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("final obligations build failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "gates", "run", "--state", stateDir, "--catalog", catalogPath, "--command-id", "go_test_all", "--snapshot", "final", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("final gate run failed: %v\n%s", err, out)
 	}
 	verificationOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "verification", "--finding", "finding-close", "--json").CombinedOutput()
 	if err != nil {
@@ -1066,7 +1072,7 @@ func TestCloseCLIEndToEndSmoke(t *testing.T) {
 	if !closeResult.Facts.RequiredGatesSatisfied || !closeResult.Facts.PrimaryReviewCompleted || !closeResult.Facts.BlockingFindingsVerified || !closeResult.Facts.CoverageObligationsSatisfied || !closeResult.Facts.ContextRequestsResolved || !closeResult.Facts.BasisFixed || !closeResult.Facts.FreshBlindedReview || !closeResult.Facts.CLIWitnessed {
 		t.Fatalf("closure facts incomplete: %s", closeOut)
 	}
-	if closeResult.Gates.RequiredCount != 1 || closeResult.Gates.PassCount != 1 || closeResult.Findings.AcceptedCount != 1 || closeResult.Findings.OpenBlockingCount != 0 {
+	if closeResult.Gates.RequiredCount != 1 || closeResult.Gates.PassCount != 2 || closeResult.Findings.AcceptedCount != 1 || closeResult.Findings.OpenBlockingCount != 0 {
 		t.Fatalf("bad gate/finding report: %s", closeOut)
 	}
 	if closeResult.Runs.DiscoveryRuns != 1 || closeResult.Runs.VerificationRuns != 1 || closeResult.Runs.PrimaryRuns != 1 || closeResult.Runs.TargetedVerifications != 1 {

@@ -139,8 +139,76 @@ func TestEvaluateClosesFromLedgerFactsAndRejectsWrongProfile(t *testing.T) {
 	}
 }
 
+func TestEvaluateEnforcesAllowedClosureBasis(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initClosureGitRepo(t, repo)
+	writeClosureFile(t, repo, "alpha.txt", "one\n")
+	runClosureGit(t, repo, "add", ".")
+	runClosureGit(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo}); err != nil {
+		t.Fatalf("Init state: %v", err)
+	}
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writeClosurePolicyWithBasis(t, root, []string{"fixed"}), Profile: "default"}); err != nil {
+		t.Fatalf("Bind policy: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	writeClosureFile(t, repo, "alpha.txt", "one\ntwo\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build obligations: %v", err)
+	}
+	primary, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary})
+	if err != nil {
+		t.Fatalf("Build primary packet: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: primary.Packet.Digest,
+		ResultPath: writeClosureWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        primary.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable findings.",
+		}),
+	}); err != nil {
+		t.Fatalf("Import clean result: %v", err)
+	}
+	blocked, err := closure.Evaluate(closure.EvaluateOptions{StateDir: stateDir, PolicyProfile: "default"})
+	if err != nil {
+		t.Fatalf("Evaluate closure: %v", err)
+	}
+	if blocked.Closed || !blocked.Facts.BasisClean || blocked.Facts.BasisFixed || !hasClosureBlocker(blocked.Blockers, "unsatisfied_closure_basis") {
+		t.Fatalf("fixed-only closure basis should reject clean-only evidence: %+v", blocked)
+	}
+}
+
 func writeClosurePolicy(t *testing.T, root string) string {
+	return writeClosurePolicyWithBasis(t, root, []string{"clean", "fixed", "deterministic_refutation"})
+}
+
+func writeClosurePolicyWithBasis(t *testing.T, root string, allowed []string) string {
 	t.Helper()
+	allowedBody, err := json.Marshal(allowed)
+	if err != nil {
+		t.Fatalf("marshal allowed basis: %v", err)
+	}
 	body := []byte(`{
   "schema_version": 1,
   "policy_id": "test-policy",
@@ -150,7 +218,7 @@ func writeClosurePolicy(t *testing.T, root string) string {
       "route_limits": {"primary_semantic_reviews": 1, "targeted_verifications": 1, "fresh_final_reviews": 0, "context_expansion_rounds": 1},
       "required_evidence_facts": ["primary_review_completed", "blocking_findings_verified", "coverage_obligations_satisfied", "policy_bound"],
       "risk_routing": [],
-      "closure_basis": {"allowed_basis": ["clean", "fixed", "deterministic_refutation"], "require_basis_for_unresolved": true}
+      "closure_basis": {"allowed_basis": ` + string(allowedBody) + `, "require_basis_for_unresolved": true}
     }
   }
 }`)

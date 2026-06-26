@@ -496,6 +496,19 @@ func LatestPrimaryReviewForManifest(observations []EvidenceObservation, manifest
 	return EvidenceObservation{}, false
 }
 
+func LatestPrimaryReviewForTargetState(observations []EvidenceObservation, targetDigest string) (EvidenceObservation, bool) {
+	for _, observation := range observations {
+		record := observation.Record
+		if record.Packet.TargetState.Digest != targetDigest {
+			continue
+		}
+		if record.Evidence.PrimaryReviewEvidence {
+			return observation, true
+		}
+	}
+	return EvidenceObservation{}, false
+}
+
 func LatestIndependentFinalReviewForManifest(observations []EvidenceObservation, manifestDigest string) (EvidenceObservation, bool) {
 	for _, observation := range observations {
 		record := observation.Record
@@ -526,6 +539,14 @@ func DeterministicRefutationsForObligation(observations []EvidenceObservation, m
 }
 
 func ActiveFindingBlockers(observations []EvidenceObservation, manifestDigest string) []FindingBlocker {
+	return findingBlockers(observations, manifestDigest, false)
+}
+
+func ClosureFindingBlockers(observations []EvidenceObservation, manifestDigest string) []FindingBlocker {
+	return findingBlockers(observations, manifestDigest, true)
+}
+
+func findingBlockers(observations []EvidenceObservation, manifestDigest string, carryForward bool) []FindingBlocker {
 	type lifecycle struct {
 		finding FindingRecord
 		state   string
@@ -536,7 +557,7 @@ func ActiveFindingBlockers(observations []EvidenceObservation, manifestDigest st
 	for i := len(observations) - 1; i >= 0; i-- {
 		observation := observations[i]
 		record := observation.Record
-		if record.Packet.CoverageManifest.Digest != manifestDigest {
+		if !carryForward && record.Packet.CoverageManifest.Digest != manifestDigest {
 			continue
 		}
 		for _, finding := range record.Findings {

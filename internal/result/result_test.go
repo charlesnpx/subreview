@@ -531,6 +531,58 @@ func TestFindingNeedsContextDoesNotCreatePermanentContextBlocker(t *testing.T) {
 	}
 }
 
+func TestTopLevelNeedsContextCanBeResolvedByLaterDiscovery(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeNeedsContext,
+			NeedsContext: []reviewresult.ContextRequest{{
+				Question: "Please include alpha_test.txt.",
+				Reason:   "The reviewer needs nearby test coverage.",
+				Paths:    []string{"alpha_test.txt"},
+			}},
+		}),
+		Now: time.Unix(238, 0),
+	}); err != nil {
+		t.Fatalf("Import needs-context result: %v", err)
+	}
+	blocked, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status after context request: %v", err)
+	}
+	if !hasStatusBlocker(blocked, "needs_context") {
+		t.Fatalf("top-level needs-context result should block closure: %+v", blocked.Blockers)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "The requested context is now sufficient.",
+		}),
+		Now: time.Unix(239, 0),
+	}); err != nil {
+		t.Fatalf("Import resolving clean result: %v", err)
+	}
+	resolved, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status after resolved context: %v", err)
+	}
+	if hasStatusBlocker(resolved, "needs_context") {
+		t.Fatalf("later discovery result should resolve top-level context request: %+v", resolved.Blockers)
+	}
+}
+
 func TestVerificationOutcomeVocabularyMapsToLifecycle(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	if _, err := reviewresult.Import(reviewresult.ImportOptions{
