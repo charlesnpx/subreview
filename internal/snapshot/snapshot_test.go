@@ -76,6 +76,30 @@ func TestCaptureRestoreAndDiffCommittedAndUncommittedSnapshots(t *testing.T) {
 			t.Fatalf("patch missing %q:\n%s", want, patch)
 		}
 	}
+	writeFile(t, repo, "alpha.txt", "three\n")
+	writeFile(t, repo, "new.txt", "new\n")
+	writeFile(t, repo, "done.txt", "done\n")
+	final, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"})
+	if err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if !final.Dirty || final.CommitSHA != "" || final.EntryCount != 3 || final.Snapshot.Digest == "" {
+		t.Fatalf("bad final snapshot: %+v", final)
+	}
+	proposalToFinal, err := CreateDiff(DiffOptions{StateDir: stateDir, FromKind: "proposal", ToKind: "final"})
+	if err != nil {
+		t.Fatalf("CreateDiff proposal->final: %v", err)
+	}
+	if !proposalToFinal.HasChanges || proposalToFinal.FromSnapshot != proposal.Snapshot.Digest || proposalToFinal.ToSnapshot != final.Snapshot.Digest {
+		t.Fatalf("bad proposal->final diff: %+v", proposalToFinal)
+	}
+	baseToFinal, err := CreateDiff(DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"})
+	if err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if !baseToFinal.HasChanges || baseToFinal.FromSnapshot != base.Snapshot.Digest || baseToFinal.ToSnapshot != final.Snapshot.Digest {
+		t.Fatalf("bad base->final diff: %+v", baseToFinal)
+	}
 	validation := state.Validate(stateDir)
 	if !validation.OK {
 		t.Fatalf("state should validate: %+v", validation.Errors)
@@ -151,6 +175,87 @@ func TestRestoreRejectsSnapshotEventTreeMismatch(t *testing.T) {
 	}
 }
 
+func TestRestoreRejectsSnapshotEventMissingPinnedBlobDigest(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "alpha.txt", "one\n")
+	git(t, repo, "add", "alpha.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	captured, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
+	if err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "snapshot.captured",
+		ObjectDigests: []string{captured.Snapshot.Digest, captured.Tree.Digest},
+		Repo:          repo,
+		Details: map[string]string{
+			"kind":     "base",
+			"snapshot": captured.Snapshot.Digest,
+			"tree":     captured.Tree.Digest,
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	_, err = Restore(RestoreOptions{StateDir: stateDir, Kind: "base", Output: filepath.Join(root, "restore")})
+	if err == nil || !strings.Contains(err.Error(), "does not pin tree entry digest") {
+		t.Fatalf("expected missing pinned blob error, got %v", err)
+	}
+}
+
+func TestRestoreDoesNotPartiallyWriteWhenBlobIsMissing(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "a.txt", "a\n")
+	writeFile(t, repo, "b.txt", "b\n")
+	git(t, repo, "add", "a.txt", "b.txt")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	captured, err := Capture(CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
+	if err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	treeBody, err := store.Read(captured.Tree.Digest)
+	if err != nil {
+		t.Fatalf("read tree: %v", err)
+	}
+	var tree TreeManifest
+	if err := decodeStrict(treeBody, &tree); err != nil {
+		t.Fatalf("decode tree: %v", err)
+	}
+	if len(tree.Entries) != 2 {
+		t.Fatalf("bad setup entries=%+v", tree.Entries)
+	}
+	missingPath := objectPathForTest(stateDir, tree.Entries[1].Digest)
+	if err := os.Remove(missingPath); err != nil {
+		t.Fatalf("remove object: %v", err)
+	}
+	restoreDir := filepath.Join(root, "restore")
+	err = restoreEntries(store, tree.Entries, restoreDir)
+	if err == nil {
+		t.Fatal("expected missing blob restore failure")
+	}
+	if _, statErr := os.Stat(filepath.Join(restoreDir, "a.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("restore should not partially write a.txt, stat err=%v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(restoreDir, "b.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("restore should not partially write b.txt, stat err=%v", statErr)
+	}
+}
+
 func TestCaptureRejectsStateInsideRepo(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "repo")
 	stateDir := filepath.Join(repo, "subreview-state")
@@ -203,4 +308,9 @@ func readFile(t *testing.T, root, rel string) string {
 		t.Fatalf("read %s: %v", rel, err)
 	}
 	return string(body)
+}
+
+func objectPathForTest(stateDir, digest string) string {
+	hexDigest := strings.TrimPrefix(digest, "sha256:")
+	return filepath.Join(stateDir, "objects", "sha256", hexDigest[:2], hexDigest)
 }

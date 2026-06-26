@@ -132,9 +132,15 @@ type stateBinding struct {
 }
 
 type snapshotBinding struct {
-	Digest string
-	Kind   string
-	Tree   string
+	Digest  string
+	Kind    string
+	Tree    string
+	Objects []string
+}
+
+type verifiedEntry struct {
+	Entry TreeEntry
+	Body  []byte
 }
 
 func Capture(opts CaptureOptions) (CaptureResult, error) {
@@ -206,9 +212,10 @@ func Capture(opts CaptureOptions) (CaptureResult, error) {
 	if err != nil {
 		return CaptureResult{}, err
 	}
+	objectDigests := snapshotObjectDigests(snapshotRef.Digest, tree.Digest, entries)
 	event, err := state.AppendEvent(stateDir, state.Event{
 		Type:          "snapshot.captured",
-		ObjectDigests: []string{snapshotRef.Digest, tree.Digest},
+		ObjectDigests: objectDigests,
 		Repo:          repo,
 		Details: map[string]string{
 			"kind":            opts.Kind,
@@ -609,12 +616,20 @@ func latestSnapshotBinding(stateDir, kind string) (snapshotBinding, error) {
 		if strings.TrimSpace(digest) == "" || strings.TrimSpace(tree) == "" {
 			return snapshotBinding{}, fmt.Errorf("malformed snapshot.captured event for kind %s", kind)
 		}
-		if len(event.ObjectDigests) != 2 || !containsDigest(event.ObjectDigests, digest) || !containsDigest(event.ObjectDigests, tree) {
+		if len(event.ObjectDigests) < 2 || !containsDigest(event.ObjectDigests, digest) || !containsDigest(event.ObjectDigests, tree) {
 			return snapshotBinding{}, fmt.Errorf("malformed snapshot.captured event for kind %s: object_digests must include snapshot and tree", kind)
 		}
-		return snapshotBinding{Digest: digest, Kind: kind, Tree: tree}, nil
+		return snapshotBinding{Digest: digest, Kind: kind, Tree: tree, Objects: append([]string(nil), event.ObjectDigests...)}, nil
 	}
 	return snapshotBinding{}, fmt.Errorf("snapshot kind is not captured in state: %s", kind)
+}
+
+func snapshotObjectDigests(snapshotDigest, treeDigest string, entries []TreeEntry) []string {
+	digests := []string{snapshotDigest, treeDigest}
+	for _, entry := range entries {
+		digests = append(digests, entry.Digest)
+	}
+	return digests
 }
 
 func containsDigest(values []string, digest string) bool {
@@ -659,6 +674,9 @@ func readSnapshot(store state.Store, binding snapshotBinding, kind string) (Snap
 		if err := validateTreeEntry(entry); err != nil {
 			return SnapshotRecord{}, nil, err
 		}
+		if !containsDigest(binding.Objects, entry.Digest) {
+			return SnapshotRecord{}, nil, fmt.Errorf("snapshot.captured event for kind %s does not pin tree entry digest %s", kind, entry.Digest)
+		}
 	}
 	return record, tree.Entries, nil
 }
@@ -702,6 +720,7 @@ func validateTreeEntry(entry TreeEntry) error {
 }
 
 func restoreEntries(store state.Store, entries []TreeEntry, output string) error {
+	verified := make([]verifiedEntry, 0, len(entries))
 	for _, entry := range entries {
 		rel, err := cleanRepoPath(entry.Path)
 		if err != nil {
@@ -713,6 +732,15 @@ func restoreEntries(store state.Store, entries []TreeEntry, output string) error
 		}
 		if int64(len(body)) != entry.Size {
 			return fmt.Errorf("tree entry size mismatch for %s", rel)
+		}
+		verified = append(verified, verifiedEntry{Entry: entry, Body: body})
+	}
+	for _, item := range verified {
+		entry := item.Entry
+		body := item.Body
+		rel, err := cleanRepoPath(entry.Path)
+		if err != nil {
+			return err
 		}
 		path := filepath.Join(output, filepath.FromSlash(rel))
 		parent := filepath.Dir(path)
