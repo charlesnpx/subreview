@@ -51,6 +51,20 @@ func TestStateInitAndValidateCLI(t *testing.T) {
 	}
 }
 
+func TestHelpLiteralIsAcceptedAsFlagValue(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "subreview")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build subreview: %v\n%s", err, out)
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "help")
+	stateDir := filepath.Join(root, "state")
+	initCLIGitRepo(t, repo)
+	if out, err := exec.Command(bin, "state", "init", "--state", stateDir, "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("state init should accept repo path ending in help: %v\n%s", err, out)
+	}
+}
+
 func TestPolicyCheckBindAndExplainCLI(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "subreview")
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
@@ -229,6 +243,64 @@ func TestSnapshotCaptureRestoreAndDiffCLI(t *testing.T) {
 	}
 	if diff.FromSnapshot != base.Snapshot.Digest || diff.ToSnapshot != proposal.Snapshot.Digest || !diff.HasChanges || diff.Patch.Digest == "" {
 		t.Fatalf("bad diff output: %s", diffOut)
+	}
+
+	anchorsPath := filepath.Join(root, "anchors.json")
+	if err := os.WriteFile(anchorsPath, []byte(`{
+  "schema_version": 1,
+  "anchors": [
+    {"id": "alpha-file", "kind": "file", "path": "alpha.txt"},
+    {"id": "missing-file", "kind": "file", "path": "missing.txt"}
+  ]
+}`), 0o644); err != nil {
+		t.Fatalf("write anchors manifest: %v", err)
+	}
+	anchorsOut, err := exec.Command(bin, "anchors", "migrate", "--state", stateDir, "--from", "base", "--to", "proposal", "--anchors", anchorsPath, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("anchors migrate failed: %v\n%s", err, anchorsOut)
+	}
+	var anchorsResult struct {
+		FromSnapshot string `json:"from_snapshot"`
+		ToSnapshot   string `json:"to_snapshot"`
+		EventID      string `json:"event_id"`
+		Diff         struct {
+			Path string `json:"path"`
+		} `json:"diff"`
+		Patch struct {
+			Path string `json:"path"`
+		} `json:"patch"`
+		Results []struct {
+			Anchor struct {
+				ID string `json:"id"`
+			} `json:"anchor"`
+			Status        string `json:"status"`
+			BlocksClosure bool   `json:"blocks_closure"`
+		} `json:"results"`
+		ClosureBlockers []struct {
+			AnchorID string `json:"anchor_id"`
+			Status   string `json:"status"`
+		} `json:"closure_blockers"`
+	}
+	if err := json.Unmarshal(anchorsOut, &anchorsResult); err != nil {
+		t.Fatalf("anchors output is not json: %v\n%s", err, anchorsOut)
+	}
+	if anchorsResult.FromSnapshot != base.Snapshot.Digest || anchorsResult.ToSnapshot != proposal.Snapshot.Digest || anchorsResult.EventID == "" || len(anchorsResult.Results) != 2 {
+		t.Fatalf("bad anchors output: %s", anchorsOut)
+	}
+	for _, path := range []string{anchorsResult.Diff.Path, anchorsResult.Patch.Path} {
+		if path == "" {
+			t.Fatalf("anchor migration emitted empty object path: %s", anchorsOut)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("anchor migration object path should exist %s: %v\n%s", path, err, anchorsOut)
+		}
+	}
+	statuses := map[string]string{}
+	for _, result := range anchorsResult.Results {
+		statuses[result.Anchor.ID] = result.Status
+	}
+	if statuses["alpha-file"] != "modified" || statuses["missing-file"] != "unresolved" || len(anchorsResult.ClosureBlockers) != 1 || anchorsResult.ClosureBlockers[0].AnchorID != "missing-file" {
+		t.Fatalf("bad anchor migration statuses: %s", anchorsOut)
 	}
 
 	restoreDir := filepath.Join(root, "restore")

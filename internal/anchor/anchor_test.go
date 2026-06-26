@@ -1,0 +1,340 @@
+package anchor
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/charlesnpx/subreview/internal/snapshot"
+	"github.com/charlesnpx/subreview/internal/state"
+)
+
+type goldenAnchorResult struct {
+	ID            string   `json:"id"`
+	Status        string   `json:"status"`
+	ToPath        string   `json:"to_path,omitempty"`
+	ToStartLine   int      `json:"to_start_line,omitempty"`
+	ToEndLine     int      `json:"to_end_line,omitempty"`
+	Candidates    []string `json:"candidates,omitempty"`
+	BlocksClosure bool     `json:"blocks_closure"`
+}
+
+func TestAnchorMigrationGoldenCases(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "edit.txt", "alpha\nbeta\ngamma\n")
+	writeFile(t, repo, "adjacent.txt", "keep\nanchor\nend\n")
+	writeFile(t, repo, "delete.txt", "gone\n")
+	writeFile(t, repo, "rename-old.txt", "same\n")
+	writeFile(t, repo, "ambiguous.txt", "dup\n")
+	writeFile(t, repo, "source.txt", "move-me\nstay\n")
+	writeFile(t, repo, "copy-source.txt", "copy-me\n")
+	writeFile(t, repo, "file-copy.txt", "original\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+
+	writeFile(t, repo, "edit.txt", "alpha\nbeta changed\ngamma\n")
+	writeFile(t, repo, "adjacent.txt", "inserted\nkeep\nanchor\nend\n")
+	if err := os.Remove(filepath.Join(repo, "delete.txt")); err != nil {
+		t.Fatalf("remove delete.txt: %v", err)
+	}
+	if err := os.Rename(filepath.Join(repo, "rename-old.txt"), filepath.Join(repo, "rename-new.txt")); err != nil {
+		t.Fatalf("rename file: %v", err)
+	}
+	writeFile(t, repo, "ambiguous.txt", "dup\nmiddle\ndup\n")
+	writeFile(t, repo, "source.txt", "stay\n")
+	writeFile(t, repo, "dest.txt", "move-me\n")
+	writeFile(t, repo, "copy-dest.txt", "copy-me\n")
+	writeFile(t, repo, "file-copy.txt", "replacement\n")
+	writeFile(t, repo, "file-copy-moved.txt", "original\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff: %v", err)
+	}
+	result, err := Migrate(MigrateOptions{
+		StateDir:    stateDir,
+		FromKind:    "base",
+		ToKind:      "proposal",
+		WriteLedger: true,
+		Anchors: []Anchor{
+			{ID: "path_unchanged", Kind: KindPath, Path: "edit.txt"},
+			{ID: "file_modified", Kind: KindFile, Path: "edit.txt"},
+			{ID: "hunk_adjacent", Kind: KindHunk, Path: "adjacent.txt", StartLine: 2, EndLine: 2, Text: "anchor\n"},
+			{ID: "file_deleted", Kind: KindFile, Path: "delete.txt"},
+			{ID: "file_renamed", Kind: KindFile, Path: "rename-old.txt"},
+			{ID: "hunk_ambiguous", Kind: KindHunk, Path: "ambiguous.txt", StartLine: 1, EndLine: 1, Text: "dup\n"},
+			{ID: "hunk_moved_to_other_file", Kind: KindHunk, Path: "source.txt", StartLine: 1, EndLine: 1, Text: "move-me\n"},
+			{ID: "hunk_copied_elsewhere", Kind: KindHunk, Path: "copy-source.txt", StartLine: 1, EndLine: 1, Text: "copy-me\n"},
+			{ID: "file_replaced_and_copied", Kind: KindFile, Path: "file-copy.txt"},
+			{ID: "file_unresolved", Kind: KindFile, Path: "missing.txt"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if result.EventID == "" || result.Migration.Digest == "" || result.AnchorManifest.Digest == "" {
+		t.Fatalf("expected migration ledger and CAS refs: %+v", result)
+	}
+	if len(result.ClosureBlockers) != 4 {
+		t.Fatalf("expected ambiguous and unresolved closure blockers, got %+v", result.ClosureBlockers)
+	}
+	for _, blocker := range result.ClosureBlockers {
+		if blocker.Status != StatusAmbiguous && blocker.Status != StatusUnresolved {
+			t.Fatalf("unexpected blocker: %+v", blocker)
+		}
+	}
+	if validation := state.Validate(stateDir); !validation.OK {
+		t.Fatalf("state should validate: %+v", validation.Errors)
+	}
+
+	got := projectGoldenResults(result.Results)
+	gotJSON := marshalIndent(t, got)
+	want, err := os.ReadFile(filepath.Join("testdata", "golden", "migration_cases.json"))
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	if !bytes.Equal(bytes.TrimSpace(gotJSON), bytes.TrimSpace(want)) {
+		t.Fatalf("golden mismatch\nwant:\n%s\n\ngot:\n%s", want, gotJSON)
+	}
+}
+
+func TestMigrateRejectsEmptyAnchorInput(t *testing.T) {
+	_, err := Migrate(MigrateOptions{StateDir: "unused", FromKind: "base", ToKind: "proposal"})
+	if err == nil || !strings.Contains(err.Error(), "at least one anchor is required") {
+		t.Fatalf("expected empty anchor input error, got %v", err)
+	}
+}
+
+func TestNormalizeAnchorsStoresCleanPaths(t *testing.T) {
+	anchors, err := normalizeAnchors([]Anchor{{ID: "a", Kind: KindFile, Path: `dir\file.go`}})
+	if err != nil {
+		t.Fatalf("normalizeAnchors: %v", err)
+	}
+	if anchors[0].Path != "dir/file.go" {
+		t.Fatalf("expected slash-normalized anchor path, got %q", anchors[0].Path)
+	}
+}
+
+func TestMigrateRejectsSnapshotTreeSizeMismatch(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initGitRepo(t, repo)
+	writeFile(t, repo, "a.txt", "one\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	base, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"})
+	if err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	writeFile(t, repo, "a.txt", "two\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	treeRef, err := store.PutJSON(snapshot.TreeManifest{SchemaVersion: snapshot.SchemaVersion, Entries: []snapshot.TreeEntry{{Path: "a.txt", Mode: "100644", Digest: objectDigestForTest(t, stateDir, "one\n"), Size: 999}}}, "application/vnd.subreview.snapshot-tree+json")
+	if err != nil {
+		t.Fatalf("PutJSON tree: %v", err)
+	}
+	record := snapshot.SnapshotRecord{
+		SchemaVersion:   snapshot.SchemaVersion,
+		Kind:            "base",
+		Repo:            repo,
+		Source:          "test",
+		TreeDigest:      treeRef.Digest,
+		Tree:            treeRef,
+		EntryCount:      1,
+		Reconstructable: true,
+	}
+	recordRef, err := store.PutJSON(record, "application/vnd.subreview.snapshot+json")
+	if err != nil {
+		t.Fatalf("PutJSON snapshot: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          "snapshot.captured",
+		ObjectDigests: []string{recordRef.Digest, treeRef.Digest},
+		Repo:          repo,
+		Details: map[string]string{
+			"kind":     "base",
+			"snapshot": recordRef.Digest,
+			"tree":     treeRef.Digest,
+		},
+	}); err != nil {
+		t.Fatalf("AppendEvent malformed snapshot: %v", err)
+	}
+	_, err = Migrate(MigrateOptions{
+		StateDir: stateDir,
+		FromKind: "base",
+		ToKind:   "proposal",
+		Anchors:  []Anchor{{ID: "a", Kind: KindFile, Path: "a.txt"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "size mismatch") {
+		t.Fatalf("expected size mismatch error, got %v", err)
+	}
+	events, err := state.ReadEvents(stateDir)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	for _, event := range events {
+		if event.Type == "anchors.migrated" {
+			t.Fatalf("migrate should not ledger after size mismatch; base=%s event=%+v", base.Snapshot.Digest, event)
+		}
+	}
+}
+
+func TestAnchorManifestReadSupportsObjectAndArrayForms(t *testing.T) {
+	root := t.TempDir()
+	objectPath := filepath.Join(root, "object.json")
+	if err := os.WriteFile(objectPath, []byte(`{"schema_version":1,"anchors":[{"id":"a","kind":"file","path":"a.txt"}]}`), 0o644); err != nil {
+		t.Fatalf("write object manifest: %v", err)
+	}
+	objectManifest, err := ReadManifest(objectPath)
+	if err != nil {
+		t.Fatalf("ReadManifest object: %v", err)
+	}
+	if len(objectManifest.Anchors) != 1 || objectManifest.Anchors[0].ID != "a" {
+		t.Fatalf("bad object manifest: %+v", objectManifest)
+	}
+	arrayPath := filepath.Join(root, "array.json")
+	if err := os.WriteFile(arrayPath, []byte(`[{"id":"b","kind":"path","path":"b.txt"}]`), 0o644); err != nil {
+		t.Fatalf("write array manifest: %v", err)
+	}
+	arrayManifest, err := ReadManifest(arrayPath)
+	if err != nil {
+		t.Fatalf("ReadManifest array: %v", err)
+	}
+	if len(arrayManifest.Anchors) != 1 || arrayManifest.Anchors[0].ID != "b" {
+		t.Fatalf("bad array manifest: %+v", arrayManifest)
+	}
+}
+
+func TestFindTextOccurrencesMatchesWholeLinesOnly(t *testing.T) {
+	locations := findTextOccurrences([]byte("foo\nfoobar\nbaz\n"), "bar\n", "target.txt", "sha256:test")
+	if len(locations) != 0 {
+		t.Fatalf("line anchor should not match substring inside changed line: %+v", locations)
+	}
+	locations = findTextOccurrences([]byte("foo\nbar\nbaz\n"), "bar\n", "target.txt", "sha256:test")
+	if len(locations) != 1 || locations[0].StartLine != 2 || locations[0].EndLine != 2 {
+		t.Fatalf("expected exact whole-line match, got %+v", locations)
+	}
+}
+
+func TestFindTextOccurrencesDetectsOverlappingRepeatedRanges(t *testing.T) {
+	locations := findTextOccurrences([]byte("a\na\na\n"), "a\na\n", "target.txt", "sha256:test")
+	if len(locations) != 2 {
+		t.Fatalf("expected overlapping repeated ranges to be detected, got %+v", locations)
+	}
+	if locations[0].StartLine != 1 || locations[0].EndLine != 2 || locations[1].StartLine != 2 || locations[1].EndLine != 3 {
+		t.Fatalf("unexpected overlapping locations: %+v", locations)
+	}
+}
+
+func TestHunkAppearsModifiedUsesWholeLines(t *testing.T) {
+	if hunkAppearsModified("bar\n", []byte("foo\nfoobar\nbaz\n")) {
+		t.Fatal("modified heuristic should not match substrings inside target lines")
+	}
+	if !hunkAppearsModified("foo\nbar\n", []byte("foo\nbaz\n")) {
+		t.Fatal("modified heuristic should match surviving whole source lines")
+	}
+}
+
+func projectGoldenResults(results []AnchorResult) []goldenAnchorResult {
+	projected := make([]goldenAnchorResult, 0, len(results))
+	for _, result := range results {
+		item := goldenAnchorResult{
+			ID:            result.Anchor.ID,
+			Status:        result.Status,
+			BlocksClosure: result.BlocksClosure,
+		}
+		if result.To != nil {
+			item.ToPath = result.To.Path
+			item.ToStartLine = result.To.StartLine
+			item.ToEndLine = result.To.EndLine
+		}
+		for _, candidate := range result.Candidates {
+			if candidate.StartLine == 0 && candidate.EndLine == 0 {
+				item.Candidates = append(item.Candidates, candidate.Path)
+				continue
+			}
+			item.Candidates = append(item.Candidates, candidate.Path+":"+strconv.Itoa(candidate.StartLine)+"-"+strconv.Itoa(candidate.EndLine))
+		}
+		projected = append(projected, item)
+	}
+	return projected
+}
+
+func marshalIndent(t *testing.T, value any) []byte {
+	t.Helper()
+	body, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent: %v", err)
+	}
+	return append(body, '\n')
+}
+
+func initGitRepo(t *testing.T, repo string) {
+	t.Helper()
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	git(t, repo, "init")
+	git(t, repo, "config", "user.email", "test@example.com")
+	git(t, repo, "config", "user.name", "Test User")
+}
+
+func git(t *testing.T, repo string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+func writeFile(t *testing.T, root, rel, body string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir parent: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
+	}
+}
+
+func objectDigestForTest(t *testing.T, stateDir, body string) string {
+	t.Helper()
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	ref, err := store.PutText(body)
+	if err != nil {
+		t.Fatalf("PutText: %v", err)
+	}
+	return ref.Digest
+}
