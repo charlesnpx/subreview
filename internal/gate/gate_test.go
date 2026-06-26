@@ -163,6 +163,45 @@ func TestRecordStoresExternalAssertedGateEvidence(t *testing.T) {
 	if _, err := Record(RecordOptions{StateDir: stateDir, CatalogPath: catalogPath, CommandID: "go_test_all", SnapshotKind: "proposal", Outcome: OutcomePass, Provenance: ProvenanceCLIWitnessed}); err == nil {
 		t.Fatal("record should not accept cli_witnessed provenance")
 	}
+	badExitCode := 1
+	if _, err := Record(RecordOptions{
+		StateDir:     stateDir,
+		CatalogPath:  catalogPath,
+		CommandID:    "go_test_all",
+		SnapshotKind: "proposal",
+		Outcome:      OutcomePass,
+		Provenance:   ProvenanceExternalAsserted,
+		ExitCode:     &badExitCode,
+	}); err == nil || !strings.Contains(err.Error(), "does not match exit code") {
+		t.Fatalf("expected pass with failing exit code to be rejected, got %v", err)
+	}
+}
+
+func TestTailBufferKeepsBoundedSuffix(t *testing.T) {
+	var tail tailBuffer
+	first := strings.Repeat("a", maxDiagnosticBytes)
+	second := strings.Repeat("b", 100)
+	if n, err := tail.Write([]byte(first)); err != nil || n != len(first) {
+		t.Fatalf("first Write: n=%d err=%v", n, err)
+	}
+	if n, err := tail.Write([]byte(second)); err != nil || n != len(second) {
+		t.Fatalf("second Write: n=%d err=%v", n, err)
+	}
+	got := tail.String()
+	if len(got) != maxDiagnosticBytes {
+		t.Fatalf("tail length = %d, want %d", len(got), maxDiagnosticBytes)
+	}
+	if !strings.HasPrefix(got, strings.Repeat("a", maxDiagnosticBytes-len(second))) || !strings.HasSuffix(got, second) {
+		t.Fatalf("tail did not preserve bounded suffix")
+	}
+	large := strings.Repeat("c", maxDiagnosticBytes+200)
+	if n, err := tail.Write([]byte(large)); err != nil || n != len(large) {
+		t.Fatalf("large Write: n=%d err=%v", n, err)
+	}
+	got = tail.String()
+	if len(got) != maxDiagnosticBytes || got != strings.Repeat("c", maxDiagnosticBytes) {
+		t.Fatalf("large write tail mismatch len=%d", len(got))
+	}
 }
 
 func initializedGateState(t *testing.T) (string, string) {

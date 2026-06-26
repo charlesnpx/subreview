@@ -285,6 +285,15 @@ func Record(opts RecordOptions) (EvidenceResult, error) {
 	if err := validateOutcome(opts.Outcome); err != nil {
 		return EvidenceResult{}, err
 	}
+	if opts.ExitCode != nil {
+		if *opts.ExitCode < 0 || *opts.ExitCode > 255 {
+			return EvidenceResult{}, errors.New("--exit-code must be 0-255")
+		}
+		expected := outcomeForExitCode(command, *opts.ExitCode)
+		if opts.Outcome != expected {
+			return EvidenceResult{}, fmt.Errorf("gate outcome %s does not match exit code %d for catalog command %s; expected %s", opts.Outcome, *opts.ExitCode, command.ID, expected)
+		}
+	}
 	provenance := strings.TrimSpace(opts.Provenance)
 	if provenance == "" {
 		provenance = ProvenanceExternalAsserted
@@ -534,13 +543,13 @@ func executeCommand(repo string, command CommandDefinition, startedAt time.Time)
 	cmd := exec.CommandContext(ctx, command.Argv[0], command.Argv[1:]...)
 	cmd.Dir = filepath.Join(repo, filepath.FromSlash(command.WorkingDir))
 	cmd.Env = commandEnv(command.Env)
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr tailBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	endedAt := time.Now().UTC()
-	stdoutTail := truncateDiagnostic(stdout.String())
-	stderrTail := truncateDiagnostic(stderr.String())
+	stdoutTail := stdout.String()
+	stderrTail := stderr.String()
 	if ctx.Err() == context.DeadlineExceeded {
 		return commandRun{Outcome: OutcomeError, Summary: "gate command timed out", StdoutTail: stdoutTail, StderrTail: stderrTail, EndedAt: endedAt}
 	}
@@ -573,6 +582,28 @@ func restoredSnapshotRoot(stateDir, kind, expectedDigest string) (string, func()
 		return "", nil, fmt.Errorf("restored snapshot changed before gate run: %s != %s", restored.SnapshotDigest, expectedDigest)
 	}
 	return output, cleanup, nil
+}
+
+type tailBuffer struct {
+	buf []byte
+}
+
+func (w *tailBuffer) Write(p []byte) (int, error) {
+	if len(p) >= maxDiagnosticBytes {
+		w.buf = append(w.buf[:0], p[len(p)-maxDiagnosticBytes:]...)
+		return len(p), nil
+	}
+	total := len(w.buf) + len(p)
+	if total > maxDiagnosticBytes {
+		trim := total - maxDiagnosticBytes
+		w.buf = append(w.buf[:0], w.buf[trim:]...)
+	}
+	w.buf = append(w.buf, p...)
+	return len(p), nil
+}
+
+func (w *tailBuffer) String() string {
+	return strings.TrimSpace(string(w.buf))
 }
 
 func evidenceRecord(repo string, command CommandDefinition, catalog state.ObjectRef, policyRef *PolicyRef, snapshot snapshotBinding, provenance, outcome string, exitCode *int, diagnostics EvidenceDiagnostics, startedAt, endedAt time.Time) EvidenceRecord {
