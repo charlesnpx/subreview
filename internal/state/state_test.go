@@ -326,6 +326,37 @@ func TestCASRejectsSymlinkObject(t *testing.T) {
 	requireIssue(t, validation, "object_not_regular")
 }
 
+func TestCASConcurrentSameDigestWrites(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	store := Store{root: stateDir}
+	payload := []byte(strings.Repeat("x", 2*1024*1024))
+	errs := make(chan error, 32)
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := store.PutBytes(payload, "application/octet-stream")
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("PutBytes concurrent same digest: %v", err)
+		}
+	}
+	validation := Validate(stateDir)
+	if !validation.OK {
+		t.Fatalf("state should validate after concurrent CAS writes: %+v", validation.Errors)
+	}
+}
+
 func TestEnsureStateSubdirToleratesConcurrentCreation(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
 	if err := os.Mkdir(root, 0o755); err != nil {
@@ -384,6 +415,109 @@ func TestLedgerAppendsPriorEventLinkage(t *testing.T) {
 	}
 	if len(events) != 2 || events[1].PriorEventID != events[0].EventID {
 		t.Fatalf("ledger order mismatch: %+v", events)
+	}
+}
+
+func TestValidateRequiresInitializedFirstLedgerEvent(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	ledgerPath := filepath.Join(stateDir, "ledger.jsonl")
+	body, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	var event Event
+	if err := decodeStrictJSON([]byte(strings.TrimSpace(string(body))), &event); err != nil {
+		t.Fatalf("decode first event: %v", err)
+	}
+	event.Type = "not.initialized"
+	event.EventID = eventID(event)
+	line, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal tampered event: %v", err)
+	}
+	if err := os.WriteFile(ledgerPath, append(line, '\n'), 0o644); err != nil {
+		t.Fatalf("write tampered ledger: %v", err)
+	}
+	validation := Validate(stateDir)
+	if validation.OK {
+		t.Fatal("expected initial event type validation failure")
+	}
+	requireIssue(t, validation, "initial_event_type_mismatch")
+}
+
+func TestValidateRejectsManifestNotIntroducedByLedger(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	store := Store{root: stateDir}
+	replacement, err := store.PutJSON(map[string]any{
+		"schema_version": SchemaVersion,
+		"repo":           root,
+		"state":          stateDir,
+		"created_at":     time.Unix(101, 0).UTC().Format(time.RFC3339Nano),
+		"layout": map[string]string{
+			"objects_dir":   "objects/sha256",
+			"manifests_dir": "manifests",
+			"ledger_path":   "ledger.jsonl",
+		},
+	}, "application/vnd.subreview.state-manifest+json")
+	if err != nil {
+		t.Fatalf("PutJSON replacement manifest: %v", err)
+	}
+	body, err := json.MarshalIndent(map[string]any{
+		"schema_version": SchemaVersion,
+		"manifest":       replacement,
+	}, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal replacement manifest pointer: %v", err)
+	}
+	body = append(body, '\n')
+	if err := os.WriteFile(filepath.Join(stateDir, "manifests", "state.json"), body, 0o644); err != nil {
+		t.Fatalf("rewrite manifest pointer: %v", err)
+	}
+	validation := Validate(stateDir)
+	if validation.OK {
+		t.Fatal("expected manifest ledger binding validation failure")
+	}
+	requireIssue(t, validation, "initial_manifest_mismatch")
+}
+
+func TestValidateRejectsUnknownLedgerEventFields(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	ledgerPath := filepath.Join(stateDir, "ledger.jsonl")
+	body, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(body))), &raw); err != nil {
+		t.Fatalf("unmarshal ledger map: %v", err)
+	}
+	raw["unknown"] = true
+	line, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("marshal unknown field ledger: %v", err)
+	}
+	if err := os.WriteFile(ledgerPath, append(line, '\n'), 0o644); err != nil {
+		t.Fatalf("write unknown field ledger: %v", err)
+	}
+	validation := Validate(stateDir)
+	if validation.OK {
+		t.Fatal("expected unknown ledger field validation failure")
+	}
+	requireIssue(t, validation, "malformed_event")
+	if _, err := AppendEvent(stateDir, Event{Time: time.Unix(101, 0).UTC().Format(time.RFC3339Nano), Type: "after_unknown"}); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("expected append to reject ledger with unknown field, got %v", err)
 	}
 }
 

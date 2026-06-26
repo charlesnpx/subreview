@@ -2,6 +2,7 @@ package state
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -91,6 +92,17 @@ type layout struct {
 	objectsDir   string
 	manifestsDir string
 	ledgerPath   string
+}
+
+type manifestInfo struct {
+	Digest string
+	Repo   string
+}
+
+type ledgerInfo struct {
+	Referenced []string
+	FirstEvent *Event
+	FirstLine  int
 }
 
 func Init(opts InitOptions) (InitResult, error) {
@@ -207,16 +219,36 @@ func (s Store) PutBytes(body []byte, mediaType string) (ObjectRef, error) {
 }
 
 func writeFileExclusive(path string, body []byte, mode os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "tmp-"+filepath.Base(path)+"-")
 	if err != nil {
 		return err
 	}
-	_, writeErr := f.Write(body)
+	tmpPath := f.Name()
+	defer os.Remove(tmpPath)
+	chmodErr := f.Chmod(mode)
+	n, writeErr := f.Write(body)
+	if writeErr == nil && n != len(body) {
+		writeErr = io.ErrShortWrite
+	}
+	syncErr := f.Sync()
 	closeErr := f.Close()
+	if chmodErr != nil {
+		return chmodErr
+	}
 	if writeErr != nil {
 		return writeErr
 	}
-	return closeErr
+	if syncErr != nil {
+		return syncErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := os.Link(tmpPath, path); err != nil {
+		return err
+	}
+	return nil
 }
 
 func checkRegularFile(path string) error {
@@ -253,13 +285,10 @@ func (s Store) ensureObject(body []byte, digest string) error {
 	if err := ensureStateSubdir(s.root, "objects", "sha256", hexDigest[:2]); err != nil {
 		return err
 	}
-	if err := writeFileExclusive(path, body, 0o644); err != nil {
-		if os.IsExist(err) {
-			return verifyExistingObject(path, digest)
-		}
+	if err := ensureStateSubdir(s.root, "objects", "tmp"); err != nil {
 		return err
 	}
-	return nil
+	return writeObjectAtomic(filepath.Join(s.root, "objects", "tmp"), path, body, digest)
 }
 
 func (s Store) Read(digest string) ([]byte, error) {
@@ -446,13 +475,19 @@ func Validate(stateDir string) ValidationResult {
 	}
 	manifestPath := filepath.Join(lay.manifestsDir, "state.json")
 	var referenced []string
+	manifest := manifestInfo{}
 	if !fileExists(manifestPath) {
 		result.addError("missing_manifest", manifestPath, 0, "manifests/state.json is missing")
 	} else {
-		referenced = append(referenced, validateManifestFile(root, manifestPath, &result)...)
+		manifest = validateManifestFile(root, manifestPath, &result)
+		if manifest.Digest != "" {
+			referenced = append(referenced, manifest.Digest)
+		}
 	}
 	result.ObjectCount = validateObjectFiles(lay, &result)
-	referenced = append(referenced, validateLedger(lay, &result)...)
+	ledger := validateLedger(lay, &result)
+	referenced = append(referenced, ledger.Referenced...)
+	validateInitialLedgerEvent(lay.ledgerPath, manifest, ledger, &result)
 	if result.EventCount == 0 {
 		result.addError("empty_ledger", lay.ledgerPath, 0, "ledger has no events")
 	}
@@ -509,18 +544,18 @@ func validateObjectFiles(lay layout, result *ValidationResult) int {
 	return count
 }
 
-func validateLedger(lay layout, result *ValidationResult) []string {
+func validateLedger(lay layout, result *ValidationResult) ledgerInfo {
 	if err := checkRegularFile(lay.ledgerPath); err != nil {
 		result.addError("ledger_not_regular", lay.ledgerPath, 0, err.Error())
-		return nil
+		return ledgerInfo{}
 	}
 	f, err := os.Open(lay.ledgerPath)
 	if err != nil {
 		result.addError("ledger_open_failed", lay.ledgerPath, 0, err.Error())
-		return nil
+		return ledgerInfo{}
 	}
 	defer f.Close()
-	var referenced []string
+	info := ledgerInfo{}
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLedgerScanTokenBytes)
 	lineNo := 0
@@ -532,11 +567,16 @@ func validateLedger(lay layout, result *ValidationResult) []string {
 			continue
 		}
 		var event Event
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
+		if err := decodeStrictJSON([]byte(line), &event); err != nil {
 			result.addError("malformed_event", lay.ledgerPath, lineNo, err.Error())
 			continue
 		}
 		result.EventCount++
+		if info.FirstEvent == nil {
+			first := event
+			info.FirstEvent = &first
+			info.FirstLine = lineNo
+		}
 		if event.SchemaVersion != SchemaVersion {
 			result.addError("unsupported_event_schema", lay.ledgerPath, lineNo, fmt.Sprintf("event schema_version=%d", event.SchemaVersion))
 		}
@@ -559,25 +599,25 @@ func validateLedger(lay layout, result *ValidationResult) []string {
 				result.addError("invalid_object_digest", lay.ledgerPath, lineNo, err.Error())
 				continue
 			}
-			referenced = append(referenced, digest)
+			info.Referenced = append(info.Referenced, digest)
 		}
 		prior = event.EventID
 	}
 	if err := scanner.Err(); err != nil {
 		result.addError("ledger_read_failed", lay.ledgerPath, lineNo, err.Error())
 	}
-	return referenced
+	return info
 }
 
-func validateManifestFile(root, path string, result *ValidationResult) []string {
+func validateManifestFile(root, path string, result *ValidationResult) manifestInfo {
 	if err := checkRegularFile(path); err != nil {
 		result.addError("manifest_not_regular", path, 0, err.Error())
-		return nil
+		return manifestInfo{}
 	}
 	body, err := os.ReadFile(path)
 	if err != nil {
 		result.addError("manifest_read_failed", path, 0, err.Error())
-		return nil
+		return manifestInfo{}
 	}
 	var manifest struct {
 		SchemaVersion int       `json:"schema_version"`
@@ -585,29 +625,28 @@ func validateManifestFile(root, path string, result *ValidationResult) []string 
 	}
 	if err := json.Unmarshal(body, &manifest); err != nil {
 		result.addError("malformed_manifest", path, 0, err.Error())
-		return nil
+		return manifestInfo{}
 	}
 	if manifest.SchemaVersion != SchemaVersion {
 		result.addError("unsupported_manifest_schema", path, 0, fmt.Sprintf("manifest schema_version=%d", manifest.SchemaVersion))
 	}
 	if manifest.Manifest.Digest == "" {
 		result.addError("missing_manifest_digest", path, 0, "manifest object digest is required")
-		return nil
+		return manifestInfo{}
 	}
 	if err := validateDigest(manifest.Manifest.Digest); err != nil {
 		result.addError("invalid_manifest_digest", path, 0, err.Error())
-		return nil
+		return manifestInfo{}
 	}
-	validateManifestObject(root, manifest.Manifest.Digest, result)
-	return []string{manifest.Manifest.Digest}
+	return manifestInfo{Digest: manifest.Manifest.Digest, Repo: validateManifestObject(root, manifest.Manifest.Digest, result)}
 }
 
-func validateManifestObject(root, digest string, result *ValidationResult) {
+func validateManifestObject(root, digest string, result *ValidationResult) string {
 	path := objectPathBestEffort(root, digest)
 	body, err := Store{root: root}.Read(digest)
 	if err != nil {
 		result.addError("object_read_failed", path, 0, err.Error())
-		return
+		return ""
 	}
 	var manifest struct {
 		SchemaVersion int    `json:"schema_version"`
@@ -622,7 +661,7 @@ func validateManifestObject(root, digest string, result *ValidationResult) {
 	}
 	if err := json.Unmarshal(body, &manifest); err != nil {
 		result.addError("malformed_manifest_object", path, 0, err.Error())
-		return
+		return ""
 	}
 	if manifest.SchemaVersion != SchemaVersion {
 		result.addError("unsupported_manifest_object_schema", path, 0, fmt.Sprintf("manifest object schema_version=%d", manifest.SchemaVersion))
@@ -642,6 +681,27 @@ func validateManifestObject(root, digest string, result *ValidationResult) {
 		manifest.Layout.ManifestsDir != "manifests" ||
 		manifest.Layout.LedgerPath != "ledger.jsonl" {
 		result.addError("manifest_layout_mismatch", path, 0, "manifest object layout must match state layout")
+	}
+	return manifest.Repo
+}
+
+func validateInitialLedgerEvent(path string, manifest manifestInfo, ledger ledgerInfo, result *ValidationResult) {
+	if manifest.Digest == "" || ledger.FirstEvent == nil {
+		return
+	}
+	event := ledger.FirstEvent
+	line := ledger.FirstLine
+	if event.Type != "state.initialized" {
+		result.addError("initial_event_type_mismatch", path, line, fmt.Sprintf("expected state.initialized, got %q", event.Type))
+	}
+	if len(event.ObjectDigests) != 1 || event.ObjectDigests[0] != manifest.Digest {
+		result.addError("initial_manifest_mismatch", path, line, fmt.Sprintf("expected initial object_digests to contain only %s", manifest.Digest))
+	}
+	if event.Details == nil || event.Details["manifest"] != manifest.Digest {
+		result.addError("initial_manifest_detail_mismatch", path, line, fmt.Sprintf("expected details.manifest %s", manifest.Digest))
+	}
+	if manifest.Repo != "" && event.Repo != manifest.Repo {
+		result.addError("initial_repo_mismatch", path, line, fmt.Sprintf("expected repo %q, got %q", manifest.Repo, event.Repo))
 	}
 }
 
@@ -757,6 +817,21 @@ func digestBytes(body []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+func decodeStrictJSON(body []byte, dest any) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dest); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
 func lastEventID(path string) (string, error) {
 	if err := checkRegularFile(path); err != nil {
 		if os.IsNotExist(err) {
@@ -783,7 +858,7 @@ func lastEventID(path string) (string, error) {
 			continue
 		}
 		var event Event
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
+		if err := decodeStrictJSON([]byte(line), &event); err != nil {
 			return "", fmt.Errorf("malformed ledger event at line %d: %w", lineNo, err)
 		}
 		last = event.EventID
@@ -814,6 +889,46 @@ func prepareLedgerForInit(root, path string) error {
 		return err
 	}
 	return f.Close()
+}
+
+func writeObjectAtomic(tmpDir, path string, body []byte, digest string) error {
+	if err := verifyExistingObject(path, digest); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	f, err := os.CreateTemp(tmpDir, "object-")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	defer os.Remove(tmpPath)
+	chmodErr := f.Chmod(0o644)
+	n, writeErr := f.Write(body)
+	if writeErr == nil && n != len(body) {
+		writeErr = io.ErrShortWrite
+	}
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if chmodErr != nil {
+		return chmodErr
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := os.Link(tmpPath, path); err != nil {
+		if os.IsExist(err) {
+			return verifyExistingObject(path, digest)
+		}
+		return err
+	}
+	return nil
 }
 
 func rollbackManifestIfEmptyLedger(manifestPath, ledgerPath string) error {
