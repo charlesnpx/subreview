@@ -123,6 +123,68 @@ func TestLeakageDetectionRejectsEvaluationLabels(t *testing.T) {
 	}
 }
 
+func TestLeakageScanIgnoresContextEntryContent(t *testing.T) {
+	material := recordLeakageMaterial{
+		Repo: "repo",
+		Target: SnapshotRef{
+			Kind:   "proposal",
+			Digest: "sha256:target",
+			Tree:   "sha256:tree",
+		},
+		Manifest: state.ObjectRef{Digest: "sha256:manifest", MediaType: "application/json", Size: 1},
+		Context: ContextBundle{Entries: []ContextEntry{{
+			Kind:         "changed_file",
+			Path:         "docs/review.md",
+			SnapshotKind: "proposal",
+			Digest:       "sha256:source",
+			Bytes:        64,
+			Content:      "This legitimate source mentions false_positive and adjudication.",
+		}}},
+		Dedupe:         NewSemanticDedupeKey(SemanticDedupeFields{Route: RoutePrimary, RunKind: RunKindDiscovery}),
+		SourceComplete: "complete",
+		TokenTelemetry: NewTokenTelemetry(RunKindDiscovery, "complete"),
+	}
+	report := CheckLeakage(leakageScanText(material))
+	if !report.OK {
+		t.Fatalf("source content should be excluded from leakage scan: %+v", report)
+	}
+}
+
+func TestRenderStablePrefixEscapesPathMetadata(t *testing.T) {
+	markdown := renderStablePrefix(stableRenderData{
+		Repo: "repo",
+		Target: SnapshotRef{
+			Kind:   "proposal",
+			Digest: "sha256:target",
+		},
+		Manifest: state.ObjectRef{Digest: "sha256:manifest"},
+		Context: ContextBundle{
+			Entries: []ContextEntry{{
+				Kind:    "changed_file",
+				Path:    "docs/name\n## injected.md",
+				Digest:  "sha256:source",
+				Content: "body",
+			}},
+			Omissions: []Omission{{
+				Code:    "path_not_in_target_snapshot",
+				Path:    "missing\n- forged",
+				Message: "missing",
+			}},
+		},
+		Dedupe:         NewSemanticDedupeKey(SemanticDedupeFields{Route: RoutePrimary, RunKind: RunKindDiscovery}),
+		SourceComplete: "partial",
+		TokenTelemetry: NewTokenTelemetry(RunKindDiscovery, "partial"),
+	})
+	if strings.Contains(markdown, "docs/name\n## injected.md") || strings.Contains(markdown, "missing\n- forged") {
+		t.Fatalf("raw path metadata should not render with literal newlines:\n%s", markdown)
+	}
+	for _, want := range []string{`"docs/name\n## injected.md"`, `"missing\n- forged"`} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("markdown missing escaped path %q:\n%s", want, markdown)
+		}
+	}
+}
+
 func TestMarkdownFenceExceedsEmbeddedBackticks(t *testing.T) {
 	if got, want := markdownFence("plain text"), "```"; got != want {
 		t.Fatalf("unexpected default fence: got %q want %q", got, want)

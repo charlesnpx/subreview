@@ -346,7 +346,18 @@ func Build(opts BuildOptions) (BuildResult, error) {
 	volatileDigest := digestString(volatile)
 	markdown := stable + "\n\n" + volatile + "\n"
 	promptDigest := digestString(markdown)
-	leakage := CheckLeakage(markdown)
+	leakage := CheckLeakage(leakageScanText(recordLeakageMaterial{
+		Repo:           binding.Repo,
+		Policy:         policyRef,
+		Target:         target,
+		Manifest:       manifestRef,
+		SourceDiffs:    sourceDiffs,
+		Context:        context,
+		Gates:          gates,
+		Dedupe:         dedupe,
+		SourceComplete: sourceCompleteness,
+		TokenTelemetry: tokenTelemetry,
+	}))
 	if !leakage.OK {
 		return BuildResult{}, fmt.Errorf("packet leakage check failed: %s", strings.Join(leakage.ForbiddenTerms, ", "))
 	}
@@ -509,6 +520,68 @@ func CheckLeakage(text string) LeakageReport {
 	return LeakageReport{OK: len(terms) == 0, ForbiddenTerms: terms}
 }
 
+type recordLeakageMaterial struct {
+	Repo           string
+	Policy         *PolicyRef
+	Target         SnapshotRef
+	Manifest       state.ObjectRef
+	SourceDiffs    []SourceDiff
+	Context        ContextBundle
+	Gates          []GateSummary
+	Dedupe         SemanticDedupeKey
+	SourceComplete string
+	TokenTelemetry TokenTelemetry
+}
+
+func leakageScanText(data recordLeakageMaterial) string {
+	type contextEntryMetadata struct {
+		Kind         string `json:"kind"`
+		Path         string `json:"path"`
+		SnapshotKind string `json:"snapshot_kind"`
+		Digest       string `json:"digest"`
+		StartLine    int    `json:"start_line,omitempty"`
+		EndLine      int    `json:"end_line,omitempty"`
+		Bytes        int    `json:"bytes"`
+	}
+	entries := make([]contextEntryMetadata, 0, len(data.Context.Entries))
+	for _, entry := range data.Context.Entries {
+		entries = append(entries, contextEntryMetadata{
+			Kind:         entry.Kind,
+			Path:         entry.Path,
+			SnapshotKind: entry.SnapshotKind,
+			Digest:       entry.Digest,
+			StartLine:    entry.StartLine,
+			EndLine:      entry.EndLine,
+			Bytes:        entry.Bytes,
+		})
+	}
+	body, err := json.Marshal(map[string]any{
+		"repo":              data.Repo,
+		"policy":            data.Policy,
+		"target":            data.Target,
+		"manifest":          canonicalObject(data.Manifest),
+		"source_diffs":      sourceDiffDigestMaterial(data.SourceDiffs),
+		"context_metadata":  entries,
+		"context_omissions": data.Context.Omissions,
+		"gates":             gateDigestMaterial(data.Gates),
+		"dedupe":            data.Dedupe,
+		"source_complete":   data.SourceComplete,
+		"token_telemetry":   data.TokenTelemetry,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
+}
+
+func markdownJSONString(value string) string {
+	body, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
+}
+
 type stableRenderData struct {
 	Repo           string
 	Policy         *PolicyRef
@@ -569,7 +642,7 @@ func renderStablePrefix(data stableRenderData) string {
 		fmt.Fprintln(&b, "- no context entries selected")
 	}
 	for _, entry := range data.Context.Entries {
-		fmt.Fprintf(&b, "### %s %s", entry.Kind, entry.Path)
+		fmt.Fprintf(&b, "### %s %s", entry.Kind, markdownJSONString(entry.Path))
 		if entry.StartLine > 0 {
 			fmt.Fprintf(&b, ":%d-%d", entry.StartLine, entry.EndLine)
 		}
@@ -587,7 +660,7 @@ func renderStablePrefix(data stableRenderData) string {
 	} else {
 		for _, omission := range data.Context.Omissions {
 			if omission.Path != "" {
-				fmt.Fprintf(&b, "- %s %s: %s\n", omission.Code, omission.Path, omission.Message)
+				fmt.Fprintf(&b, "- %s %s: %s\n", omission.Code, markdownJSONString(omission.Path), omission.Message)
 			} else {
 				fmt.Fprintf(&b, "- %s: %s\n", omission.Code, omission.Message)
 			}
