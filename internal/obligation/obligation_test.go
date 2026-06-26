@@ -192,30 +192,29 @@ func TestGateEvidenceUsesLatestManifestMatchingRecord(t *testing.T) {
 }
 
 func TestGateEvidenceMustMatchPolicyCommandDigest(t *testing.T) {
-	_, stateDir := initializedStateWithBuiltObligations(t)
-	mismatchedCatalogPath := writeGateCatalogCommand(t, t.TempDir(), "go_test_all", "printf different")
-	if _, err := gate.Record(gate.RecordOptions{
-		StateDir:     stateDir,
-		CatalogPath:  mismatchedCatalogPath,
-		CommandID:    "go_test_all",
-		SnapshotKind: "final",
-		Outcome:      gate.OutcomePass,
-		Provenance:   gate.ProvenanceExternalAsserted,
-		Diagnostic:   "external pass from different catalog",
-		Now:          time.Unix(200, 0),
-	}); err != nil {
-		t.Fatalf("Record mismatched gate pass: %v", err)
+	manifest := CoverageManifest{
+		Policy: &PolicyRef{Digest: "policy-digest"},
+		SourceDiffs: []TransitionDiff{{
+			FromKind:   "base",
+			ToKind:     "final",
+			ToSnapshot: "final-snapshot",
+		}},
 	}
-	status, err := Status(StatusOptions{StateDir: stateDir})
-	if err != nil {
-		t.Fatalf("Status: %v", err)
-	}
-	gateStatus := gateObligationStatus(t, status, "go_test_all")
-	if gateStatus.Satisfied {
-		t.Fatalf("mismatched command digest should not satisfy obligation: %+v", gateStatus)
-	}
-	if !hasBlocker(status.Blockers, "stale_gate_evidence") {
-		t.Fatalf("mismatched command digest should be stale evidence: %+v", status.Blockers)
+	expectedDigest := testGateCommandDigest("go_test_all")
+	mismatchedDigest := gate.CommandDigest(testGateCommand("go_test_all", "printf different"))
+	evidence, ok, sawStale := latestGateEvidenceForManifest([]gate.EvidenceObservation{{
+		Digest:  "evidence-digest",
+		EventID: "event-id",
+		Record: gate.EvidenceRecord{
+			CommandID:     "go_test_all",
+			CommandDigest: mismatchedDigest,
+			Policy:        &gate.PolicyRef{Digest: "policy-digest"},
+			InputSnapshot: gate.SnapshotRef{Kind: "final", Digest: "final-snapshot"},
+			Outcome:       gate.OutcomePass,
+		},
+	}}, manifest, expectedDigest)
+	if ok || evidence.Digest != "" || !sawStale {
+		t.Fatalf("mismatched command digest should be stale, evidence=%+v ok=%v sawStale=%v", evidence, ok, sawStale)
 	}
 }
 

@@ -108,12 +108,13 @@ func TestRunStoresCLIWitnessedGateEvidence(t *testing.T) {
 }
 
 func TestRunExecutesRestoredSnapshotNotDirtyWorkingTree(t *testing.T) {
-	repo, stateDir := initializedGateState(t)
+	command := testCommand("go_test_all", []string{"/bin/sh", "-c", "test \"$(cat alpha.txt)\" = one"})
+	repo, stateDir := initializedGateStateForCommand(t, command)
 	writeFile(t, repo, "alpha.txt", "dirty\n")
 	catalogPath := writeCatalog(t, t.TempDir(), Catalog{
 		SchemaVersion: SchemaVersion,
 		Commands: []CommandDefinition{
-			testCommand("go_test_all", []string{"/bin/sh", "-c", "test \"$(cat alpha.txt)\" = one"}),
+			command,
 		},
 	})
 	result, err := Run(RunOptions{StateDir: stateDir, CatalogPath: catalogPath, CommandID: "go_test_all", SnapshotKind: "proposal", Now: time.Unix(250, 0)})
@@ -125,6 +126,24 @@ func TestRunExecutesRestoredSnapshotNotDirtyWorkingTree(t *testing.T) {
 	}
 	if got := readFile(t, repo, "alpha.txt"); got != "dirty\n" {
 		t.Fatalf("gate run should not modify live working tree, got %q", got)
+	}
+}
+
+func TestRunRejectsCatalogCommandThatDoesNotMatchBoundPolicy(t *testing.T) {
+	repo, stateDir := initializedGateState(t)
+	marker := filepath.Join(repo, "untrusted-ran")
+	catalogPath := writeCatalog(t, t.TempDir(), Catalog{
+		SchemaVersion: SchemaVersion,
+		Commands: []CommandDefinition{
+			testCommand("go_test_all", []string{"/bin/sh", "-c", "printf ran > " + marker}),
+		},
+	})
+	_, err := Run(RunOptions{StateDir: stateDir, CatalogPath: catalogPath, CommandID: "go_test_all", SnapshotKind: "proposal", Now: time.Unix(255, 0)})
+	if err == nil || !strings.Contains(err.Error(), "does not match bound policy digest") {
+		t.Fatalf("Run should reject untrusted catalog command before execution, got %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("untrusted command should not execute, stat err=%v", err)
 	}
 }
 
@@ -290,6 +309,11 @@ func TestExecuteCommandCleansUpBackgroundChildrenAfterSuccess(t *testing.T) {
 
 func initializedGateState(t *testing.T) (string, string) {
 	t.Helper()
+	return initializedGateStateForCommand(t, testCommand("go_test_all", []string{"/bin/sh", "-c", "printf ok"}))
+}
+
+func initializedGateStateForCommand(t *testing.T, command CommandDefinition) (string, string) {
+	t.Helper()
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
 	stateDir := filepath.Join(root, "state")
@@ -300,7 +324,7 @@ func initializedGateState(t *testing.T) (string, string) {
 	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfig(t, root), Profile: "default"}); err != nil {
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfig(t, root, CommandDigest(command)), Profile: "default"}); err != nil {
 		t.Fatalf("Bind policy: %v", err)
 	}
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal", Ref: "HEAD"}); err != nil {
@@ -337,6 +361,7 @@ func testCommand(id string, argv []string) CommandDefinition {
 		ExecutesRepoCode:  true,
 		SideEffects:       SideEffectsNone,
 		TimeoutSeconds:    5,
+		AllowedExitCodes:  []int{0},
 	}
 }
 
@@ -353,14 +378,14 @@ func writeCatalog(t *testing.T, root string, catalog Catalog) string {
 	return path
 }
 
-func writePolicyConfig(t *testing.T, root string) string {
+func writePolicyConfig(t *testing.T, root, commandDigest string) string {
 	t.Helper()
 	body := []byte(`{
   "schema_version": 1,
   "policy_id": "test-policy",
   "profiles": {
     "default": {
-      "gate_requirements": [{"command_id": "go_test_all", "command_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "required": true}],
+      "gate_requirements": [{"command_id": "go_test_all", "command_digest": "` + commandDigest + `", "required": true}],
       "route_limits": {"primary_semantic_reviews": 1, "targeted_verifications": 1, "fresh_final_reviews": 0, "context_expansion_rounds": 1},
       "required_evidence_facts": ["required_gates_satisfied", "primary_review_completed", "blocking_findings_verified", "coverage_obligations_satisfied", "policy_bound"],
       "risk_routing": [],

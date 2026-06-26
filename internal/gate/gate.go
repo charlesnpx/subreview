@@ -187,7 +187,8 @@ type snapshotBinding struct {
 }
 
 type policyBinding struct {
-	Ref PolicyRef
+	Ref       PolicyRef
+	Effective policy.EffectivePolicy
 }
 
 func CheckCatalog(opts CheckOptions) (CheckResult, error) {
@@ -240,8 +241,11 @@ func Run(opts RunOptions) (EvidenceResult, error) {
 	if err != nil {
 		return EvidenceResult{}, err
 	}
-	policyRef, err := requiredPolicyBinding(events, store, binding.Repo)
+	policyBinding, err := requiredPolicyBinding(events, store, binding.Repo)
 	if err != nil {
+		return EvidenceResult{}, err
+	}
+	if err := requireBoundPolicyCommandDigest(policyBinding.Effective, command); err != nil {
 		return EvidenceResult{}, err
 	}
 	catalogRef, err := store.PutJSON(catalog, MediaTypeCatalog)
@@ -258,7 +262,7 @@ func Run(opts RunOptions) (EvidenceResult, error) {
 	}
 	defer cleanup()
 	run := executeCommand(runRoot, command, start)
-	record := evidenceRecord(binding.Repo, command, catalogRef, policyRef, inputSnapshot, ProvenanceCLIWitnessed, run.Outcome, run.ExitCode, EvidenceDiagnostics{
+	record := evidenceRecord(binding.Repo, command, catalogRef, &policyBinding.Ref, inputSnapshot, ProvenanceCLIWitnessed, run.Outcome, run.ExitCode, EvidenceDiagnostics{
 		Summary:    run.Summary,
 		StdoutTail: run.StdoutTail,
 		StderrTail: run.StderrTail,
@@ -313,8 +317,11 @@ func Record(opts RecordOptions) (EvidenceResult, error) {
 	if err != nil {
 		return EvidenceResult{}, err
 	}
-	policyRef, err := requiredPolicyBinding(events, store, binding.Repo)
+	policyBinding, err := requiredPolicyBinding(events, store, binding.Repo)
 	if err != nil {
+		return EvidenceResult{}, err
+	}
+	if err := requireBoundPolicyCommandDigest(policyBinding.Effective, command); err != nil {
 		return EvidenceResult{}, err
 	}
 	catalogRef, err := store.PutJSON(catalog, MediaTypeCatalog)
@@ -325,7 +332,7 @@ func Record(opts RecordOptions) (EvidenceResult, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	record := evidenceRecord(binding.Repo, command, catalogRef, policyRef, snapshot, provenance, opts.Outcome, opts.ExitCode, EvidenceDiagnostics{
+	record := evidenceRecord(binding.Repo, command, catalogRef, &policyBinding.Ref, snapshot, provenance, opts.Outcome, opts.ExitCode, EvidenceDiagnostics{
 		Summary: truncateDiagnostic(opts.Diagnostic),
 	}, now, now)
 	return writeEvidence(binding.State, binding.Repo, store, record)
@@ -764,7 +771,7 @@ func latestSnapshotBinding(events []state.Event, kind, repo string) (snapshotBin
 	return snapshotBinding{}, fmt.Errorf("snapshot kind is not captured in state: %s", kind)
 }
 
-func latestPolicyBinding(events []state.Event, store state.Store, repo string) (*PolicyRef, error) {
+func latestPolicyBinding(events []state.Event, store state.Store, repo string) (*policyBinding, error) {
 	for i := len(events) - 1; i >= 0; i-- {
 		event := events[i]
 		if event.Type != "policy.bound" {
@@ -793,20 +800,38 @@ func latestPolicyBinding(events []state.Event, store state.Store, repo string) (
 		if effective.SchemaVersion != policy.SchemaVersion || effective.Repo != repo || effective.Profile != profile || effective.PolicyID != policyID {
 			return nil, errors.New("bound policy object does not match policy.bound event")
 		}
-		return &PolicyRef{Profile: profile, PolicyID: policyID, Digest: digest}, nil
+		return &policyBinding{Ref: PolicyRef{Profile: profile, PolicyID: policyID, Digest: digest}, Effective: effective}, nil
 	}
 	return nil, nil
 }
 
-func requiredPolicyBinding(events []state.Event, store state.Store, repo string) (*PolicyRef, error) {
-	ref, err := latestPolicyBinding(events, store, repo)
+func requiredPolicyBinding(events []state.Event, store state.Store, repo string) (*policyBinding, error) {
+	binding, err := latestPolicyBinding(events, store, repo)
 	if err != nil {
 		return nil, err
 	}
-	if ref == nil {
+	if binding == nil {
 		return nil, errors.New("policy is not bound in state; run policy bind first")
 	}
-	return ref, nil
+	return binding, nil
+}
+
+func requireBoundPolicyCommandDigest(effective policy.EffectivePolicy, command CommandDefinition) error {
+	for _, requirement := range effective.GateRequirements {
+		if requirement.CommandID != command.ID {
+			continue
+		}
+		expected := strings.TrimSpace(requirement.CommandDigest)
+		if expected == "" {
+			return fmt.Errorf("bound policy gate %s does not define command_digest", command.ID)
+		}
+		actual := CommandDigest(command)
+		if actual != expected {
+			return fmt.Errorf("gate command %s digest %s does not match bound policy digest %s", command.ID, actual, expected)
+		}
+		return nil
+	}
+	return fmt.Errorf("bound policy does not define gate command: %s", command.ID)
 }
 
 func validateEvidenceRecord(record EvidenceRecord, repo, commandID string) error {
