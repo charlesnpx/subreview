@@ -73,6 +73,29 @@ func TestInitRejectsSymlinkedHiddenStateParent(t *testing.T) {
 	}
 }
 
+func TestInitAllowsVisibleSymlinkedStateParent(t *testing.T) {
+	root := t.TempDir()
+	realParent := filepath.Join(root, "real-parent")
+	if err := os.Mkdir(realParent, 0o755); err != nil {
+		t.Fatalf("mkdir real parent: %v", err)
+	}
+	linkParent := filepath.Join(root, "visible-link")
+	if err := os.Symlink(realParent, linkParent); err != nil {
+		t.Fatalf("symlink visible parent: %v", err)
+	}
+	stateDir := filepath.Join(linkParent, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init through visible symlinked parent: %v", err)
+	}
+	validation := Validate(stateDir)
+	if !validation.OK {
+		t.Fatalf("state should validate through visible symlinked parent: %+v", validation.Errors)
+	}
+	if _, err := os.Stat(filepath.Join(realParent, "state", "ledger.jsonl")); err != nil {
+		t.Fatalf("expected state under real parent: %v", err)
+	}
+}
+
 func TestInitDoesNotOverwriteExistingManifest(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")

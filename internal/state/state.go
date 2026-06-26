@@ -248,7 +248,7 @@ func writeFileExclusive(path string, body []byte, mode os.FileMode) error {
 	if err := os.Link(tmpPath, path); err != nil {
 		return err
 	}
-	return nil
+	return syncDir(dir)
 }
 
 func checkRegularFile(path string) error {
@@ -983,7 +983,7 @@ func writeObjectAtomic(tmpDir, path string, body []byte, digest string) error {
 		}
 		return err
 	}
-	return nil
+	return syncDir(filepath.Dir(path))
 }
 
 func rollbackManifestIfEmptyLedger(manifestPath, ledgerPath string) error {
@@ -1092,7 +1092,51 @@ func ensureStateRoot(root string) error {
 	}
 	parent := filepath.Dir(clean)
 	if parent != clean {
-		if err := ensureRealDirPath(parent); err != nil {
+		if err := ensureStateRootParentPath(parent); err != nil {
+			return err
+		}
+	}
+	if err := os.Mkdir(clean, 0o755); err != nil {
+		if os.IsExist(err) {
+			return requireExistingRealDir(clean)
+		}
+		return err
+	}
+	return nil
+}
+
+func ensureStateRootParentPath(path string) error {
+	clean := filepath.Clean(path)
+	info, err := os.Lstat(clean)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, err := filepath.EvalSymlinks(clean)
+			if err != nil {
+				return err
+			}
+			if hasHiddenComponent(filepath.Clean(resolved)) {
+				return fmt.Errorf("state parent resolves through hidden directories: %s", clean)
+			}
+			resolvedInfo, err := os.Stat(resolved)
+			if err != nil {
+				return err
+			}
+			if !resolvedInfo.IsDir() {
+				return fmt.Errorf("state parent symlink target is not a directory: %s", clean)
+			}
+			return nil
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("state parent exists and is not a directory: %s", clean)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	parent := filepath.Dir(clean)
+	if parent != clean {
+		if err := ensureStateRootParentPath(parent); err != nil {
 			return err
 		}
 	}
