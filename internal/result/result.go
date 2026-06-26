@@ -396,7 +396,7 @@ func Import(opts ImportOptions) (ImportResult, error) {
 		"accepted_findings":                 strconv.Itoa(countAcceptedFindings(record.Findings)),
 		"duplicate_findings":                strconv.Itoa(countFindingState(record.Findings, StateDuplicate)),
 		"rejected_structural":               strconv.Itoa(countFindingState(record.Findings, StateRejectedStructural)),
-		"needs_context":                     strconv.FormatBool(len(record.NeedsContext) > 0 || hasFindingState(record.Findings, StateNeedsContext)),
+		"needs_context":                     strconv.FormatBool(len(record.NeedsContext) > 0),
 		"primary_review_evidence":           strconv.FormatBool(record.Evidence.PrimaryReviewEvidence),
 		"deterministic_refutation_evidence": strconv.FormatBool(record.Evidence.DeterministicRefutationEvidence),
 	}

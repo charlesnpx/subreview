@@ -166,6 +166,56 @@ func TestImportNormalizesTerminalDiscoveryFindingToNeedsConfirmation(t *testing.
 	}
 }
 
+func TestFindingNeedsContextDoesNotCreatePermanentContextBlocker(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	finding := validFinding("needs-context-finding")
+	finding.State = reviewresult.StateNeedsContext
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{finding},
+		}),
+		Now: time.Unix(236, 0),
+	}); err != nil {
+		t.Fatalf("Import needs-context finding: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
+				FindingID:        "needs-context-finding",
+				State:            reviewresult.StateInvalidated,
+				Basis:            reviewresult.BasisFreshSemantic,
+				Summary:          "Follow-up context showed the finding is not a defect.",
+				VerifierRelation: reviewresult.RelationFreshBlinded,
+				RelationEvidence: reviewresult.RelationEvidenceCallerAssert,
+			}},
+		}),
+		Now: time.Unix(237, 0),
+	}); err != nil {
+		t.Fatalf("Import verifier outcome: %v", err)
+	}
+	status, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if hasStatusBlocker(status, "needs_context") || hasStatusBlocker(status, "open_finding") {
+		t.Fatalf("resolved finding-level needs_context should not leave blockers: %+v", status.Blockers)
+	}
+}
+
 func TestFindingDedupeIsScopedToCoverageManifest(t *testing.T) {
 	repo, stateDir, firstPacket, _ := initializedResultState(t)
 	first, err := reviewresult.Import(reviewresult.ImportOptions{
