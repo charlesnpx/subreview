@@ -8,6 +8,9 @@ Current early commands:
 subreview version
 subreview state init --state /tmp/subreview-state --repo . --json
 subreview state validate --state /tmp/subreview-state --json
+subreview policy check --config /tmp/subreview-policy.json --repo . --json
+subreview policy bind --state /tmp/subreview-state --config /tmp/subreview-policy.json --profile default --json
+subreview policy explain --state /tmp/subreview-state --profile default --json
 subreview install-skills --plan --target all --json
 subreview install-skills --install --target all --json --install-root /tmp/subreview-stage
 subreview install-skills --uninstall --target all --json --install-root /tmp/subreview-stage
@@ -28,5 +31,7 @@ Real installs without `--install-root` target hidden home paths such as `~/.loca
 The installed skills are intentionally thin. They tell agents to invoke the CLI, require explicit `--state <dir>` paths for any command that accepts state, avoid hidden default state creation, and avoid claiming closure from a clean reviewer response alone. Later stories add the actual v1 workflow commands behind the CLI.
 
 `subreview state init` creates local state only at the supplied non-hidden `--state` path. The state layout contains `objects/sha256/`, `manifests/`, and `ledger.jsonl`. `subreview state validate` checks ledger JSONL, event linkage, referenced CAS objects, and digest integrity.
+
+`subreview policy check` validates strict JSON control-plane policy config without writing state. `subreview policy bind` normalizes a profile, stores it in state CAS, and records a `policy.bound` ledger event. `subreview policy explain` reads the bound profile and reports closure predicates as required evidence facts rather than scalar assurance grades.
 
 The existing `research/` corpus and `scripts/` utilities are research inputs for policy design and evaluation. They are separate from the v1 runtime CLI and are not imported or executed by `subreview` commands.

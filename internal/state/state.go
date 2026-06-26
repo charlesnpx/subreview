@@ -187,6 +187,64 @@ func Open(root string) (Store, error) {
 	return Store{root: stateRoot}, nil
 }
 
+func ResolveStateDir(root string) (string, error) {
+	return explicitStateDir(root)
+}
+
+func ReadEvents(stateDir string) ([]Event, error) {
+	root, err := explicitStateDir(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	lay := stateLayout(root)
+	if err := checkRegularFile(lay.ledgerPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("ledger missing: %s", lay.ledgerPath)
+		}
+		return nil, err
+	}
+	f, err := os.Open(lay.ledgerPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLedgerScanTokenBytes)
+	events := []Event{}
+	lineNo := 0
+	prior := ""
+	for scanner.Scan() {
+		lineNo++
+		rawLine := scanner.Bytes()
+		if len(rawLine) > maxLedgerLineBytes {
+			return nil, fmt.Errorf("ledger line %d exceeds %d byte limit", lineNo, maxLedgerLineBytes)
+		}
+		line := strings.TrimSpace(string(rawLine))
+		if line == "" {
+			continue
+		}
+		var event Event
+		if err := decodeStrictJSON([]byte(line), &event); err != nil {
+			return nil, fmt.Errorf("malformed ledger event at line %d: %w", lineNo, err)
+		}
+		var validationErr error
+		validateLedgerEvent(event, prior, func(code, message string) {
+			if validationErr == nil {
+				validationErr = fmt.Errorf("%s at ledger line %d: %s", code, lineNo, message)
+			}
+		}, nil)
+		if validationErr != nil {
+			return nil, validationErr
+		}
+		prior = event.EventID
+		events = append(events, event)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
 func (s Store) PutJSON(value any, mediaType string) (ObjectRef, error) {
 	body, err := json.Marshal(value)
 	if err != nil {
