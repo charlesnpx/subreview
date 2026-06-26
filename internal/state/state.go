@@ -355,6 +355,7 @@ func appendLedgerLine(path string, event Event) (Event, error) {
 	}
 	var f *os.File
 	needsSeparator := false
+	created := false
 	if info, err := os.Lstat(path); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return Event{}, fmt.Errorf("path is not a regular file: %s", path)
@@ -374,6 +375,7 @@ func appendLedgerLine(path string, event Event) (Event, error) {
 		if err != nil {
 			return Event{}, err
 		}
+		created = true
 	} else {
 		return Event{}, err
 	}
@@ -382,14 +384,43 @@ func appendLedgerLine(path string, event Event) (Event, error) {
 	if needsSeparator {
 		body = append([]byte{'\n'}, body...)
 	}
-	if _, err := f.Write(body); err != nil {
-		_ = f.Close()
-		return Event{}, err
+	n, writeErr := f.Write(body)
+	if writeErr == nil && n != len(body) {
+		writeErr = io.ErrShortWrite
 	}
-	if err := f.Close(); err != nil {
-		return Event{}, err
+	var syncErr error
+	if writeErr == nil {
+		syncErr = f.Sync()
+	}
+	closeErr := f.Close()
+	if writeErr != nil {
+		return Event{}, writeErr
+	}
+	if syncErr != nil {
+		return Event{}, syncErr
+	}
+	if closeErr != nil {
+		return Event{}, closeErr
+	}
+	if created {
+		if err := syncDir(filepath.Dir(path)); err != nil {
+			return Event{}, err
+		}
 	}
 	return event, nil
+}
+
+func syncDir(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 func ledgerNeedsSeparator(path string, size int64) (bool, error) {
@@ -577,36 +608,46 @@ func validateLedger(lay layout, result *ValidationResult) ledgerInfo {
 			info.FirstEvent = &first
 			info.FirstLine = lineNo
 		}
-		if event.SchemaVersion != SchemaVersion {
-			result.addError("unsupported_event_schema", lay.ledgerPath, lineNo, fmt.Sprintf("event schema_version=%d", event.SchemaVersion))
-		}
-		if event.Type == "" {
-			result.addError("missing_event_type", lay.ledgerPath, lineNo, "event type is required")
-		}
-		if event.Time == "" {
-			result.addError("missing_event_time", lay.ledgerPath, lineNo, "event time is required")
-		} else if _, err := time.Parse(time.RFC3339Nano, event.Time); err != nil {
-			result.addError("invalid_event_time", lay.ledgerPath, lineNo, err.Error())
-		}
-		if event.PriorEventID != prior {
-			result.addError("prior_event_mismatch", lay.ledgerPath, lineNo, fmt.Sprintf("expected prior_event_id %q, got %q", prior, event.PriorEventID))
-		}
-		if expected := eventID(event); event.EventID != expected {
-			result.addError("event_id_mismatch", lay.ledgerPath, lineNo, fmt.Sprintf("expected %s, got %s", expected, event.EventID))
-		}
-		for _, digest := range event.ObjectDigests {
-			if err := validateDigest(digest); err != nil {
-				result.addError("invalid_object_digest", lay.ledgerPath, lineNo, err.Error())
-				continue
-			}
+		validateLedgerEvent(event, prior, func(code, message string) {
+			result.addError(code, lay.ledgerPath, lineNo, message)
+		}, func(digest string) {
 			info.Referenced = append(info.Referenced, digest)
-		}
+		})
 		prior = event.EventID
 	}
 	if err := scanner.Err(); err != nil {
 		result.addError("ledger_read_failed", lay.ledgerPath, lineNo, err.Error())
 	}
 	return info
+}
+
+func validateLedgerEvent(event Event, prior string, addIssue func(string, string), addReferenced func(string)) {
+	if event.SchemaVersion != SchemaVersion {
+		addIssue("unsupported_event_schema", fmt.Sprintf("event schema_version=%d", event.SchemaVersion))
+	}
+	if event.Type == "" {
+		addIssue("missing_event_type", "event type is required")
+	}
+	if event.Time == "" {
+		addIssue("missing_event_time", "event time is required")
+	} else if _, err := time.Parse(time.RFC3339Nano, event.Time); err != nil {
+		addIssue("invalid_event_time", err.Error())
+	}
+	if event.PriorEventID != prior {
+		addIssue("prior_event_mismatch", fmt.Sprintf("expected prior_event_id %q, got %q", prior, event.PriorEventID))
+	}
+	if expected := eventID(event); event.EventID != expected {
+		addIssue("event_id_mismatch", fmt.Sprintf("expected %s, got %s", expected, event.EventID))
+	}
+	for _, digest := range event.ObjectDigests {
+		if err := validateDigest(digest); err != nil {
+			addIssue("invalid_object_digest", err.Error())
+			continue
+		}
+		if addReferenced != nil {
+			addReferenced(digest)
+		}
+	}
 }
 
 func validateManifestFile(root, path string, result *ValidationResult) manifestInfo {
@@ -851,6 +892,7 @@ func lastEventID(path string) (string, error) {
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLedgerScanTokenBytes)
 	last := ""
 	lineNo := 0
+	prior := ""
 	for scanner.Scan() {
 		lineNo++
 		line := strings.TrimSpace(scanner.Text())
@@ -861,6 +903,16 @@ func lastEventID(path string) (string, error) {
 		if err := decodeStrictJSON([]byte(line), &event); err != nil {
 			return "", fmt.Errorf("malformed ledger event at line %d: %w", lineNo, err)
 		}
+		var validationErr error
+		validateLedgerEvent(event, prior, func(code, message string) {
+			if validationErr == nil {
+				validationErr = fmt.Errorf("%s at ledger line %d: %s", code, lineNo, message)
+			}
+		}, nil)
+		if validationErr != nil {
+			return "", validationErr
+		}
+		prior = event.EventID
 		last = event.EventID
 	}
 	return last, scanner.Err()
@@ -876,7 +928,10 @@ func prepareLedgerForInit(root, path string) error {
 		if err != nil {
 			return err
 		}
-		return f.Close()
+		if err := f.Close(); err != nil {
+			return err
+		}
+		return syncDir(filepath.Dir(path))
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return fmt.Errorf("ledger path is not a regular file: %s", path)

@@ -521,6 +521,39 @@ func TestValidateRejectsUnknownLedgerEventFields(t *testing.T) {
 	}
 }
 
+func TestAppendEventRejectsCorruptExistingLedgerChain(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if _, err := Init(InitOptions{StateDir: stateDir, RepoPath: root, Now: time.Unix(100, 0)}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	ledgerPath := filepath.Join(stateDir, "ledger.jsonl")
+	body, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	var event Event
+	if err := decodeStrictJSON([]byte(strings.TrimSpace(string(body))), &event); err != nil {
+		t.Fatalf("decode first event: %v", err)
+	}
+	event.EventID = "evt_" + strings.Repeat("0", 24)
+	line, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal tampered event: %v", err)
+	}
+	if err := os.WriteFile(ledgerPath, append(line, '\n'), 0o644); err != nil {
+		t.Fatalf("write tampered ledger: %v", err)
+	}
+	if _, err := AppendEvent(stateDir, Event{Time: time.Unix(101, 0).UTC().Format(time.RFC3339Nano), Type: "after_corrupt"}); err == nil || !strings.Contains(err.Error(), "event_id_mismatch") {
+		t.Fatalf("expected append to reject corrupt ledger chain, got %v", err)
+	}
+	validation := Validate(stateDir)
+	if validation.OK {
+		t.Fatal("expected corrupt ledger validation failure")
+	}
+	requireIssue(t, validation, "event_id_mismatch")
+}
+
 func TestLedgerAppendPreservesLedgerWithoutTrailingNewline(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")
