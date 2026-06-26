@@ -75,6 +75,12 @@ type Facts struct {
 	CoverageObligationsSatisfied   bool `json:"coverage_obligations_satisfied"`
 	ContextRequestsResolved        bool `json:"context_requests_resolved"`
 	IndependentFinalCompleted      bool `json:"independent_final_completed"`
+	FreshBlindedReview             bool `json:"fresh_blinded_review"`
+	CLIWitnessed                   bool `json:"cli_witnessed"`
+	BasisClean                     bool `json:"basis_clean"`
+	BasisFixed                     bool `json:"basis_fixed"`
+	BasisAcceptedRisk              bool `json:"basis_accepted_risk"`
+	BasisDeterministicRefutation   bool `json:"basis_deterministic_refutation"`
 	PolicyFinalPredicatesSatisfied bool `json:"policy_final_predicates_satisfied"`
 }
 
@@ -259,8 +265,14 @@ func Evaluate(opts EvaluateOptions) (Result, error) {
 	obligationFacts := obligationFacts(status)
 	gateFacts := gateFacts(gateEvidence, obligationFacts.RequiredGateCount)
 	facts := factsFromEvidence(status, manifest, observations, status.Manifest.Digest, findingFacts, blockers)
-	blockers = append(blockers, policyFactBlockers(effective, facts)...)
 	scheduler := schedulerFacts(effective, runFacts)
+	if scheduler.OverLimit {
+		blockers = append(blockers, Blocker{
+			Code:    "scheduler_route_limit_exceeded",
+			Message: "policy route limits exceeded: " + strings.Join(scheduler.Violations, "; "),
+		})
+	}
+	blockers = append(blockers, policyFactBlockers(effective, facts)...)
 	closed := status.Closed && facts.PolicyBound && len(blockers) == 0
 
 	sortBlockers(blockers)
@@ -372,6 +384,7 @@ func readEffectivePolicy(store state.Store, manifest obligation.CoverageManifest
 func factsFromEvidence(status obligation.StatusResult, manifest obligation.CoverageManifest, observations []reviewresult.EvidenceObservation, manifestDigest string, findings FindingFacts, blockers []Blocker) Facts {
 	_, hasPrimary := reviewresult.LatestPrimaryReviewForManifest(observations, manifestDigest)
 	_, hasFinal := reviewresult.LatestIndependentFinalReviewForManifest(observations, manifestDigest)
+	evidence := evidenceFacts(observations, manifestDigest)
 	facts := Facts{
 		PolicyBound:                    manifest.Policy != nil,
 		RequiredGatesSatisfied:         obligationsSatisfied(status, obligation.KindGateRequirement),
@@ -380,7 +393,43 @@ func factsFromEvidence(status obligation.StatusResult, manifest obligation.Cover
 		CoverageObligationsSatisfied:   coverageSatisfied(status),
 		ContextRequestsResolved:        !hasBlockerCode(blockers, "needs_context"),
 		IndependentFinalCompleted:      hasFinal,
+		FreshBlindedReview:             evidence.FreshBlindedReview,
+		CLIWitnessed:                   evidence.CLIWitnessed,
+		BasisClean:                     evidence.BasisClean,
+		BasisFixed:                     evidence.BasisFixed,
+		BasisAcceptedRisk:              evidence.BasisAcceptedRisk,
+		BasisDeterministicRefutation:   evidence.BasisDeterministicRefutation,
 		PolicyFinalPredicatesSatisfied: obligationsSatisfied(status, obligation.KindPolicyFinalReview),
+	}
+	return facts
+}
+
+func evidenceFacts(observations []reviewresult.EvidenceObservation, manifestDigest string) Facts {
+	facts := Facts{}
+	for _, observation := range observations {
+		record := observation.Record
+		if record.Packet.CoverageManifest.Digest != manifestDigest {
+			continue
+		}
+		if record.RunKind == reviewresult.RunKindDiscovery && record.Route == reviewresult.RoutePrimaryReview && record.Outcome == reviewresult.OutcomeClean {
+			facts.BasisClean = true
+		}
+		for _, outcome := range record.VerifierOutcomes {
+			if outcome.State == reviewresult.StateVerified && outcome.Basis == reviewresult.BasisFixVerification {
+				facts.BasisFixed = true
+			}
+			if outcome.VerifierRelation == reviewresult.RelationFreshBlinded {
+				facts.FreshBlindedReview = true
+			}
+			if outcome.RelationEvidence == reviewresult.RelationEvidenceCLIWitnessed {
+				facts.CLIWitnessed = true
+			}
+		}
+		for _, refutation := range record.DeterministicRefutations {
+			if refutation.Basis == reviewresult.BasisDeterministicRefutation || refutation.Basis == reviewresult.BasisExecutableRefutation {
+				facts.BasisDeterministicRefutation = true
+			}
+		}
 	}
 	return facts
 }
@@ -414,8 +463,20 @@ func factSatisfied(fact string, facts Facts) bool {
 		return facts.CoverageObligationsSatisfied
 	case "context_requests_resolved":
 		return facts.ContextRequestsResolved
-	case "independent_final_completed", "fresh_blinded_review", "cli_witnessed":
+	case "independent_final_completed":
 		return facts.IndependentFinalCompleted
+	case "fresh_blinded_review":
+		return facts.FreshBlindedReview
+	case "cli_witnessed":
+		return facts.CLIWitnessed
+	case "basis_clean":
+		return facts.BasisClean
+	case "basis_fixed":
+		return facts.BasisFixed
+	case "basis_accepted_risk":
+		return facts.BasisAcceptedRisk
+	case "basis_deterministic_refutation":
+		return facts.BasisDeterministicRefutation
 	default:
 		return false
 	}

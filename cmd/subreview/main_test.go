@@ -882,6 +882,7 @@ func TestCloseCLIEndToEndSmoke(t *testing.T) {
         "blocking_findings_verified",
         "coverage_obligations_satisfied",
         "context_requests_resolved",
+        "basis_fixed",
         "policy_bound"
       ],
       "risk_routing": [],
@@ -993,11 +994,13 @@ func TestCloseCLIEndToEndSmoke(t *testing.T) {
 		Outcome:       reviewresult.OutcomeVerification,
 		Summary:       "The finding is fixed in the final state.",
 		VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
-			FindingID: "finding-close",
-			Outcome:   reviewresult.VerificationResolved,
-			State:     reviewresult.StateVerified,
-			Basis:     reviewresult.BasisFixVerification,
-			Summary:   "alpha.txt now contains fixed rather than bug.",
+			FindingID:        "finding-close",
+			Outcome:          reviewresult.VerificationResolved,
+			State:            reviewresult.StateVerified,
+			Basis:            reviewresult.BasisFixVerification,
+			Summary:          "alpha.txt now contains fixed rather than bug.",
+			VerifierRelation: reviewresult.RelationFreshBlinded,
+			RelationEvidence: reviewresult.RelationEvidenceCLIWitnessed,
 		}},
 		Telemetry: reviewresult.TokenTelemetry{
 			GrossVerificationTokens:       130,
@@ -1023,6 +1026,9 @@ func TestCloseCLIEndToEndSmoke(t *testing.T) {
 			BlockingFindingsVerified     bool `json:"blocking_findings_verified"`
 			CoverageObligationsSatisfied bool `json:"coverage_obligations_satisfied"`
 			ContextRequestsResolved      bool `json:"context_requests_resolved"`
+			BasisFixed                   bool `json:"basis_fixed"`
+			FreshBlindedReview           bool `json:"fresh_blinded_review"`
+			CLIWitnessed                 bool `json:"cli_witnessed"`
 		} `json:"facts"`
 		Gates struct {
 			RequiredCount int `json:"required_count"`
@@ -1057,7 +1063,7 @@ func TestCloseCLIEndToEndSmoke(t *testing.T) {
 	if !closeResult.Closed || len(closeResult.Blockers) != 0 {
 		t.Fatalf("expected closure success: %s", closeOut)
 	}
-	if !closeResult.Facts.RequiredGatesSatisfied || !closeResult.Facts.PrimaryReviewCompleted || !closeResult.Facts.BlockingFindingsVerified || !closeResult.Facts.CoverageObligationsSatisfied || !closeResult.Facts.ContextRequestsResolved {
+	if !closeResult.Facts.RequiredGatesSatisfied || !closeResult.Facts.PrimaryReviewCompleted || !closeResult.Facts.BlockingFindingsVerified || !closeResult.Facts.CoverageObligationsSatisfied || !closeResult.Facts.ContextRequestsResolved || !closeResult.Facts.BasisFixed || !closeResult.Facts.FreshBlindedReview || !closeResult.Facts.CLIWitnessed {
 		t.Fatalf("closure facts incomplete: %s", closeOut)
 	}
 	if closeResult.Gates.RequiredCount != 1 || closeResult.Gates.PassCount != 1 || closeResult.Findings.AcceptedCount != 1 || closeResult.Findings.OpenBlockingCount != 0 {

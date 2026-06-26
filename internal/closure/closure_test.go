@@ -89,7 +89,7 @@ func TestEvaluateClosesFromLedgerFactsAndRejectsWrongProfile(t *testing.T) {
 	if !closed.Closed || len(closed.Blockers) != 0 {
 		t.Fatalf("expected closed state with no blockers: %+v", closed)
 	}
-	if !closed.Facts.PolicyBound || !closed.Facts.PrimaryReviewCompleted || !closed.Facts.CoverageObligationsSatisfied || !closed.Facts.BlockingFindingsVerified || !closed.Facts.ContextRequestsResolved {
+	if !closed.Facts.PolicyBound || !closed.Facts.PrimaryReviewCompleted || !closed.Facts.CoverageObligationsSatisfied || !closed.Facts.BlockingFindingsVerified || !closed.Facts.ContextRequestsResolved || !closed.Facts.BasisClean {
 		t.Fatalf("closure facts should reflect satisfied ledger evidence: %+v", closed.Facts)
 	}
 	if closed.Facts.IndependentFinalCompleted {
@@ -103,6 +103,28 @@ func TestEvaluateClosesFromLedgerFactsAndRejectsWrongProfile(t *testing.T) {
 	}
 	if closed.Report.Digest == "" || closed.EventID == "" {
 		t.Fatalf("closure report should be persisted and ledgered: %+v", closed)
+	}
+
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: primary.Packet.Digest,
+		ResultPath: writeClosureWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        primary.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "Second primary review should exceed the v1 route limit.",
+		}),
+	}); err != nil {
+		t.Fatalf("Import second clean result: %v", err)
+	}
+	overLimit, err := closure.Evaluate(closure.EvaluateOptions{StateDir: stateDir, PolicyProfile: "default"})
+	if err != nil {
+		t.Fatalf("Evaluate over route limit: %v", err)
+	}
+	if overLimit.Closed || !overLimit.Scheduler.OverLimit || overLimit.Scheduler.AntiThrashOK || !hasClosureBlocker(overLimit.Blockers, "scheduler_route_limit_exceeded") {
+		t.Fatalf("route-limit violation should block closure: %+v", overLimit)
 	}
 
 	wrongProfile, err := closure.Evaluate(closure.EvaluateOptions{StateDir: stateDir, PolicyProfile: "strict"})
