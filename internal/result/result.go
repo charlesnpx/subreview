@@ -1143,14 +1143,13 @@ func validateVerifierOutcomeEvidence(outcomes []VerifierOutcome, refutations []D
 		refutedFindings[refutation.FindingID] = struct{}{}
 	}
 	for _, outcome := range outcomes {
-		if outcome.State != StateInvalidated {
-			continue
-		}
-		if outcome.Basis != BasisDeterministicRefutation && outcome.Basis != BasisExecutableRefutation {
-			continue
-		}
-		if _, ok := refutedFindings[outcome.FindingID]; !ok {
+		_, hasRefutation := refutedFindings[outcome.FindingID]
+		deterministicOutcome := outcome.State == StateInvalidated && (outcome.Basis == BasisDeterministicRefutation || outcome.Basis == BasisExecutableRefutation)
+		if deterministicOutcome && !hasRefutation {
 			return fmt.Errorf("deterministic verifier outcome for %s requires matching deterministic refutation evidence", outcome.FindingID)
+		}
+		if hasRefutation && !deterministicOutcome {
+			return fmt.Errorf("deterministic refutation for %s conflicts with verifier outcome %s/%s", outcome.FindingID, outcome.Outcome, outcome.Basis)
 		}
 	}
 	return nil

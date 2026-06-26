@@ -572,6 +572,55 @@ func TestVerificationOutcomeRejectsDuplicateTargetedOutcomes(t *testing.T) {
 	}
 }
 
+func TestVerificationOutcomeRejectsContradictoryRefutationEvidence(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("finding-one")},
+		}),
+		Now: time.Unix(239, 6),
+	}); err != nil {
+		t.Fatalf("Import finding: %v", err)
+	}
+	verificationPacket := buildVerificationResultPacket(t, stateDir, "finding-one")
+	before := readEvents(t, stateDir)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: verificationPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        verificationPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
+				FindingID: "finding-one",
+				Outcome:   reviewresult.VerificationNotResolved,
+				Summary:   "The final state still leaves the reported failure.",
+			}},
+			DeterministicRefutations: []reviewresult.DeterministicRefutationInput{{
+				FindingID:    "finding-one",
+				EvidenceKind: "test",
+				Summary:      "This contradictory refutation would otherwise close the finding.",
+				Citations:    []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 1}},
+			}},
+		}),
+		Now: time.Unix(239, 7),
+	}); err == nil {
+		t.Fatal("verification outcome should reject contradictory deterministic refutation evidence")
+	}
+	if after := readEvents(t, stateDir); len(after) != len(before) {
+		t.Fatalf("contradictory refutation import should not append ledger event: before=%d after=%d", len(before), len(after))
+	}
+}
+
 func TestVerificationNotResolvedAndDeterministicRefutedOutcomes(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	if _, err := reviewresult.Import(reviewresult.ImportOptions{
