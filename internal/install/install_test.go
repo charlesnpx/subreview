@@ -94,11 +94,16 @@ func TestRunInstallStagedAllTargets(t *testing.T) {
 		for _, want := range []string{
 			"subreview version",
 			"subreview install-skills --plan --target all --json",
+			"subreview artifact import --state <dir> --kind plan --path <file> --title <title>",
+			"subreview artifact status --state <dir> --artifact <id> --json",
+			"subreview packet build --state <dir> --kind artifact --artifact <id> --json",
 			"subreview close --state <dir> --policy-profile <name> --json",
+			"external subagent runner",
+			"Do not claim that `subreview` spawns subagents",
 			"Do not simulate unsupported `subreview` commands in prose",
 			"explicit `--state <dir>` path",
 			"Do not create hidden default state directories",
-			"Do not claim review closure from a clean reviewer response alone",
+			"Do not claim code-review closure from a clean reviewer response alone",
 		} {
 			if !strings.Contains(content, want) {
 				t.Fatalf("staged skill %s missing %q", path, want)

@@ -25,8 +25,11 @@ subreview gates run --state <dir> --catalog <path> --command-id <id> --snapshot 
 subreview gates record --state <dir> --catalog <path> --command-id <id> --snapshot <base|proposal|final> --outcome <pass|fail|error> --json
 subreview obligations build --state <dir> --json
 subreview obligations status --state <dir> --json
+subreview artifact import --state <dir> --kind plan --path <file> --title <title> [--revises <artifact-id>] --json
+subreview artifact status --state <dir> --artifact <id> --json
 subreview packet build --state <dir> --kind primary --json
 subreview packet build --state <dir> --kind verification --finding <id> --json
+subreview packet build --state <dir> --kind artifact --artifact <id> --json
 subreview result import --state <dir> --packet <id> --result <file> --json
 subreview close --state <dir> --policy-profile <name> --json
 subreview install-skills --plan --target all --json
@@ -36,4 +39,8 @@ Do not simulate unsupported `subreview` commands in prose. If a requested comman
 
 For any command that accepts state, require an explicit `--state <dir>` path supplied by the operator or current task. Do not create hidden default state directories, and do not use `~/.subreview` or any other implicit hidden state path.
 
-Do not claim review closure from a clean reviewer response alone. Closure must come from `subreview close`, which evaluates the latest policy-bound ledger evidence and reports facts, blockers, gates, findings, discovery/verification runs, token telemetry, and scheduler status.
+For standalone plan review, use artifact commands as controller recordkeeping only: import the plan artifact, build an `artifact_review` packet, run the actual review with the external subagent runner available in the current environment, import that structured result, and use `subreview artifact status` as the loop gate. Artifact review does not require snapshots, diffs, obligations, policy binding, gates, coverage manifests, or `subreview close`.
+
+Do not claim that `subreview` spawns subagents. It records state and packets; the operator's orchestration tool performs the review.
+
+Do not claim code-review closure from a clean reviewer response alone. Code-review closure must come from `subreview close`, which evaluates the latest policy-bound ledger evidence and reports facts, blockers, gates, findings, discovery/verification runs, token telemetry, and scheduler status.
