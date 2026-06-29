@@ -107,6 +107,31 @@ func TestArtifactImportAndStatusCLI(t *testing.T) {
 	if status.ArtifactID != imported.ArtifactID || status.Status != "no_review_packet" || !status.ReviewRequired || status.Artifact.ContentDigest != imported.ContentDigest {
 		t.Fatalf("bad status output: %s", statusOut)
 	}
+	statusTextOut, err := exec.Command(bin, "artifact", "status", "--state", stateDir, "--artifact", imported.ArtifactID).CombinedOutput()
+	if err != nil {
+		t.Fatalf("artifact status text failed: %v\n%s", err, statusTextOut)
+	}
+	if got := string(statusTextOut); !strings.Contains(got, "artifact status: "+imported.ArtifactID) || !strings.Contains(got, "status=no_review_packet") {
+		t.Fatalf("bad text status output: %s", statusTextOut)
+	}
+	revisedPath := filepath.Join(root, "revised-plan.md")
+	if err := os.WriteFile(revisedPath, []byte("# Revised Plan\n\nReview me again.\n"), 0o644); err != nil {
+		t.Fatalf("write revised plan: %v", err)
+	}
+	revisedOut, err := exec.Command(bin, "artifact", "import", "--state", stateDir, "--kind", "plan", "--path", revisedPath, "--title", "CLI Plan Revision", "--revises", imported.ArtifactID, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("revised artifact import failed: %v\n%s", err, revisedOut)
+	}
+	var revised struct {
+		ArtifactID string `json:"artifact_id"`
+		Revises    string `json:"revises"`
+	}
+	if err := json.Unmarshal(revisedOut, &revised); err != nil {
+		t.Fatalf("revised import output is not json: %v\n%s", err, revisedOut)
+	}
+	if revised.ArtifactID == "" || revised.ArtifactID == imported.ArtifactID || revised.Revises != imported.ArtifactID {
+		t.Fatalf("bad revised import output: %s", revisedOut)
+	}
 	validateOut, err := exec.Command(bin, "state", "validate", "--state", stateDir, "--json").CombinedOutput()
 	if err != nil {
 		t.Fatalf("state validate failed: %v\n%s", err, validateOut)

@@ -170,12 +170,39 @@ func TestStatusReportsMalformedForkBlocker(t *testing.T) {
 	}
 }
 
+func TestStatusReportsMalformedCycleBlocker(t *testing.T) {
+	repo, stateDir := initializedArtifactState(t)
+	appendArtifactRecord(t, stateDir, repo, "artifact-a", "artifact-c", "a\n")
+	appendArtifactRecord(t, stateDir, repo, "artifact-b", "artifact-a", "b\n")
+	appendArtifactRecord(t, stateDir, repo, "artifact-c", "artifact-b", "c\n")
+
+	status, err := Status(StatusOptions{StateDir: stateDir, ArtifactID: "artifact-a"})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Status != "blocked" || status.ReviewRequired {
+		t.Fatalf("revision cycle should block status: %+v", status)
+	}
+	if !hasBlocker(status.Blockers, "revision_cycle") {
+		t.Fatalf("expected revision_cycle blocker: %+v", status.Blockers)
+	}
+}
+
 func TestStatusRejectsUnknownArtifact(t *testing.T) {
 	_, stateDir := initializedArtifactState(t)
 	_, err := Status(StatusOptions{StateDir: stateDir, ArtifactID: "artifact-missing"})
 	if err == nil || !strings.Contains(err.Error(), "artifact not found") {
 		t.Fatalf("expected unknown artifact error, got %v", err)
 	}
+}
+
+func hasBlocker(blockers []Blocker, code string) bool {
+	for _, blocker := range blockers {
+		if blocker.Code == code {
+			return true
+		}
+	}
+	return false
 }
 
 func initializedArtifactState(t *testing.T) (string, string) {
