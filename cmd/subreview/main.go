@@ -173,7 +173,9 @@ func artifactStatus(args []string) error {
 func usageArtifact(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   subreview artifact import --state <dir> --kind plan --path <file> --title <title> [--revises <artifact-id>] [--json]
-  subreview artifact status --state <dir> --artifact <id> [--json]`)
+  subreview artifact status --state <dir> --artifact <id> [--json]
+
+Standalone artifact review records plans or similar text artifacts without snapshots, diffs, obligations, coverage manifests, or close.`)
 }
 
 func usageArtifactImport(w io.Writer) {
@@ -284,7 +286,8 @@ func usagePacketBuild(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   subreview packet build --state <dir> --kind <primary|verification|artifact> [--artifact <id>] [--finding <id>] [--route targeted_verification|artifact_review] [--json]
 
-Builds a canonical primary, finding-targeted verification, or standalone artifact packet with stable and volatile prompt sections.`)
+Builds a canonical primary, finding-targeted verification, or standalone artifact packet with stable and volatile prompt sections.
+Artifact packets use --kind artifact --artifact <id>, route artifact_review, and do not require snapshots, diffs, obligations, policy, gates, coverage manifests, or close.`)
 }
 
 func resultCommand(args []string) error {

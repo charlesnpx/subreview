@@ -59,6 +59,10 @@ func TestArtifactImportAndStatusCLI(t *testing.T) {
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("go build subreview: %v\n%s", err, out)
 	}
+	assertCLIHelpContains(t, bin, []string{"artifact", "--help"}, "Standalone artifact review")
+	assertCLIHelpContains(t, bin, []string{"artifact", "status", "--help"}, "Artifact review loops use packet build, result import, and artifact status")
+	assertCLIHelpContains(t, bin, []string{"packet", "build", "--help"}, "Artifact packets use --kind artifact --artifact <id>")
+	assertCLIHelpContains(t, bin, []string{"result", "import", "--help"}, "For artifact_review packets")
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
 	if err := os.MkdirAll(repo, 0o755); err != nil {
@@ -72,6 +76,7 @@ func TestArtifactImportAndStatusCLI(t *testing.T) {
 	if out, err := exec.Command(bin, "state", "init", "--state", stateDir, "--repo", repo, "--json").CombinedOutput(); err != nil {
 		t.Fatalf("state init failed: %v\n%s", err, out)
 	}
+	assertCLIStateValid(t, bin, stateDir)
 	importOut, err := exec.Command(bin, "artifact", "import", "--state", stateDir, "--kind", "plan", "--path", planPath, "--title", "CLI Plan", "--json").CombinedOutput()
 	if err != nil {
 		t.Fatalf("artifact import failed: %v\n%s", err, importOut)
@@ -89,6 +94,7 @@ func TestArtifactImportAndStatusCLI(t *testing.T) {
 	if imported.ArtifactID == "" || imported.Kind != "plan" || imported.Title != "CLI Plan" || imported.ContentDigest == "" || imported.EventID == "" {
 		t.Fatalf("bad import output: %s", importOut)
 	}
+	assertCLIStateValid(t, bin, stateDir)
 	statusOut, err := exec.Command(bin, "artifact", "status", "--state", stateDir, "--artifact", imported.ArtifactID, "--json").CombinedOutput()
 	if err != nil {
 		t.Fatalf("artifact status failed: %v\n%s", err, statusOut)
@@ -135,6 +141,7 @@ func TestArtifactImportAndStatusCLI(t *testing.T) {
 	if builtPacket.Kind != "artifact" || builtPacket.RunKind != "discovery" || builtPacket.Route != "artifact_review" || builtPacket.Packet.Digest == "" || builtPacket.Artifact.ID != imported.ArtifactID {
 		t.Fatalf("bad packet output: %s", packetOut)
 	}
+	assertCLIStateValid(t, bin, stateDir)
 	statusAfterPacketOut, err := exec.Command(bin, "artifact", "status", "--state", stateDir, "--artifact", imported.ArtifactID, "--json").CombinedOutput()
 	if err != nil {
 		t.Fatalf("artifact status after packet failed: %v\n%s", err, statusAfterPacketOut)
@@ -187,6 +194,7 @@ func TestArtifactImportAndStatusCLI(t *testing.T) {
 	if artifactResult.ArtifactID != imported.ArtifactID || artifactResult.Outcome != "findings" || artifactResult.AcceptedFindingCount != 1 {
 		t.Fatalf("bad artifact result output: %s", artifactResultOut)
 	}
+	assertCLIStateValid(t, bin, stateDir)
 	statusAfterResultOut, err := exec.Command(bin, "artifact", "status", "--state", stateDir, "--artifact", imported.ArtifactID, "--json").CombinedOutput()
 	if err != nil {
 		t.Fatalf("artifact status after result failed: %v\n%s", err, statusAfterResultOut)
@@ -228,10 +236,98 @@ func TestArtifactImportAndStatusCLI(t *testing.T) {
 	if revised.ArtifactID == "" || revised.ArtifactID == imported.ArtifactID || revised.Revises != imported.ArtifactID {
 		t.Fatalf("bad revised import output: %s", revisedOut)
 	}
-	validateOut, err := exec.Command(bin, "state", "validate", "--state", stateDir, "--json").CombinedOutput()
+	assertCLIStateValid(t, bin, stateDir)
+	revisedPacketOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "artifact", "--artifact", revised.ArtifactID, "--json").CombinedOutput()
 	if err != nil {
-		t.Fatalf("state validate failed: %v\n%s", err, validateOut)
+		t.Fatalf("revised artifact packet build failed: %v\n%s", err, revisedPacketOut)
 	}
+	var revisedPacket struct {
+		Kind    string `json:"kind"`
+		RunKind string `json:"run_kind"`
+		Route   string `json:"route"`
+		Packet  struct {
+			Digest string `json:"digest"`
+		} `json:"packet"`
+		Artifact struct {
+			ID string `json:"id"`
+		} `json:"artifact"`
+	}
+	if err := json.Unmarshal(revisedPacketOut, &revisedPacket); err != nil {
+		t.Fatalf("revised packet output is not json: %v\n%s", err, revisedPacketOut)
+	}
+	if revisedPacket.Kind != "artifact" || revisedPacket.RunKind != "discovery" || revisedPacket.Route != "artifact_review" || revisedPacket.Packet.Digest == "" || revisedPacket.Artifact.ID != revised.ArtifactID {
+		t.Fatalf("bad revised packet output: %s", revisedPacketOut)
+	}
+	assertCLIStateValid(t, bin, stateDir)
+	statusAfterRevisionPacketOut, err := exec.Command(bin, "artifact", "status", "--state", stateDir, "--artifact", revised.ArtifactID, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("artifact status after revised packet failed: %v\n%s", err, statusAfterRevisionPacketOut)
+	}
+	var statusAfterRevisionPacket struct {
+		Status         string `json:"status"`
+		ReviewRequired bool   `json:"review_required"`
+		LatestPacket   struct {
+			Packet string `json:"packet"`
+		} `json:"latest_packet"`
+		SupersededFindings []struct {
+			FindingID string `json:"finding_id"`
+		} `json:"superseded_findings"`
+	}
+	if err := json.Unmarshal(statusAfterRevisionPacketOut, &statusAfterRevisionPacket); err != nil {
+		t.Fatalf("status after revised packet output is not json: %v\n%s", err, statusAfterRevisionPacketOut)
+	}
+	if statusAfterRevisionPacket.Status != "waiting_for_result" || !statusAfterRevisionPacket.ReviewRequired || statusAfterRevisionPacket.LatestPacket.Packet != revisedPacket.Packet.Digest || len(statusAfterRevisionPacket.SupersededFindings) != 1 || statusAfterRevisionPacket.SupersededFindings[0].FindingID != "artifact-cli" {
+		t.Fatalf("bad status after revised packet output: %s", statusAfterRevisionPacketOut)
+	}
+	cleanResultOut, err := exec.Command(bin, "result", "import", "--state", stateDir, "--packet", revisedPacket.Packet.Digest, "--result", writeCLIWorkerResult(t, reviewresult.WorkerResult{
+		SchemaVersion: reviewresult.SchemaVersion,
+		Packet:        revisedPacket.Packet.Digest,
+		RunKind:       reviewresult.RunKindDiscovery,
+		Route:         reviewresult.RouteArtifactReview,
+		Outcome:       reviewresult.OutcomeClean,
+		Summary:       "No actionable findings remain in the revised plan.",
+	}), "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("clean artifact result import failed: %v\n%s", err, cleanResultOut)
+	}
+	var cleanResult struct {
+		ArtifactID           string `json:"artifact_id"`
+		Outcome              string `json:"outcome"`
+		AcceptedFindingCount int    `json:"accepted_finding_count"`
+	}
+	if err := json.Unmarshal(cleanResultOut, &cleanResult); err != nil {
+		t.Fatalf("clean artifact result output is not json: %v\n%s", err, cleanResultOut)
+	}
+	if cleanResult.ArtifactID != revised.ArtifactID || cleanResult.Outcome != "clean" || cleanResult.AcceptedFindingCount != 0 {
+		t.Fatalf("bad clean artifact result output: %s", cleanResultOut)
+	}
+	assertCLIStateValid(t, bin, stateDir)
+	finalStatusOut, err := exec.Command(bin, "artifact", "status", "--state", stateDir, "--artifact", revised.ArtifactID, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("final artifact status failed: %v\n%s", err, finalStatusOut)
+	}
+	var finalStatus struct {
+		Status           string `json:"status"`
+		ReviewRequired   bool   `json:"review_required"`
+		Outcome          string `json:"outcome"`
+		Clean            bool   `json:"clean"`
+		LatestArtifactID string `json:"latest_artifact_id"`
+		IsLatest         bool   `json:"is_latest"`
+		LatestResult     struct {
+			Packet  string `json:"packet"`
+			Outcome string `json:"outcome"`
+		} `json:"latest_result"`
+		SupersededFindings []struct {
+			FindingID string `json:"finding_id"`
+		} `json:"superseded_findings"`
+	}
+	if err := json.Unmarshal(finalStatusOut, &finalStatus); err != nil {
+		t.Fatalf("final status output is not json: %v\n%s", err, finalStatusOut)
+	}
+	if finalStatus.Status != "clean" || finalStatus.ReviewRequired || finalStatus.Outcome != "clean" || !finalStatus.Clean || finalStatus.LatestArtifactID != revised.ArtifactID || !finalStatus.IsLatest || finalStatus.LatestResult.Packet != revisedPacket.Packet.Digest || finalStatus.LatestResult.Outcome != "clean" || len(finalStatus.SupersededFindings) != 1 {
+		t.Fatalf("bad final artifact status output: %s", finalStatusOut)
+	}
+	assertCLIStateValid(t, bin, stateDir)
 }
 
 func TestHelpLiteralIsAcceptedAsFlagValue(t *testing.T) {
@@ -1329,6 +1425,34 @@ func writeCLIWorkerResult(t *testing.T, value reviewresult.WorkerResult) string 
 		t.Fatalf("write worker result: %v", err)
 	}
 	return path
+}
+
+func assertCLIStateValid(t *testing.T, bin, stateDir string) {
+	t.Helper()
+	validateOut, err := exec.Command(bin, "state", "validate", "--state", stateDir, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("state validate failed: %v\n%s", err, validateOut)
+	}
+	var validation struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.Unmarshal(validateOut, &validation); err != nil {
+		t.Fatalf("validate output is not json: %v\n%s", err, validateOut)
+	}
+	if !validation.OK {
+		t.Fatalf("expected valid state: %s", validateOut)
+	}
+}
+
+func assertCLIHelpContains(t *testing.T, bin string, args []string, want string) {
+	t.Helper()
+	out, err := exec.Command(bin, args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s help failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	if !strings.Contains(string(out), want) {
+		t.Fatalf("%s help missing %q:\n%s", strings.Join(args, " "), want, out)
+	}
 }
 
 func writeCLIFile(t *testing.T, root, rel, body string) {

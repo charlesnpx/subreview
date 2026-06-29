@@ -21,8 +21,11 @@ subreview gates run --state /tmp/subreview-state --catalog /tmp/subreview-gates.
 subreview gates record --state /tmp/subreview-state --catalog /tmp/subreview-gates.json --command-id go_test_all --snapshot proposal --outcome pass --diagnostic "external CI passed" --json
 subreview obligations build --state /tmp/subreview-state --json
 subreview obligations status --state /tmp/subreview-state --json
+subreview artifact import --state /tmp/subreview-state --kind plan --path /tmp/plan.md --title "Plan Review" --json
+subreview artifact status --state /tmp/subreview-state --artifact artifact-... --json
 subreview packet build --state /tmp/subreview-state --kind primary --json
 subreview packet build --state /tmp/subreview-state --kind verification --finding finding-123 --json
+subreview packet build --state /tmp/subreview-state --kind artifact --artifact artifact-... --json
 subreview result import --state /tmp/subreview-state --packet sha256:... --result /tmp/worker-result.json --json
 subreview close --state /tmp/subreview-state --policy-profile default --json
 subreview install-skills --plan --target all --json
@@ -61,5 +64,74 @@ The installed skills are intentionally thin. They tell agents to invoke the CLI,
 `subreview result import` ingests a bounded structured worker result for a built packet. It normalizes clean reviews, findings, context requests, verifier outcomes, deterministic refutations, and token telemetry into CAS, deduplicates findings, records lifecycle states, and lets `subreview obligations status` consume primary-review and deterministic-refutation evidence without treating open findings as closed.
 
 `subreview close` evaluates final-state closure from the latest ledger evidence and the requested bound policy profile. It persists a `closure.evaluated` report object and reports closure facts, blockers, gates, findings, discovery runs, verification runs, measured discovery/verification tokens, estimated full-cycle tokens when telemetry is available, and anti-thrash scheduler status. Closure succeeds only when the obligation engine has satisfied required gates, coverage obligations, context requests, active finding lifecycle requirements, and policy-triggered final review predicates; a clean primary reviewer response alone is not sufficient.
+
+## Standalone artifact review
+
+Use artifact review when the thing being reviewed is a standalone plan or similar text artifact rather than a code diff. The CLI records the artifact, builds the bounded packet, imports the external reviewer result, and reports loop status. The actual reviewer still runs through the operator's subagent tool; `subreview` does not spawn subagents.
+
+Artifact packets avoid snapshots, diffs, policy binding, gates, obligations, coverage manifests, and `subreview close`. `subreview close` remains for code-review closure. For artifact loops, `subreview artifact status` is the gate.
+
+Example command sequence:
+
+```sh
+subreview state init --state /tmp/plan-review-state --repo . --json
+
+subreview artifact import \
+  --state /tmp/plan-review-state \
+  --kind plan \
+  --path /tmp/plan.md \
+  --title "Release Plan" \
+  --json
+
+subreview packet build \
+  --state /tmp/plan-review-state \
+  --kind artifact \
+  --artifact artifact-... \
+  --json
+
+# Run an external subagent on the artifact_review packet, then save its structured result.
+subreview result import \
+  --state /tmp/plan-review-state \
+  --packet sha256:... \
+  --result /tmp/artifact-review-result.json \
+  --json
+
+subreview artifact status \
+  --state /tmp/plan-review-state \
+  --artifact artifact-... \
+  --json
+```
+
+If the reviewer reports findings, revise the plan and continue with a revised artifact:
+
+```sh
+subreview artifact import \
+  --state /tmp/plan-review-state \
+  --kind plan \
+  --path /tmp/revised-plan.md \
+  --title "Release Plan Revision" \
+  --revises artifact-... \
+  --json
+
+subreview packet build \
+  --state /tmp/plan-review-state \
+  --kind artifact \
+  --artifact artifact-... \
+  --json
+
+# Run a fresh external subagent on the revised artifact_review packet.
+subreview result import \
+  --state /tmp/plan-review-state \
+  --packet sha256:... \
+  --result /tmp/revised-artifact-review-result.json \
+  --json
+
+subreview artifact status \
+  --state /tmp/plan-review-state \
+  --artifact artifact-... \
+  --json
+```
+
+The final status is clean only when the latest artifact has a matching latest artifact packet and a clean imported `artifact_review` result. Rebuilding the packet after importing a result returns the artifact to `waiting_for_result` until a result for that latest packet is imported.
 
 Generated/private research corpora and replay artifacts are intentionally not included in this public runtime repository. The generated corpus path is ignored so local research outputs are not tracked accidentally.
