@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/charlesnpx/subreview/internal/anchor"
+	"github.com/charlesnpx/subreview/internal/artifact"
 	"github.com/charlesnpx/subreview/internal/closure"
 	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/install"
@@ -30,6 +31,8 @@ func main() {
 	switch os.Args[1] {
 	case "anchors":
 		err = anchorsCommand(os.Args[2:])
+	case "artifact":
+		err = artifactCommand(os.Args[2:])
 	case "close":
 		err = closeCommand(os.Args[2:])
 	case "diff":
@@ -66,6 +69,8 @@ func main() {
 func usage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   subreview anchors migrate --state <dir> --from <base|proposal|final> --to <base|proposal|final> --anchors <path> [--json]
+  subreview artifact import --state <dir> --kind plan --path <file> --title <title> [--revises <artifact-id>] [--json]
+  subreview artifact status --state <dir> --artifact <id> [--json]
   subreview close --state <dir> --policy-profile <name> [--json]
   subreview diff create --state <dir> --from <base|proposal|final> --to <base|proposal|final> [--json]
   subreview gates check-catalog --catalog <path> --repo <path> [--json]
@@ -84,6 +89,105 @@ func usage(w io.Writer) {
   subreview state init --state <dir> --repo <path> [--json]
   subreview state validate --state <dir> [--json]
   subreview version`)
+}
+
+func artifactCommand(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("artifact requires subcommand: import or status")
+	}
+	if isHelpCommand(args[0]) {
+		usageArtifact(os.Stdout)
+		return nil
+	}
+	switch args[0] {
+	case "import":
+		return artifactImport(args[1:])
+	case "status":
+		return artifactStatus(args[1:])
+	default:
+		return fmt.Errorf("artifact requires subcommand: import or status")
+	}
+}
+
+func artifactImport(args []string) error {
+	if hasHelpFlag(args) {
+		usageArtifactImport(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("artifact import", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	kind := fs.String("kind", artifact.KindPlan, "Artifact kind")
+	path := fs.String("path", "", "Artifact file path")
+	title := fs.String("title", "", "Artifact title")
+	revises := fs.String("revises", "", "Artifact id this import revises")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("artifact import does not accept positional arguments")
+	}
+	result, err := artifact.Import(artifact.ImportOptions{StateDir: *stateDir, Kind: *kind, Path: *path, Title: *title, Revises: *revises})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	if result.AlreadyImported {
+		fmt.Printf("artifact already imported: %s content=%s\n", result.ArtifactID, result.ContentDigest)
+		return nil
+	}
+	fmt.Printf("artifact imported: %s content=%s artifact=%s\n", result.ArtifactID, result.ContentDigest, result.Artifact.Digest)
+	return nil
+}
+
+func artifactStatus(args []string) error {
+	if hasHelpFlag(args) {
+		usageArtifactStatus(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("artifact status", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	artifactID := fs.String("artifact", "", "Artifact id")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("artifact status does not accept positional arguments")
+	}
+	result, err := artifact.Status(artifact.StatusOptions{StateDir: *stateDir, ArtifactID: *artifactID})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("artifact status: %s status=%s review_required=%t\n", result.ArtifactID, result.Status, result.ReviewRequired)
+	return nil
+}
+
+func usageArtifact(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview artifact import --state <dir> --kind plan --path <file> --title <title> [--revises <artifact-id>] [--json]
+  subreview artifact status --state <dir> --artifact <id> [--json]`)
+}
+
+func usageArtifactImport(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview artifact import --state <dir> --kind plan --path <file> --title <title> [--revises <artifact-id>] [--json]
+
+Imports a standalone review artifact into CAS and records an auditable artifact.imported ledger event.`)
+}
+
+func usageArtifactStatus(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview artifact status --state <dir> --artifact <id> [--json]
+
+Reports artifact metadata and import-only review status without requiring snapshots, diffs, obligations, or coverage manifests.`)
 }
 
 func closeCommand(args []string) error {
