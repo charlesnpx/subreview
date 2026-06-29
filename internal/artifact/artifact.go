@@ -331,6 +331,7 @@ func Status(opts StatusOptions) (StatusResult, error) {
 	}
 	latestResultObservation := latestResultForArtifact(resultObservations, latestArtifactID)
 	var latestResult *ResultSummary
+	var currentResult *ResultSummary
 	outcome := ""
 	clean := false
 	findingCount := 0
@@ -341,6 +342,12 @@ func Status(opts StatusOptions) (StatusResult, error) {
 	if latestResultObservation != nil {
 		summary := latestResultObservation.summary()
 		latestResult = &summary
+		if latestPacket != nil && summary.Packet == latestPacket.Packet {
+			currentResult = latestResult
+		}
+	}
+	if currentResult != nil {
+		summary := *currentResult
 		outcome = summary.Outcome
 		clean = summary.Clean
 		findingCount = summary.FindingCount
@@ -357,8 +364,8 @@ func Status(opts StatusOptions) (StatusResult, error) {
 	} else if !isLatest {
 		status = "superseded"
 		reviewRequired = false
-	} else if latestResult != nil {
-		switch latestResult.Outcome {
+	} else if currentResult != nil {
+		switch currentResult.Outcome {
 		case "clean":
 			status = "clean"
 			reviewRequired = false
@@ -369,7 +376,7 @@ func Status(opts StatusOptions) (StatusResult, error) {
 			status = "findings"
 			reviewRequired = true
 		default:
-			status = latestResult.Outcome
+			status = currentResult.Outcome
 			reviewRequired = true
 		}
 	} else if latestPacket != nil {

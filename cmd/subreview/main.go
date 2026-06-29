@@ -187,7 +187,8 @@ func usageArtifactStatus(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   subreview artifact status --state <dir> --artifact <id> [--json]
 
-Reports artifact metadata and import-only review status without requiring snapshots, diffs, obligations, or coverage manifests.`)
+Reports artifact metadata, latest artifact packet/result state, and whether artifact review must continue.
+Artifact review loops use packet build, result import, and artifact status; subreview close does not close artifact review loops.`)
 }
 
 func closeCommand(args []string) error {
@@ -339,7 +340,8 @@ func usageResultImport(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   subreview result import --state <dir> --packet <id> --result <file> [--json]
 
-Imports a bounded structured worker result, normalizes findings, records lifecycle evidence, and appends one ledger event.`)
+Imports a bounded structured worker result, normalizes findings, records lifecycle evidence, and appends one ledger event.
+For artifact_review packets, import the reviewer result here and use artifact status as the loop gate; subreview close remains code-review closure only.`)
 }
 
 func gatesCommand(args []string) error {

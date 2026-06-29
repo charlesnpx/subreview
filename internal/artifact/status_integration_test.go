@@ -117,6 +117,37 @@ func TestStatusUsesLatestArtifactResultDeterministically(t *testing.T) {
 	}
 }
 
+func TestStatusRequiresResultForLatestArtifactPacket(t *testing.T) {
+	repo, stateDir := initializedStatusState(t)
+	imported := importStatusArtifact(t, stateDir, repo, "plan.md", "Rebuilt Packet Plan", "# Plan\n\nReview me.\n", "")
+	firstPacket := buildStatusPacket(t, stateDir, imported.ArtifactID)
+	importStatusResult(t, stateDir, firstPacket.Packet.Digest, imported.ArtifactID, reviewresult.OutcomeClean, "")
+
+	secondPacket, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindArtifact, ArtifactID: imported.ArtifactID, Now: time.Unix(31, 0)})
+	if err != nil {
+		t.Fatalf("Build second artifact packet: %v", err)
+	}
+	if secondPacket.Packet.Digest == firstPacket.Packet.Digest {
+		t.Fatalf("second packet should have a distinct digest")
+	}
+	status, err := artifact.Status(artifact.StatusOptions{StateDir: stateDir, ArtifactID: imported.ArtifactID})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Status != "waiting_for_result" || !status.ReviewRequired || status.Clean || status.Outcome != "" {
+		t.Fatalf("rebuilt latest packet should wait for a matching result: %+v", status)
+	}
+	if status.LatestPacket == nil || status.LatestPacket.Packet != secondPacket.Packet.Digest {
+		t.Fatalf("status should expose rebuilt latest packet: %+v", status.LatestPacket)
+	}
+	if status.LatestResult == nil || status.LatestResult.Packet != firstPacket.Packet.Digest || status.LatestResult.Outcome != reviewresult.OutcomeClean {
+		t.Fatalf("status should retain latest imported stale result metadata: %+v", status.LatestResult)
+	}
+	if status.FindingCount != 0 || status.AcceptedFindings != 0 || status.NeedsContextCount != 0 {
+		t.Fatalf("stale result should not contribute current counts: %+v", status)
+	}
+}
+
 func TestStatusReportsDuplicateArtifactResultImports(t *testing.T) {
 	repo, stateDir := initializedStatusState(t)
 	imported := importStatusArtifact(t, stateDir, repo, "plan.md", "Duplicate Result Plan", "# Plan\n\nReview me.\n", "")
