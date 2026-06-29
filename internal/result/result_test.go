@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charlesnpx/subreview/internal/artifact"
 	"github.com/charlesnpx/subreview/internal/obligation"
 	"github.com/charlesnpx/subreview/internal/packet"
 	"github.com/charlesnpx/subreview/internal/policy"
@@ -1428,6 +1429,384 @@ func TestDeterministicRefutationSatisfiesSpecificObligation(t *testing.T) {
 	t.Fatalf("missing obligation %s", obligationID)
 }
 
+func TestImportArtifactReviewOutcomesWithoutCoverageRefs(t *testing.T) {
+	_, stateDir, imported, built := initializedArtifactResultState(t)
+	clean, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RouteArtifactReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable plan findings.",
+		}),
+		Now: time.Unix(300, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import clean artifact result: %v", err)
+	}
+	if clean.ArtifactID != imported.ArtifactID || clean.Outcome != reviewresult.OutcomeClean || clean.PrimaryReviewEvidence {
+		t.Fatalf("bad clean artifact import: %+v", clean)
+	}
+	if observations := readObservations(t, stateDir); len(observations) != 0 {
+		t.Fatalf("artifact results should not be returned as code-review observations: %+v", observations)
+	}
+
+	findings, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RouteArtifactReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validArtifactFinding("artifact-finding", imported.ArtifactID)},
+		}),
+		Now: time.Unix(301, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import artifact findings: %v", err)
+	}
+	if findings.ArtifactID != imported.ArtifactID || findings.FindingCount != 1 || findings.AcceptedFindingCount != 1 {
+		t.Fatalf("bad artifact findings import: %+v", findings)
+	}
+
+	needsContext, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RouteArtifactReview,
+			Outcome:       reviewresult.OutcomeNeedsContext,
+			NeedsContext: []reviewresult.ContextRequest{{
+				Question: "Which acceptance criterion should govern this edge case?",
+				Reason:   "The plan text names the work but omits a decision point.",
+				Paths:    []string{"plan.md"},
+			}},
+		}),
+		Now: time.Unix(302, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import artifact needs-context: %v", err)
+	}
+	if needsContext.Outcome != reviewresult.OutcomeNeedsContext || needsContext.NeedsContextCount != 1 {
+		t.Fatalf("bad artifact needs-context import: %+v", needsContext)
+	}
+}
+
+func TestArtifactFindingRefsNormalizeAndDedupe(t *testing.T) {
+	_, stateDir, imported, built := initializedArtifactResultState(t)
+	finding := validArtifactFinding("artifact-finding", imported.ArtifactID)
+	finding.ArtifactRefs = []reviewresult.ArtifactRef{
+		{ArtifactID: imported.ArtifactID, Section: "Story", StartLine: 9, EndLine: 10, Quote: "ship it"},
+		{ArtifactID: imported.ArtifactID, Section: "Acceptance", StartLine: 3, EndLine: 4, Quote: "review it"},
+		{ArtifactID: imported.ArtifactID, Section: "Acceptance", StartLine: 3, EndLine: 4, Quote: "review it"},
+	}
+	first, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RouteArtifactReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{finding},
+		}),
+		Now: time.Unix(303, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import artifact finding: %v", err)
+	}
+	record := readResultRecord(t, stateDir, first.Result.Digest)
+	if got := record.Findings[0].ArtifactRefs; len(got) != 2 || got[0].Section != "Acceptance" || got[1].Section != "Story" {
+		t.Fatalf("artifact refs should be sorted and deduplicated: %+v", got)
+	}
+
+	reordered := validArtifactFinding("artifact-finding", imported.ArtifactID)
+	reordered.ArtifactRefs = []reviewresult.ArtifactRef{
+		{ArtifactID: imported.ArtifactID, Section: "Story", StartLine: 9, EndLine: 10, Quote: "ship it"},
+		{ArtifactID: imported.ArtifactID, Section: "Acceptance", StartLine: 3, EndLine: 4, Quote: "review it"},
+	}
+	second, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RouteArtifactReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{reordered},
+		}),
+		Now: time.Unix(304, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import duplicate artifact finding: %v", err)
+	}
+	if second.AcceptedFindingCount != 0 || second.DuplicateFindingCount != 1 {
+		t.Fatalf("duplicate artifact finding should be deduped: %+v", second)
+	}
+}
+
+func TestArtifactFindingValidationIsRouteScoped(t *testing.T) {
+	_, stateDir, imported, built := initializedArtifactResultState(t)
+	cases := []struct {
+		name    string
+		finding reviewresult.FindingInput
+	}{
+		{
+			name: "missing artifact refs",
+			finding: func() reviewresult.FindingInput {
+				finding := validArtifactFinding("missing-ref", imported.ArtifactID)
+				finding.ArtifactRefs = nil
+				return finding
+			}(),
+		},
+		{
+			name: "wrong artifact id",
+			finding: func() reviewresult.FindingInput {
+				finding := validArtifactFinding("wrong-artifact", imported.ArtifactID)
+				finding.ArtifactRefs = []reviewresult.ArtifactRef{{ArtifactID: "artifact-other", Section: "Story"}}
+				return finding
+			}(),
+		},
+		{
+			name: "code citations rejected",
+			finding: func() reviewresult.FindingInput {
+				finding := validArtifactFinding("code-citation", imported.ArtifactID)
+				finding.Citations = []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 1}}
+				return finding
+			}(),
+		},
+		{
+			name: "anchors rejected",
+			finding: func() reviewresult.FindingInput {
+				finding := validArtifactFinding("anchor", imported.ArtifactID)
+				finding.Anchors = []reviewresult.AnchorRef{{Kind: "hunk", Path: "alpha.txt", StartLine: 1, EndLine: 1}}
+				return finding
+			}(),
+		},
+		{
+			name: "fix surface rejected",
+			finding: func() reviewresult.FindingInput {
+				finding := validArtifactFinding("fix-surface", imported.ArtifactID)
+				finding.ExpectedFixSurface = []reviewresult.FixSurface{{Kind: "docs", Path: "plan.md"}}
+				return finding
+			}(),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := reviewresult.Import(reviewresult.ImportOptions{
+				StateDir: stateDir,
+				PacketID: built.Packet.Digest,
+				ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+					SchemaVersion: reviewresult.SchemaVersion,
+					Packet:        built.Packet.Digest,
+					RunKind:       reviewresult.RunKindDiscovery,
+					Route:         reviewresult.RouteArtifactReview,
+					Outcome:       reviewresult.OutcomeFindings,
+					Findings:      []reviewresult.FindingInput{tc.finding},
+				}),
+				Now: time.Unix(305, 0),
+			})
+			if err != nil {
+				t.Fatalf("Import artifact structural rejection: %v", err)
+			}
+			if result.AcceptedFindingCount != 0 || result.RejectedStructuralCount != 1 {
+				t.Fatalf("artifact finding should be structurally rejected: %+v", result)
+			}
+		})
+	}
+
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "This route does not match the artifact packet.",
+		}),
+		Now: time.Unix(306, 0),
+	}); err == nil {
+		t.Fatal("artifact packet should reject non-artifact routes")
+	}
+
+	_, codeStateDir, codePacket, _ := initializedResultState(t)
+	codeFinding := validFinding("code-with-artifact-ref")
+	codeFinding.ArtifactRefs = []reviewresult.ArtifactRef{{ArtifactID: imported.ArtifactID, Section: "Story"}}
+	codeResult, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: codeStateDir,
+		PacketID: codePacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        codePacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{codeFinding},
+		}),
+		Now: time.Unix(307, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import code finding with artifact refs: %v", err)
+	}
+	if codeResult.AcceptedFindingCount != 0 || codeResult.RejectedStructuralCount != 1 {
+		t.Fatalf("code-route artifact_refs should be structurally rejected: %+v", codeResult)
+	}
+
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: codeStateDir,
+		PacketID: codePacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        codePacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RouteArtifactReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "This route does not match the primary packet.",
+		}),
+		Now: time.Unix(308, 0),
+	}); err == nil {
+		t.Fatal("primary packet should reject artifact_review routes")
+	}
+}
+
+func TestArtifactFindingIdentityIsScopedByArtifactID(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(10, 0)}); err != nil {
+		t.Fatalf("Init state: %v", err)
+	}
+	firstPath := writeFileForPath(t, repo, "first.md", "# Plan\n\nFirst artifact.\n")
+	firstArtifact, err := artifact.Import(artifact.ImportOptions{StateDir: stateDir, Kind: artifact.KindPlan, Path: firstPath, Title: "First"})
+	if err != nil {
+		t.Fatalf("Import first artifact: %v", err)
+	}
+	firstPacket, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindArtifact, ArtifactID: firstArtifact.ArtifactID})
+	if err != nil {
+		t.Fatalf("Build first artifact packet: %v", err)
+	}
+	first, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: firstPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        firstPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RouteArtifactReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validArtifactFinding("same-id", firstArtifact.ArtifactID)},
+		}),
+		Now: time.Unix(309, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import first artifact finding: %v", err)
+	}
+	secondPath := writeFileForPath(t, repo, "second.md", "# Plan\n\nSecond artifact.\n")
+	secondArtifact, err := artifact.Import(artifact.ImportOptions{StateDir: stateDir, Kind: artifact.KindPlan, Path: secondPath, Title: "Second"})
+	if err != nil {
+		t.Fatalf("Import second artifact: %v", err)
+	}
+	secondPacket, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindArtifact, ArtifactID: secondArtifact.ArtifactID})
+	if err != nil {
+		t.Fatalf("Build second artifact packet: %v", err)
+	}
+	second, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: secondPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        secondPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RouteArtifactReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validArtifactFinding("same-id", secondArtifact.ArtifactID)},
+		}),
+		Now: time.Unix(310, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import second artifact finding: %v", err)
+	}
+	if first.AcceptedFindingCount != 1 || second.AcceptedFindingCount != 1 {
+		t.Fatalf("same finding id should be valid on different artifacts: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestArtifactResultsDoNotAffectCodeReviewClosure(t *testing.T) {
+	repo, stateDir, built, _ := initializedResultState(t)
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable code findings.",
+		}),
+		Now: time.Unix(311, 0),
+	}); err != nil {
+		t.Fatalf("Import clean primary: %v", err)
+	}
+	before, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status before artifact result: %v", err)
+	}
+	if !before.Closed {
+		t.Fatalf("clean primary should close code obligations before artifact result: %+v", before.Blockers)
+	}
+	artifactPath := writeFileForPath(t, repo, "artifact-plan.md", "# Plan\n\nReview this artifact.\n")
+	imported, err := artifact.Import(artifact.ImportOptions{StateDir: stateDir, Kind: artifact.KindPlan, Path: artifactPath, Title: "Closure Artifact"})
+	if err != nil {
+		t.Fatalf("Import artifact: %v", err)
+	}
+	artifactPacket, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindArtifact, ArtifactID: imported.ArtifactID})
+	if err != nil {
+		t.Fatalf("Build artifact packet: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: artifactPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        artifactPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RouteArtifactReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validArtifactFinding("artifact-open", imported.ArtifactID)},
+		}),
+		Now: time.Unix(312, 0),
+	}); err != nil {
+		t.Fatalf("Import artifact finding: %v", err)
+	}
+	after, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Status after artifact result: %v", err)
+	}
+	if !after.Closed {
+		t.Fatalf("artifact finding should not reopen code obligations: %+v", after.Blockers)
+	}
+	observations := readObservations(t, stateDir)
+	if len(observations) != 1 || observations[0].Record.Route != reviewresult.RoutePrimaryReview {
+		t.Fatalf("code observations should exclude artifact result: %+v", observations)
+	}
+}
+
 func initializedResultState(t *testing.T) (string, string, packet.BuildResult, obligation.CoverageManifest) {
 	t.Helper()
 	root := t.TempDir()
@@ -1485,6 +1864,40 @@ func initializedResultState(t *testing.T) (string, string, packet.BuildResult, o
 	return repo, stateDir, builtPacket, manifest
 }
 
+func initializedArtifactResultState(t *testing.T) (string, string, artifact.ImportResult, packet.BuildResult) {
+	t.Helper()
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(10, 0)}); err != nil {
+		t.Fatalf("Init artifact state: %v", err)
+	}
+	planPath := writeFileForPath(t, repo, "plan.md", "# Plan\n\n- review it\n- ship it\n")
+	imported, err := artifact.Import(artifact.ImportOptions{
+		StateDir: stateDir,
+		Kind:     artifact.KindPlan,
+		Path:     planPath,
+		Title:    "Artifact Result Plan",
+		Now:      time.Unix(20, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import artifact: %v", err)
+	}
+	built, err := packet.Build(packet.BuildOptions{
+		StateDir:   stateDir,
+		Kind:       packet.KindArtifact,
+		ArtifactID: imported.ArtifactID,
+		Now:        time.Unix(30, 0),
+	})
+	if err != nil {
+		t.Fatalf("Build artifact packet: %v", err)
+	}
+	return repo, stateDir, imported, built
+}
+
 func buildVerificationResultPacket(t *testing.T, stateDir, findingID string) packet.BuildResult {
 	t.Helper()
 	result, err := packet.Build(packet.BuildOptions{
@@ -1537,6 +1950,42 @@ func validFinding(id string) reviewresult.FindingInput {
 			Path: "alpha.txt",
 		}},
 	}
+}
+
+func validArtifactFinding(id, artifactID string) reviewresult.FindingInput {
+	return reviewresult.FindingInput{
+		ID:              id,
+		Severity:        "high",
+		Class:           "correctness",
+		Claim:           "The plan omits an actionable release verification step.",
+		FailureScenario: "An operator follows the plan and cannot prove the upgraded release version is correct.",
+		ArtifactRefs: []reviewresult.ArtifactRef{{
+			ArtifactID:  artifactID,
+			Section:     "Acceptance Criteria",
+			StoryID:     "story-artifact-result-status",
+			MergeUnitID: "artifact-result-and-status",
+			StartLine:   1,
+			EndLine:     2,
+			Quote:       "review it",
+		}},
+	}
+}
+
+func readResultRecord(t *testing.T, stateDir, digest string) reviewresult.ResultRecord {
+	t.Helper()
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	body, err := store.Read(digest)
+	if err != nil {
+		t.Fatalf("Read result record: %v", err)
+	}
+	var record reviewresult.ResultRecord
+	if err := json.Unmarshal(body, &record); err != nil {
+		t.Fatalf("Unmarshal result record: %v", err)
+	}
+	return record
 }
 
 func writeWorkerResult(t *testing.T, value reviewresult.WorkerResult) string {
@@ -1700,4 +2149,16 @@ func writeFile(t *testing.T, root, rel, body string) {
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", rel, err)
 	}
+}
+
+func writeFileForPath(t *testing.T, root, rel, body string) string {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir parent: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
+	}
+	return path
 }

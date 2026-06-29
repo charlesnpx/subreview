@@ -152,6 +152,64 @@ func TestArtifactImportAndStatusCLI(t *testing.T) {
 	if statusAfterPacket.Status != "waiting_for_result" || statusAfterPacket.LatestPacket.Packet != builtPacket.Packet.Digest || statusAfterPacket.LatestPacket.Route != "artifact_review" {
 		t.Fatalf("bad status after packet output: %s", statusAfterPacketOut)
 	}
+	artifactResultOut, err := exec.Command(bin, "result", "import", "--state", stateDir, "--packet", builtPacket.Packet.Digest, "--result", writeCLIWorkerResult(t, reviewresult.WorkerResult{
+		SchemaVersion: reviewresult.SchemaVersion,
+		Packet:        builtPacket.Packet.Digest,
+		RunKind:       reviewresult.RunKindDiscovery,
+		Route:         reviewresult.RouteArtifactReview,
+		Outcome:       reviewresult.OutcomeFindings,
+		Findings: []reviewresult.FindingInput{{
+			ID:              "artifact-cli",
+			Severity:        "high",
+			Class:           "correctness",
+			Claim:           "The plan omits an actionable release verification step.",
+			FailureScenario: "An operator follows the plan and cannot prove the upgraded release version is correct.",
+			ArtifactRefs: []reviewresult.ArtifactRef{{
+				ArtifactID: imported.ArtifactID,
+				Section:    "Plan",
+				StartLine:  1,
+				EndLine:    2,
+				Quote:      "Review me",
+			}},
+		}},
+	}), "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("artifact result import failed: %v\n%s", err, artifactResultOut)
+	}
+	var artifactResult struct {
+		ArtifactID           string `json:"artifact_id"`
+		Outcome              string `json:"outcome"`
+		AcceptedFindingCount int    `json:"accepted_finding_count"`
+	}
+	if err := json.Unmarshal(artifactResultOut, &artifactResult); err != nil {
+		t.Fatalf("artifact result output is not json: %v\n%s", err, artifactResultOut)
+	}
+	if artifactResult.ArtifactID != imported.ArtifactID || artifactResult.Outcome != "findings" || artifactResult.AcceptedFindingCount != 1 {
+		t.Fatalf("bad artifact result output: %s", artifactResultOut)
+	}
+	statusAfterResultOut, err := exec.Command(bin, "artifact", "status", "--state", stateDir, "--artifact", imported.ArtifactID, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("artifact status after result failed: %v\n%s", err, statusAfterResultOut)
+	}
+	var statusAfterResult struct {
+		Status               string `json:"status"`
+		ReviewRequired       bool   `json:"review_required"`
+		Outcome              string `json:"outcome"`
+		Clean                bool   `json:"clean"`
+		AcceptedFindingCount int    `json:"accepted_finding_count"`
+		LatestArtifactID     string `json:"latest_artifact_id"`
+		IsLatest             bool   `json:"is_latest"`
+		LatestResult         struct {
+			Packet  string `json:"packet"`
+			Outcome string `json:"outcome"`
+		} `json:"latest_result"`
+	}
+	if err := json.Unmarshal(statusAfterResultOut, &statusAfterResult); err != nil {
+		t.Fatalf("status after result output is not json: %v\n%s", err, statusAfterResultOut)
+	}
+	if statusAfterResult.Status != "findings" || !statusAfterResult.ReviewRequired || statusAfterResult.Outcome != "findings" || statusAfterResult.Clean || statusAfterResult.AcceptedFindingCount != 1 || statusAfterResult.LatestArtifactID != imported.ArtifactID || !statusAfterResult.IsLatest || statusAfterResult.LatestResult.Packet != builtPacket.Packet.Digest || statusAfterResult.LatestResult.Outcome != "findings" {
+		t.Fatalf("bad status after artifact result output: %s", statusAfterResultOut)
+	}
 	revisedPath := filepath.Join(root, "revised-plan.md")
 	if err := os.WriteFile(revisedPath, []byte("# Revised Plan\n\nReview me again.\n"), 0o644); err != nil {
 		t.Fatalf("write revised plan: %v", err)

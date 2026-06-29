@@ -63,17 +63,29 @@ type StatusOptions struct {
 }
 
 type StatusResult struct {
-	SchemaVersion       int             `json:"schema_version"`
-	State               string          `json:"state"`
-	Repo                string          `json:"repo"`
-	RequestedArtifactID string          `json:"requested_artifact_id"`
-	ArtifactID          string          `json:"artifact_id"`
-	Status              string          `json:"status"`
-	ReviewRequired      bool            `json:"review_required"`
-	Artifact            ArtifactSummary `json:"artifact"`
-	LatestPacket        *PacketSummary  `json:"latest_packet,omitempty"`
-	SupersededBy        []string        `json:"superseded_by,omitempty"`
-	Blockers            []Blocker       `json:"blockers,omitempty"`
+	SchemaVersion       int              `json:"schema_version"`
+	State               string           `json:"state"`
+	Repo                string           `json:"repo"`
+	RequestedArtifactID string           `json:"requested_artifact_id"`
+	ArtifactID          string           `json:"artifact_id"`
+	LatestArtifactID    string           `json:"latest_artifact_id"`
+	IsLatest            bool             `json:"is_latest"`
+	Successor           string           `json:"successor,omitempty"`
+	Status              string           `json:"status"`
+	ReviewRequired      bool             `json:"review_required"`
+	Outcome             string           `json:"outcome,omitempty"`
+	Clean               bool             `json:"clean"`
+	FindingCount        int              `json:"finding_count"`
+	AcceptedFindings    int              `json:"accepted_finding_count"`
+	DuplicateFindings   int              `json:"duplicate_finding_count"`
+	RejectedStructural  int              `json:"rejected_structural_count"`
+	NeedsContextCount   int              `json:"needs_context_count"`
+	Artifact            ArtifactSummary  `json:"artifact"`
+	LatestPacket        *PacketSummary   `json:"latest_packet,omitempty"`
+	LatestResult        *ResultSummary   `json:"latest_result,omitempty"`
+	SupersededBy        []string         `json:"superseded_by,omitempty"`
+	SupersededFindings  []FindingSummary `json:"superseded_findings,omitempty"`
+	Blockers            []Blocker        `json:"blockers,omitempty"`
 }
 
 type Blocker struct {
@@ -102,6 +114,30 @@ type PacketSummary struct {
 	Route   string `json:"route"`
 	Kind    string `json:"kind"`
 	RunKind string `json:"run_kind"`
+}
+
+type ResultSummary struct {
+	Result             string `json:"result"`
+	EventID            string `json:"event_id"`
+	Packet             string `json:"packet"`
+	Outcome            string `json:"outcome"`
+	Clean              bool   `json:"clean"`
+	FindingCount       int    `json:"finding_count"`
+	AcceptedFindings   int    `json:"accepted_finding_count"`
+	DuplicateFindings  int    `json:"duplicate_finding_count"`
+	RejectedStructural int    `json:"rejected_structural_count"`
+	NeedsContextCount  int    `json:"needs_context_count"`
+}
+
+type FindingSummary struct {
+	ArtifactID string `json:"artifact_id"`
+	FindingID  string `json:"finding_id"`
+	State      string `json:"state"`
+	Severity   string `json:"severity"`
+	Class      string `json:"class"`
+	Claim      string `json:"claim"`
+	Result     string `json:"result"`
+	EventID    string `json:"event_id"`
 }
 
 type ArtifactRecord struct {
@@ -279,15 +315,72 @@ func Status(opts StatusOptions) (StatusResult, error) {
 	blockers := revisionBlockers(observations, children, component)
 	supersededBy := append([]string(nil), children[artifactID]...)
 	sort.Strings(supersededBy)
-	latestPacket := latestPacketForArtifact(events, binding.Repo, artifactID)
+	latestArtifactID := latestArtifactInComponent(component, children)
+	if latestArtifactID == "" {
+		latestArtifactID = artifactID
+	}
+	isLatest := artifactID == latestArtifactID
+	successor := ""
+	if len(supersededBy) > 0 {
+		successor = supersededBy[0]
+	}
+	latestPacket := latestPacketForArtifact(events, binding.Repo, latestArtifactID)
+	resultObservations, err := artifactResultObservations(store, events, binding.Repo)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	latestResultObservation := latestResultForArtifact(resultObservations, latestArtifactID)
+	var latestResult *ResultSummary
+	var currentResult *ResultSummary
+	outcome := ""
+	clean := false
+	findingCount := 0
+	acceptedFindings := 0
+	duplicateFindings := 0
+	rejectedStructural := 0
+	needsContextCount := 0
+	if latestResultObservation != nil {
+		summary := latestResultObservation.summary()
+		latestResult = &summary
+		if latestPacket != nil && summary.Packet == latestPacket.Packet {
+			currentResult = latestResult
+		}
+	}
+	if currentResult != nil {
+		summary := *currentResult
+		outcome = summary.Outcome
+		clean = summary.Clean
+		findingCount = summary.FindingCount
+		acceptedFindings = summary.AcceptedFindings
+		duplicateFindings = summary.DuplicateFindings
+		rejectedStructural = summary.RejectedStructural
+		needsContextCount = summary.NeedsContextCount
+	}
 	status := "no_review_packet"
 	reviewRequired := true
-	if latestPacket != nil {
-		status = "waiting_for_result"
-	}
 	if len(blockers) > 0 {
 		status = "blocked"
 		reviewRequired = false
+	} else if !isLatest {
+		status = "superseded"
+		reviewRequired = false
+	} else if currentResult != nil {
+		switch currentResult.Outcome {
+		case "clean":
+			status = "clean"
+			reviewRequired = false
+		case "needs_context":
+			status = "needs_context"
+			reviewRequired = true
+		case "findings":
+			status = "findings"
+			reviewRequired = true
+		default:
+			status = currentResult.Outcome
+			reviewRequired = true
+		}
+	} else if latestPacket != nil {
+		status = "waiting_for_result"
 	}
 	return StatusResult{
 		SchemaVersion:       SchemaVersion,
@@ -295,11 +388,23 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		Repo:                binding.Repo,
 		RequestedArtifactID: artifactID,
 		ArtifactID:          artifactID,
+		LatestArtifactID:    latestArtifactID,
+		IsLatest:            isLatest,
+		Successor:           successor,
 		Status:              status,
 		ReviewRequired:      reviewRequired,
+		Outcome:             outcome,
+		Clean:               clean,
+		FindingCount:        findingCount,
+		AcceptedFindings:    acceptedFindings,
+		DuplicateFindings:   duplicateFindings,
+		RejectedStructural:  rejectedStructural,
+		NeedsContextCount:   needsContextCount,
 		Artifact:            artifactSummary(observation),
 		LatestPacket:        latestPacket,
+		LatestResult:        latestResult,
 		SupersededBy:        supersededBy,
+		SupersededFindings:  supersededFindings(resultObservations, component, latestArtifactID),
 		Blockers:            blockers,
 	}, nil
 }
@@ -642,6 +747,26 @@ func uniqueSorted(values []string) []string {
 	return out
 }
 
+func latestArtifactInComponent(component map[string]struct{}, children map[string][]string) string {
+	leaves := []string{}
+	for id := range component {
+		childCount := 0
+		for _, child := range children[id] {
+			if _, ok := component[child]; ok {
+				childCount++
+			}
+		}
+		if childCount == 0 {
+			leaves = append(leaves, id)
+		}
+	}
+	sort.Strings(leaves)
+	if len(leaves) == 0 {
+		return ""
+	}
+	return leaves[0]
+}
+
 func latestPacketForArtifact(events []state.Event, repo, artifactID string) *PacketSummary {
 	var latest *PacketSummary
 	for _, event := range events {
@@ -661,6 +786,173 @@ func latestPacketForArtifact(events []state.Event, repo, artifactID string) *Pac
 		}
 	}
 	return latest
+}
+
+type artifactResultObservation struct {
+	ArtifactID string
+	Result     string
+	EventID    string
+	Record     artifactResultRecord
+}
+
+type artifactResultRecord struct {
+	Packet       artifactResultPacketRef `json:"packet"`
+	Route        string                  `json:"route"`
+	Outcome      string                  `json:"outcome"`
+	Findings     []artifactResultFinding `json:"findings"`
+	NeedsContext []json.RawMessage       `json:"needs_context"`
+}
+
+type artifactResultPacketRef struct {
+	Digest   string                        `json:"digest"`
+	Kind     string                        `json:"kind"`
+	RunKind  string                        `json:"run_kind"`
+	Route    string                        `json:"route"`
+	Artifact *artifactResultPacketArtifact `json:"artifact,omitempty"`
+}
+
+type artifactResultPacketArtifact struct {
+	ID string `json:"id"`
+}
+
+type artifactResultFinding struct {
+	ID           string `json:"id"`
+	State        string `json:"state"`
+	Severity     string `json:"severity"`
+	Class        string `json:"class"`
+	Claim        string `json:"claim"`
+	Accepted     bool   `json:"accepted"`
+	DuplicateOf  string `json:"duplicate_of,omitempty"`
+	RejectReason string `json:"rejection_reason,omitempty"`
+}
+
+func artifactResultObservations(store state.Store, events []state.Event, repo string) ([]artifactResultObservation, error) {
+	observations := []artifactResultObservation{}
+	for _, event := range events {
+		if event.Type != "result.imported" {
+			continue
+		}
+		if event.Repo != repo {
+			return nil, errors.New("malformed result.imported event: repo mismatch")
+		}
+		if event.Details["route"] != "artifact_review" {
+			continue
+		}
+		digest := strings.TrimSpace(event.Details["result"])
+		if digest == "" {
+			return nil, errors.New("malformed result.imported event: missing result")
+		}
+		if !containsDigest(event.ObjectDigests, digest) {
+			return nil, errors.New("malformed result.imported event: object_digests missing result")
+		}
+		body, err := store.Read(digest)
+		if err != nil {
+			return nil, err
+		}
+		var record artifactResultRecord
+		if err := json.Unmarshal(body, &record); err != nil {
+			return nil, err
+		}
+		if record.Route != "artifact_review" || record.Packet.Kind != "artifact" || record.Packet.Route != "artifact_review" || record.Packet.RunKind != "discovery" {
+			return nil, errors.New("malformed artifact result record")
+		}
+		if record.Packet.Artifact == nil || strings.TrimSpace(record.Packet.Artifact.ID) == "" {
+			return nil, errors.New("malformed artifact result record: missing artifact")
+		}
+		artifactID := record.Packet.Artifact.ID
+		if detailArtifactID := strings.TrimSpace(event.Details["artifact_id"]); detailArtifactID != "" && detailArtifactID != artifactID {
+			return nil, errors.New("malformed result.imported event: artifact_id mismatch")
+		}
+		observations = append(observations, artifactResultObservation{
+			ArtifactID: artifactID,
+			Result:     digest,
+			EventID:    event.EventID,
+			Record:     record,
+		})
+	}
+	return observations, nil
+}
+
+func latestResultForArtifact(observations []artifactResultObservation, artifactID string) *artifactResultObservation {
+	for i := len(observations) - 1; i >= 0; i-- {
+		if observations[i].ArtifactID == artifactID {
+			return &observations[i]
+		}
+	}
+	return nil
+}
+
+func (observation artifactResultObservation) summary() ResultSummary {
+	return ResultSummary{
+		Result:             observation.Result,
+		EventID:            observation.EventID,
+		Packet:             observation.Record.Packet.Digest,
+		Outcome:            observation.Record.Outcome,
+		Clean:              observation.Record.Outcome == "clean",
+		FindingCount:       len(observation.Record.Findings),
+		AcceptedFindings:   countArtifactFindings(observation.Record.Findings, "accepted"),
+		DuplicateFindings:  countArtifactFindings(observation.Record.Findings, "duplicate"),
+		RejectedStructural: countArtifactFindings(observation.Record.Findings, "rejected_structural"),
+		NeedsContextCount:  len(observation.Record.NeedsContext),
+	}
+}
+
+func countArtifactFindings(findings []artifactResultFinding, kind string) int {
+	count := 0
+	for _, finding := range findings {
+		switch kind {
+		case "accepted":
+			if finding.Accepted {
+				count++
+			}
+		case "duplicate":
+			if finding.State == "duplicate" {
+				count++
+			}
+		case "rejected_structural":
+			if finding.State == "rejected_structural" {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func supersededFindings(observations []artifactResultObservation, component map[string]struct{}, latestArtifactID string) []FindingSummary {
+	out := []FindingSummary{}
+	for _, observation := range observations {
+		if observation.ArtifactID == latestArtifactID {
+			continue
+		}
+		if _, ok := component[observation.ArtifactID]; !ok {
+			continue
+		}
+		for _, finding := range observation.Record.Findings {
+			if !finding.Accepted {
+				continue
+			}
+			out = append(out, FindingSummary{
+				ArtifactID: observation.ArtifactID,
+				FindingID:  finding.ID,
+				State:      finding.State,
+				Severity:   finding.Severity,
+				Class:      finding.Class,
+				Claim:      finding.Claim,
+				Result:     observation.Result,
+				EventID:    observation.EventID,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ArtifactID != out[j].ArtifactID {
+			return out[i].ArtifactID < out[j].ArtifactID
+		}
+		if out[i].Severity != out[j].Severity {
+			return out[i].Severity > out[j].Severity
+		}
+		return out[i].FindingID < out[j].FindingID
+	})
+	return out
 }
 
 func containsDigest(digests []string, digest string) bool {
