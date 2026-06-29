@@ -114,6 +114,44 @@ func TestArtifactImportAndStatusCLI(t *testing.T) {
 	if got := string(statusTextOut); !strings.Contains(got, "artifact status: "+imported.ArtifactID) || !strings.Contains(got, "status=no_review_packet") {
 		t.Fatalf("bad text status output: %s", statusTextOut)
 	}
+	packetOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "artifact", "--artifact", imported.ArtifactID, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("artifact packet build failed: %v\n%s", err, packetOut)
+	}
+	var builtPacket struct {
+		Kind    string `json:"kind"`
+		RunKind string `json:"run_kind"`
+		Route   string `json:"route"`
+		Packet  struct {
+			Digest string `json:"digest"`
+		} `json:"packet"`
+		Artifact struct {
+			ID string `json:"id"`
+		} `json:"artifact"`
+	}
+	if err := json.Unmarshal(packetOut, &builtPacket); err != nil {
+		t.Fatalf("packet output is not json: %v\n%s", err, packetOut)
+	}
+	if builtPacket.Kind != "artifact" || builtPacket.RunKind != "discovery" || builtPacket.Route != "artifact_review" || builtPacket.Packet.Digest == "" || builtPacket.Artifact.ID != imported.ArtifactID {
+		t.Fatalf("bad packet output: %s", packetOut)
+	}
+	statusAfterPacketOut, err := exec.Command(bin, "artifact", "status", "--state", stateDir, "--artifact", imported.ArtifactID, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("artifact status after packet failed: %v\n%s", err, statusAfterPacketOut)
+	}
+	var statusAfterPacket struct {
+		Status       string `json:"status"`
+		LatestPacket struct {
+			Packet string `json:"packet"`
+			Route  string `json:"route"`
+		} `json:"latest_packet"`
+	}
+	if err := json.Unmarshal(statusAfterPacketOut, &statusAfterPacket); err != nil {
+		t.Fatalf("status after packet output is not json: %v\n%s", err, statusAfterPacketOut)
+	}
+	if statusAfterPacket.Status != "waiting_for_result" || statusAfterPacket.LatestPacket.Packet != builtPacket.Packet.Digest || statusAfterPacket.LatestPacket.Route != "artifact_review" {
+		t.Fatalf("bad status after packet output: %s", statusAfterPacketOut)
+	}
 	revisedPath := filepath.Join(root, "revised-plan.md")
 	if err := os.WriteFile(revisedPath, []byte("# Revised Plan\n\nReview me again.\n"), 0o644); err != nil {
 		t.Fatalf("write revised plan: %v", err)
