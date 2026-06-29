@@ -188,6 +188,39 @@ func TestStatusReportsMalformedCycleBlocker(t *testing.T) {
 	}
 }
 
+func TestStatusReportsMissingRevisionTargetBlocker(t *testing.T) {
+	repo, stateDir := initializedArtifactState(t)
+	appendArtifactRecord(t, stateDir, repo, "artifact-child", "artifact-missing", "child\n")
+
+	status, err := Status(StatusOptions{StateDir: stateDir, ArtifactID: "artifact-child"})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Status != "blocked" || status.ReviewRequired {
+		t.Fatalf("missing revision target should block status: %+v", status)
+	}
+	if !hasBlocker(status.Blockers, "missing_revision_target") {
+		t.Fatalf("expected missing_revision_target blocker: %+v", status.Blockers)
+	}
+}
+
+func TestStatusIgnoresUnrelatedMalformedRevisionChain(t *testing.T) {
+	repo, stateDir := initializedArtifactState(t)
+	clean := appendArtifactRecord(t, stateDir, repo, "artifact-clean", "", "clean\n")
+	appendArtifactRecord(t, stateDir, repo, "artifact-bad", "artifact-missing", "bad\n")
+
+	status, err := Status(StatusOptions{StateDir: stateDir, ArtifactID: clean})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Status != "no_review_packet" || !status.ReviewRequired {
+		t.Fatalf("unrelated malformed chain should not block clean artifact: %+v", status)
+	}
+	if len(status.Blockers) != 0 {
+		t.Fatalf("clean artifact should not include unrelated blockers: %+v", status.Blockers)
+	}
+}
+
 func TestStatusRejectsUnknownArtifact(t *testing.T) {
 	_, stateDir := initializedArtifactState(t)
 	_, err := Status(StatusOptions{StateDir: stateDir, ArtifactID: "artifact-missing"})
@@ -233,7 +266,7 @@ func writeArtifactBytes(t *testing.T, repo, name string, body []byte) string {
 	return path
 }
 
-func appendArtifactRecord(t *testing.T, stateDir, repo, id, revises, body string) {
+func appendArtifactRecord(t *testing.T, stateDir, repo, id, revises, body string) string {
 	t.Helper()
 	store, err := state.Open(stateDir)
 	if err != nil {
@@ -279,4 +312,5 @@ func appendArtifactRecord(t *testing.T, stateDir, repo, id, revises, body string
 	}); err != nil {
 		t.Fatalf("append artifact event: %v", err)
 	}
+	return id
 }

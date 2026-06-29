@@ -266,7 +266,8 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		return StatusResult{}, fmt.Errorf("artifact not found in state: %s", artifactID)
 	}
 	children := childrenByParent(observations)
-	blockers := revisionBlockers(observations)
+	component := revisionComponent(observations, artifactID, children)
+	blockers := revisionBlockers(observations, children, component)
 	supersededBy := append([]string(nil), children[artifactID]...)
 	sort.Strings(supersededBy)
 	status := "no_review_packet"
@@ -526,10 +527,12 @@ func childrenByParent(observations []Observation) map[string][]string {
 	return children
 }
 
-func revisionBlockers(observations []Observation) []Blocker {
-	children := childrenByParent(observations)
+func revisionBlockers(observations []Observation, children map[string][]string, component map[string]struct{}) []Blocker {
 	blockers := []Blocker{}
 	for parent, ids := range children {
+		if _, relevant := component[parent]; !relevant {
+			continue
+		}
 		unique := uniqueSorted(ids)
 		if len(unique) > 1 {
 			blockers = append(blockers, Blocker{
@@ -540,6 +543,18 @@ func revisionBlockers(observations []Observation) []Blocker {
 		}
 	}
 	for _, observation := range observations {
+		if _, relevant := component[observation.Record.ID]; !relevant {
+			continue
+		}
+		if observation.Record.Revises != "" {
+			if _, ok := observationByID(observations, observation.Record.Revises); !ok {
+				blockers = append(blockers, Blocker{
+					Code:    "missing_revision_target",
+					Message: fmt.Sprintf("artifact %s revises missing artifact %s", observation.Record.ID, observation.Record.Revises),
+					IDs:     []string{observation.Record.ID, observation.Record.Revises},
+				})
+			}
+		}
 		if chainContains(observations, observation.Record.Revises, observation.Record.ID) {
 			blockers = append(blockers, Blocker{
 				Code:    "revision_cycle",
@@ -555,6 +570,29 @@ func revisionBlockers(observations []Observation) []Blocker {
 		return blockers[i].Code < blockers[j].Code
 	})
 	return blockers
+}
+
+func revisionComponent(observations []Observation, artifactID string, children map[string][]string) map[string]struct{} {
+	component := map[string]struct{}{artifactID: {}}
+	queue := []string{artifactID}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		if observation, ok := observationByID(observations, current); ok && observation.Record.Revises != "" {
+			if _, seen := component[observation.Record.Revises]; !seen {
+				component[observation.Record.Revises] = struct{}{}
+				queue = append(queue, observation.Record.Revises)
+			}
+		}
+		for _, child := range children[current] {
+			if _, seen := component[child]; seen {
+				continue
+			}
+			component[child] = struct{}{}
+			queue = append(queue, child)
+		}
+	}
+	return component
 }
 
 func chainContains(observations []Observation, start, want string) bool {
