@@ -103,7 +103,7 @@ func TestRunInstallStagedAllTargets(t *testing.T) {
 			"Do not simulate unsupported `subreview` commands in prose",
 			"explicit `--state <dir>` path",
 			"Do not create hidden default state directories",
-			"Do not claim review closure from a clean reviewer response alone",
+			"Do not claim code-review closure from a clean reviewer response alone",
 		} {
 			if !strings.Contains(content, want) {
 				t.Fatalf("staged skill %s missing %q", path, want)

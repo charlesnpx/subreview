@@ -43,4 +43,4 @@ For standalone plan review, use artifact commands as controller recordkeeping on
 
 Do not claim that `subreview` spawns subagents. It records state and packets; the operator's orchestration tool performs the review.
 
-Do not claim review closure from a clean reviewer response alone. Closure must come from `subreview close`, which evaluates the latest policy-bound ledger evidence and reports facts, blockers, gates, findings, discovery/verification runs, token telemetry, and scheduler status.
+Do not claim code-review closure from a clean reviewer response alone. Code-review closure must come from `subreview close`, which evaluates the latest policy-bound ledger evidence and reports facts, blockers, gates, findings, discovery/verification runs, token telemetry, and scheduler status.
