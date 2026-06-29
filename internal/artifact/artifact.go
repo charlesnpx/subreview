@@ -1,0 +1,646 @@
+package artifact
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/charlesnpx/subreview/internal/state"
+)
+
+const SchemaVersion = 1
+
+const (
+	EventTypeImported = "artifact.imported"
+
+	KindPlan = "plan"
+
+	MediaTypeArtifact = "application/vnd.subreview.artifact+json"
+	MediaTypePlanText = "text/plain; charset=utf-8"
+
+	DefaultMaxArtifactBytes = 1 << 20
+)
+
+type ImportOptions struct {
+	StateDir         string
+	Kind             string
+	Path             string
+	Title            string
+	Revises          string
+	Now              time.Time
+	MaxArtifactBytes int64
+}
+
+type ImportResult struct {
+	SchemaVersion   int             `json:"schema_version"`
+	State           string          `json:"state"`
+	Repo            string          `json:"repo"`
+	ArtifactID      string          `json:"artifact_id"`
+	Kind            string          `json:"kind"`
+	Title           string          `json:"title"`
+	SourcePath      string          `json:"source_path"`
+	Revises         string          `json:"revises,omitempty"`
+	Content         state.ObjectRef `json:"content"`
+	ContentDigest   string          `json:"content_digest"`
+	Artifact        state.ObjectRef `json:"artifact"`
+	EventID         string          `json:"event_id"`
+	CreatedAt       string          `json:"created_at"`
+	AlreadyImported bool            `json:"already_imported,omitempty"`
+}
+
+type StatusOptions struct {
+	StateDir   string
+	ArtifactID string
+}
+
+type StatusResult struct {
+	SchemaVersion       int             `json:"schema_version"`
+	State               string          `json:"state"`
+	Repo                string          `json:"repo"`
+	RequestedArtifactID string          `json:"requested_artifact_id"`
+	ArtifactID          string          `json:"artifact_id"`
+	Status              string          `json:"status"`
+	ReviewRequired      bool            `json:"review_required"`
+	Artifact            ArtifactSummary `json:"artifact"`
+	SupersededBy        []string        `json:"superseded_by,omitempty"`
+	Blockers            []Blocker       `json:"blockers,omitempty"`
+}
+
+type Blocker struct {
+	Code    string   `json:"code"`
+	Message string   `json:"message"`
+	IDs     []string `json:"ids,omitempty"`
+}
+
+type ArtifactSummary struct {
+	ID            string          `json:"id"`
+	Kind          string          `json:"kind"`
+	Title         string          `json:"title"`
+	SourcePath    string          `json:"source_path"`
+	Repo          string          `json:"repo"`
+	CreatedAt     string          `json:"created_at"`
+	Revises       string          `json:"revises,omitempty"`
+	Content       state.ObjectRef `json:"content"`
+	ContentDigest string          `json:"content_digest"`
+	Artifact      state.ObjectRef `json:"artifact"`
+	EventID       string          `json:"event_id"`
+}
+
+type ArtifactRecord struct {
+	SchemaVersion int             `json:"schema_version"`
+	ID            string          `json:"id"`
+	Kind          string          `json:"kind"`
+	Title         string          `json:"title"`
+	SourcePath    string          `json:"source_path"`
+	Repo          string          `json:"repo"`
+	CreatedAt     string          `json:"created_at"`
+	Revises       string          `json:"revises,omitempty"`
+	Content       state.ObjectRef `json:"content"`
+	ContentDigest string          `json:"content_digest"`
+	Text          TextMetadata    `json:"text"`
+}
+
+type TextMetadata struct {
+	Encoding    string `json:"encoding"`
+	UTF8        bool   `json:"utf8"`
+	ContainsNUL bool   `json:"contains_nul"`
+}
+
+type Observation struct {
+	Record   ArtifactRecord  `json:"record"`
+	Artifact state.ObjectRef `json:"artifact"`
+	EventID  string          `json:"event_id"`
+}
+
+type stateBinding struct {
+	State string
+	Repo  string
+}
+
+func Import(opts ImportOptions) (ImportResult, error) {
+	now := opts.Now.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	binding, err := stateBindingFromState(opts.StateDir)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	kind, err := normalizeKind(opts.Kind)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	title := strings.TrimSpace(opts.Title)
+	if title == "" {
+		return ImportResult{}, errors.New("--title is required")
+	}
+	sourcePath, body, err := readBoundedArtifactFile(opts.Path, maxArtifactBytes(opts.MaxArtifactBytes))
+	if err != nil {
+		return ImportResult{}, err
+	}
+	if kind == KindPlan {
+		if err := validatePlanText(body); err != nil {
+			return ImportResult{}, err
+		}
+	}
+	store, err := state.Open(binding.State)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	events, err := state.ReadEvents(binding.State)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	observations, err := Observations(store, events, binding.Repo)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	revises := strings.TrimSpace(opts.Revises)
+	contentDigest := digestBytes(body)
+	artifactID := artifactID(kind, title, contentDigest, revises)
+	if existing, ok := observationByID(observations, artifactID); ok {
+		if sameImport(existing.Record, kind, title, revises, contentDigest, binding.Repo) {
+			return importResultFromObservation(binding, existing, true), nil
+		}
+		return ImportResult{}, fmt.Errorf("artifact id collision: %s", artifactID)
+	}
+	if revises != "" {
+		if err := validateRevisionTarget(observations, binding.Repo, kind, artifactID, revises); err != nil {
+			return ImportResult{}, err
+		}
+	}
+	contentRef, err := store.PutBytes(body, MediaTypePlanText)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	record := ArtifactRecord{
+		SchemaVersion: SchemaVersion,
+		ID:            artifactID,
+		Kind:          kind,
+		Title:         title,
+		SourcePath:    sourcePath,
+		Repo:          binding.Repo,
+		CreatedAt:     now.Format(time.RFC3339Nano),
+		Revises:       revises,
+		Content:       contentRef,
+		ContentDigest: contentRef.Digest,
+		Text: TextMetadata{
+			Encoding:    "utf-8",
+			UTF8:        true,
+			ContainsNUL: false,
+		},
+	}
+	artifactRef, err := store.PutJSON(record, MediaTypeArtifact)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	details := map[string]string{
+		"artifact":       artifactRef.Digest,
+		"artifact_id":    artifactID,
+		"kind":           kind,
+		"title":          title,
+		"content":        contentRef.Digest,
+		"content_digest": contentRef.Digest,
+	}
+	if revises != "" {
+		details["revises"] = revises
+	}
+	event, err := state.AppendEvent(binding.State, state.Event{
+		Type:          EventTypeImported,
+		ObjectDigests: []string{artifactRef.Digest, contentRef.Digest},
+		Repo:          binding.Repo,
+		Details:       details,
+	})
+	if err != nil {
+		return ImportResult{}, err
+	}
+	return ImportResult{
+		SchemaVersion: SchemaVersion,
+		State:         binding.State,
+		Repo:          binding.Repo,
+		ArtifactID:    artifactID,
+		Kind:          kind,
+		Title:         title,
+		SourcePath:    sourcePath,
+		Revises:       revises,
+		Content:       contentRef,
+		ContentDigest: contentRef.Digest,
+		Artifact:      artifactRef,
+		EventID:       event.EventID,
+		CreatedAt:     record.CreatedAt,
+	}, nil
+}
+
+func Status(opts StatusOptions) (StatusResult, error) {
+	artifactID := strings.TrimSpace(opts.ArtifactID)
+	if artifactID == "" {
+		return StatusResult{}, errors.New("--artifact is required")
+	}
+	binding, err := stateBindingFromState(opts.StateDir)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	store, err := state.Open(binding.State)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	events, err := state.ReadEvents(binding.State)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	observations, err := Observations(store, events, binding.Repo)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	observation, ok := observationByID(observations, artifactID)
+	if !ok {
+		return StatusResult{}, fmt.Errorf("artifact not found in state: %s", artifactID)
+	}
+	children := childrenByParent(observations)
+	blockers := revisionBlockers(observations)
+	supersededBy := append([]string(nil), children[artifactID]...)
+	sort.Strings(supersededBy)
+	status := "no_review_packet"
+	reviewRequired := true
+	if len(blockers) > 0 {
+		status = "blocked"
+		reviewRequired = false
+	}
+	return StatusResult{
+		SchemaVersion:       SchemaVersion,
+		State:               binding.State,
+		Repo:                binding.Repo,
+		RequestedArtifactID: artifactID,
+		ArtifactID:          artifactID,
+		Status:              status,
+		ReviewRequired:      reviewRequired,
+		Artifact:            artifactSummary(observation),
+		SupersededBy:        supersededBy,
+		Blockers:            blockers,
+	}, nil
+}
+
+func Observations(store state.Store, events []state.Event, repo string) ([]Observation, error) {
+	observations := []Observation{}
+	for _, event := range events {
+		if event.Type != EventTypeImported {
+			continue
+		}
+		if event.Repo != repo {
+			return nil, errors.New("malformed artifact.imported event: repo mismatch")
+		}
+		digest := strings.TrimSpace(event.Details["artifact"])
+		if digest == "" {
+			return nil, errors.New("malformed artifact.imported event: missing artifact")
+		}
+		if !containsDigest(event.ObjectDigests, digest) {
+			return nil, errors.New("malformed artifact.imported event: object_digests missing artifact")
+		}
+		body, err := store.Read(digest)
+		if err != nil {
+			return nil, err
+		}
+		var record ArtifactRecord
+		if err := json.Unmarshal(body, &record); err != nil {
+			return nil, err
+		}
+		if err := validateArtifactRecord(record, repo); err != nil {
+			return nil, err
+		}
+		if !containsDigest(event.ObjectDigests, record.ContentDigest) {
+			return nil, errors.New("malformed artifact.imported event: object_digests missing content")
+		}
+		if event.Details["artifact_id"] != "" && event.Details["artifact_id"] != record.ID {
+			return nil, errors.New("malformed artifact.imported event: artifact_id mismatch")
+		}
+		observations = append(observations, Observation{
+			Record:   record,
+			Artifact: state.ObjectRef{Digest: digest, MediaType: MediaTypeArtifact, Size: int64(len(body)), Path: recordPathBestEffort(record.Content.Path, digest)},
+			EventID:  event.EventID,
+		})
+	}
+	return observations, nil
+}
+
+func normalizeKind(kind string) (string, error) {
+	value := strings.ToLower(strings.TrimSpace(kind))
+	switch value {
+	case KindPlan:
+		return value, nil
+	case "":
+		return "", errors.New("--kind is required")
+	default:
+		return "", fmt.Errorf("unsupported artifact kind: %s", value)
+	}
+}
+
+func maxArtifactBytes(value int64) int64 {
+	if value > 0 {
+		return value
+	}
+	return DefaultMaxArtifactBytes
+}
+
+func readBoundedArtifactFile(path string, maxBytes int64) (string, []byte, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", nil, errors.New("--path is required")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", nil, err
+	}
+	info, err := os.Lstat(abs)
+	if err != nil {
+		return "", nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("artifact path must be a regular file: %s", abs)
+	}
+	if info.Size() == 0 {
+		return "", nil, errors.New("artifact file is empty")
+	}
+	if info.Size() > maxBytes {
+		return "", nil, fmt.Errorf("artifact exceeds %d byte limit", maxBytes)
+	}
+	body, err := os.ReadFile(abs)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(body) == 0 {
+		return "", nil, errors.New("artifact file is empty")
+	}
+	if int64(len(body)) > maxBytes {
+		return "", nil, fmt.Errorf("artifact exceeds %d byte limit", maxBytes)
+	}
+	return abs, body, nil
+}
+
+func validatePlanText(body []byte) error {
+	if !utf8.Valid(body) {
+		return errors.New("plan artifact must be valid UTF-8")
+	}
+	if bytes.IndexByte(body, 0) >= 0 {
+		return errors.New("plan artifact must not contain NUL bytes")
+	}
+	return nil
+}
+
+func validateRevisionTarget(observations []Observation, repo, kind, artifactID, revises string) error {
+	target, ok := observationByID(observations, revises)
+	if !ok {
+		return fmt.Errorf("revises artifact not found: %s", revises)
+	}
+	if target.Record.Repo != repo {
+		return fmt.Errorf("revises artifact repo mismatch: %s != %s", target.Record.Repo, repo)
+	}
+	if target.Record.Kind != kind {
+		return fmt.Errorf("revises artifact kind mismatch: %s != %s", target.Record.Kind, kind)
+	}
+	if chainContains(observations, revises, artifactID) {
+		return fmt.Errorf("artifact revision cycle detected for %s", artifactID)
+	}
+	for _, existing := range observations {
+		if existing.Record.Revises == revises && existing.Record.ID != artifactID {
+			return fmt.Errorf("forked_revision: %s already revises %s", existing.Record.ID, revises)
+		}
+	}
+	return nil
+}
+
+func validateArtifactRecord(record ArtifactRecord, repo string) error {
+	if record.SchemaVersion != SchemaVersion {
+		return fmt.Errorf("unsupported artifact schema_version: %d", record.SchemaVersion)
+	}
+	if record.ID == "" {
+		return errors.New("artifact missing id")
+	}
+	if record.Repo != repo {
+		return errors.New("artifact repo mismatch")
+	}
+	if record.Kind != KindPlan {
+		return fmt.Errorf("unsupported artifact kind: %s", record.Kind)
+	}
+	if strings.TrimSpace(record.Title) == "" {
+		return errors.New("artifact missing title")
+	}
+	if record.ContentDigest == "" || record.Content.Digest == "" || record.ContentDigest != record.Content.Digest {
+		return errors.New("artifact content digest mismatch")
+	}
+	if record.CreatedAt == "" {
+		return errors.New("artifact missing created_at")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, record.CreatedAt); err != nil {
+		return fmt.Errorf("artifact invalid created_at: %w", err)
+	}
+	return nil
+}
+
+func artifactID(kind, title, contentDigest, revises string) string {
+	parts := strings.Join([]string{
+		"subreview-artifact-v1",
+		strings.ToLower(strings.TrimSpace(kind)),
+		strings.TrimSpace(title),
+		strings.TrimSpace(contentDigest),
+		strings.TrimSpace(revises),
+	}, "\x00")
+	sum := sha256.Sum256([]byte(parts))
+	return "artifact-" + hex.EncodeToString(sum[:])[:16]
+}
+
+func digestBytes(body []byte) string {
+	sum := sha256.Sum256(body)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func observationByID(observations []Observation, id string) (Observation, bool) {
+	for i := len(observations) - 1; i >= 0; i-- {
+		if observations[i].Record.ID == id {
+			return observations[i], true
+		}
+	}
+	return Observation{}, false
+}
+
+func sameImport(observation ArtifactRecord, kind, title, revises, contentDigest, repo string) bool {
+	return observation.Kind == kind &&
+		observation.Title == title &&
+		observation.Revises == revises &&
+		observation.ContentDigest == contentDigest &&
+		observation.Repo == repo
+}
+
+func importResultFromObservation(binding stateBinding, observation Observation, duplicate bool) ImportResult {
+	record := observation.Record
+	return ImportResult{
+		SchemaVersion:   SchemaVersion,
+		State:           binding.State,
+		Repo:            binding.Repo,
+		ArtifactID:      record.ID,
+		Kind:            record.Kind,
+		Title:           record.Title,
+		SourcePath:      record.SourcePath,
+		Revises:         record.Revises,
+		Content:         record.Content,
+		ContentDigest:   record.ContentDigest,
+		Artifact:        observation.Artifact,
+		EventID:         observation.EventID,
+		CreatedAt:       record.CreatedAt,
+		AlreadyImported: duplicate,
+	}
+}
+
+func artifactSummary(observation Observation) ArtifactSummary {
+	record := observation.Record
+	return ArtifactSummary{
+		ID:            record.ID,
+		Kind:          record.Kind,
+		Title:         record.Title,
+		SourcePath:    record.SourcePath,
+		Repo:          record.Repo,
+		CreatedAt:     record.CreatedAt,
+		Revises:       record.Revises,
+		Content:       record.Content,
+		ContentDigest: record.ContentDigest,
+		Artifact:      observation.Artifact,
+		EventID:       observation.EventID,
+	}
+}
+
+func childrenByParent(observations []Observation) map[string][]string {
+	children := map[string][]string{}
+	for _, observation := range observations {
+		if observation.Record.Revises == "" {
+			continue
+		}
+		children[observation.Record.Revises] = append(children[observation.Record.Revises], observation.Record.ID)
+	}
+	return children
+}
+
+func revisionBlockers(observations []Observation) []Blocker {
+	children := childrenByParent(observations)
+	blockers := []Blocker{}
+	for parent, ids := range children {
+		unique := uniqueSorted(ids)
+		if len(unique) > 1 {
+			blockers = append(blockers, Blocker{
+				Code:    "forked_revision",
+				Message: fmt.Sprintf("artifact %s has multiple successors", parent),
+				IDs:     unique,
+			})
+		}
+	}
+	for _, observation := range observations {
+		if chainContains(observations, observation.Record.Revises, observation.Record.ID) {
+			blockers = append(blockers, Blocker{
+				Code:    "revision_cycle",
+				Message: fmt.Sprintf("artifact %s participates in a revision cycle", observation.Record.ID),
+				IDs:     []string{observation.Record.ID},
+			})
+		}
+	}
+	sort.Slice(blockers, func(i, j int) bool {
+		if blockers[i].Code == blockers[j].Code {
+			return strings.Join(blockers[i].IDs, ",") < strings.Join(blockers[j].IDs, ",")
+		}
+		return blockers[i].Code < blockers[j].Code
+	})
+	return blockers
+}
+
+func chainContains(observations []Observation, start, want string) bool {
+	seen := map[string]struct{}{}
+	for start != "" {
+		if start == want {
+			return true
+		}
+		if _, ok := seen[start]; ok {
+			return true
+		}
+		seen[start] = struct{}{}
+		observation, ok := observationByID(observations, start)
+		if !ok {
+			return false
+		}
+		start = observation.Record.Revises
+	}
+	return false
+}
+
+func uniqueSorted(values []string) []string {
+	seen := map[string]struct{}{}
+	out := []string{}
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func containsDigest(digests []string, digest string) bool {
+	for _, item := range digests {
+		if item == digest {
+			return true
+		}
+	}
+	return false
+}
+
+func stateBindingFromState(stateDir string) (stateBinding, error) {
+	root, err := state.ResolveStateDir(stateDir)
+	if err != nil {
+		return stateBinding{}, err
+	}
+	if result := state.Validate(root); !result.OK {
+		return stateBinding{}, stateValidationError(result)
+	}
+	events, err := state.ReadEvents(root)
+	if err != nil {
+		return stateBinding{}, err
+	}
+	if len(events) == 0 || events[0].Type != "state.initialized" {
+		return stateBinding{}, errors.New("state first event is not state.initialized")
+	}
+	return stateBinding{State: root, Repo: events[0].Repo}, nil
+}
+
+func stateValidationError(result state.ValidationResult) error {
+	if len(result.Errors) == 0 {
+		return errors.New("state validation failed")
+	}
+	first := result.Errors[0]
+	if first.Line > 0 {
+		return fmt.Errorf("state validation failed: %s:%d: %s: %s", first.Path, first.Line, first.Code, first.Message)
+	}
+	return fmt.Errorf("state validation failed: %s: %s: %s", first.Path, first.Code, first.Message)
+}
+
+func recordPathBestEffort(contentPath, digest string) string {
+	if contentPath == "" {
+		return ""
+	}
+	root := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(contentPath))))
+	hexDigest := strings.TrimPrefix(digest, "sha256:")
+	if len(hexDigest) < 2 {
+		return ""
+	}
+	path := filepath.Join(root, "objects", "sha256", hexDigest[:2], hexDigest)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return abs
+}

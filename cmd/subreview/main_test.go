@@ -54,6 +54,65 @@ func TestStateInitAndValidateCLI(t *testing.T) {
 	}
 }
 
+func TestArtifactImportAndStatusCLI(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "subreview")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build subreview: %v\n%s", err, out)
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	stateDir := filepath.Join(root, "state")
+	planPath := filepath.Join(root, "plan.md")
+	if err := os.WriteFile(planPath, []byte("# Plan\n\nReview me.\n"), 0o644); err != nil {
+		t.Fatalf("write plan: %v", err)
+	}
+	if out, err := exec.Command(bin, "state", "init", "--state", stateDir, "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("state init failed: %v\n%s", err, out)
+	}
+	importOut, err := exec.Command(bin, "artifact", "import", "--state", stateDir, "--kind", "plan", "--path", planPath, "--title", "CLI Plan", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("artifact import failed: %v\n%s", err, importOut)
+	}
+	var imported struct {
+		ArtifactID    string `json:"artifact_id"`
+		Kind          string `json:"kind"`
+		Title         string `json:"title"`
+		ContentDigest string `json:"content_digest"`
+		EventID       string `json:"event_id"`
+	}
+	if err := json.Unmarshal(importOut, &imported); err != nil {
+		t.Fatalf("import output is not json: %v\n%s", err, importOut)
+	}
+	if imported.ArtifactID == "" || imported.Kind != "plan" || imported.Title != "CLI Plan" || imported.ContentDigest == "" || imported.EventID == "" {
+		t.Fatalf("bad import output: %s", importOut)
+	}
+	statusOut, err := exec.Command(bin, "artifact", "status", "--state", stateDir, "--artifact", imported.ArtifactID, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("artifact status failed: %v\n%s", err, statusOut)
+	}
+	var status struct {
+		ArtifactID     string `json:"artifact_id"`
+		Status         string `json:"status"`
+		ReviewRequired bool   `json:"review_required"`
+		Artifact       struct {
+			ContentDigest string `json:"content_digest"`
+		} `json:"artifact"`
+	}
+	if err := json.Unmarshal(statusOut, &status); err != nil {
+		t.Fatalf("status output is not json: %v\n%s", err, statusOut)
+	}
+	if status.ArtifactID != imported.ArtifactID || status.Status != "no_review_packet" || !status.ReviewRequired || status.Artifact.ContentDigest != imported.ContentDigest {
+		t.Fatalf("bad status output: %s", statusOut)
+	}
+	validateOut, err := exec.Command(bin, "state", "validate", "--state", stateDir, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("state validate failed: %v\n%s", err, validateOut)
+	}
+}
+
 func TestHelpLiteralIsAcceptedAsFlagValue(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "subreview")
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
