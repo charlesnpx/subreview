@@ -1272,7 +1272,6 @@ func renderArtifactStablePrefix(data artifactRenderData) string {
 	if data.Artifact.Revises != "" {
 		fmt.Fprintf(&b, "- artifact_revises: %s\n", data.Artifact.Revises)
 	}
-	fmt.Fprintf(&b, "- artifact_digest: %s\n", data.Artifact.Artifact.Digest)
 	fmt.Fprintf(&b, "- content_digest: %s\n", data.Artifact.ContentDigest)
 	fmt.Fprintf(&b, "- semantic_dedupe_digest: %s\n", data.Dedupe.Digest)
 	fmt.Fprintln(&b)

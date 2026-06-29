@@ -192,22 +192,26 @@ func TestBuildArtifactPacketStableDigestIgnoresImportPathAndTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build first artifact packet: %v", err)
 	}
+	secondStateDir := filepath.Join(t.TempDir(), "state")
+	if _, err := state.Init(state.InitOptions{StateDir: secondStateDir, RepoPath: repo, Now: time.Unix(30, 0)}); err != nil {
+		t.Fatalf("Init second state: %v", err)
+	}
 	secondImport, err := artifact.Import(artifact.ImportOptions{
-		StateDir: stateDir,
+		StateDir: secondStateDir,
 		Kind:     artifact.KindPlan,
 		Path:     writeArtifactPlanFile(t, repo, "second.md", "same\n"),
 		Title:    "Same Plan",
-		Now:      time.Unix(20, 0),
+		Now:      time.Unix(40, 0),
 	})
 	if err != nil {
-		t.Fatalf("Import duplicate artifact: %v", err)
+		t.Fatalf("Import second artifact: %v", err)
 	}
-	secondPacket, err := Build(BuildOptions{StateDir: stateDir, Kind: KindArtifact, ArtifactID: secondImport.ArtifactID, Now: time.Unix(200, 0)})
+	secondPacket, err := Build(BuildOptions{StateDir: secondStateDir, Kind: KindArtifact, ArtifactID: secondImport.ArtifactID, Now: time.Unix(200, 0)})
 	if err != nil {
-		t.Fatalf("Build duplicate artifact packet: %v", err)
+		t.Fatalf("Build second artifact packet: %v", err)
 	}
-	if firstImport.ArtifactID != secondImport.ArtifactID || !secondImport.AlreadyImported {
-		t.Fatalf("duplicate import should resolve to same artifact: first=%+v second=%+v", firstImport, secondImport)
+	if firstImport.ArtifactID != secondImport.ArtifactID {
+		t.Fatalf("same artifact content should produce same id across states: first=%+v second=%+v", firstImport, secondImport)
 	}
 	if firstPacket.StableDigest != secondPacket.StableDigest {
 		t.Fatalf("stable digest should ignore import path/time: %s != %s", firstPacket.StableDigest, secondPacket.StableDigest)
