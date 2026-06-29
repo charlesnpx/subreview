@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charlesnpx/subreview/internal/artifact"
 	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/obligation"
 	"github.com/charlesnpx/subreview/internal/policy"
@@ -16,6 +17,206 @@ import (
 	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
 )
+
+func TestBuildArtifactPacketWithoutCoverageManifest(t *testing.T) {
+	repo, stateDir := initializedArtifactOnlyState(t)
+	imported, err := artifact.Import(artifact.ImportOptions{
+		StateDir: stateDir,
+		Kind:     artifact.KindPlan,
+		Path:     writeArtifactPlanFile(t, repo, "plan.md", "# Plan\n\n- ship it\n"),
+		Title:    "Artifact Plan",
+		Now:      time.Unix(10, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import artifact: %v", err)
+	}
+	first, err := Build(BuildOptions{StateDir: stateDir, Kind: KindArtifact, ArtifactID: imported.ArtifactID, Now: time.Unix(100, 0)})
+	if err != nil {
+		t.Fatalf("Build artifact packet: %v", err)
+	}
+	second, err := Build(BuildOptions{StateDir: stateDir, Kind: KindArtifact, ArtifactID: imported.ArtifactID, Now: time.Unix(200, 0)})
+	if err != nil {
+		t.Fatalf("Build second artifact packet: %v", err)
+	}
+	if first.Kind != KindArtifact || first.Route != RouteArtifact || first.RunKind != RunKindDiscovery || first.Artifact == nil {
+		t.Fatalf("bad artifact packet result: %+v", first)
+	}
+	if first.CoverageManifest.Digest != "" || first.TargetState.Digest != "" {
+		t.Fatalf("artifact packet should not require code coverage refs: %+v", first)
+	}
+	if first.StableDigest != second.StableDigest {
+		t.Fatalf("stable digest should ignore generated time: %s != %s", first.StableDigest, second.StableDigest)
+	}
+	if first.VolatileDigest == second.VolatileDigest {
+		t.Fatalf("volatile digest should include generated time")
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	markdown, err := store.Read(first.Markdown.Digest)
+	if err != nil {
+		t.Fatalf("Read markdown: %v", err)
+	}
+	for _, want := range []string{"# Subreview Artifact Review Packet", "route: artifact_review", "artifact_id: " + imported.ArtifactID, "- ship it", "artifact_refs"} {
+		if !strings.Contains(string(markdown), want) {
+			t.Fatalf("artifact markdown missing %q:\n%s", want, markdown)
+		}
+	}
+	packetBody, err := store.Read(first.Packet.Digest)
+	if err != nil {
+		t.Fatalf("Read packet: %v", err)
+	}
+	var record PacketRecord
+	if err := json.Unmarshal(packetBody, &record); err != nil {
+		t.Fatalf("Unmarshal packet: %v", err)
+	}
+	if record.Artifact == nil || record.Artifact.ID != imported.ArtifactID || record.StableDigest != first.StableDigest {
+		t.Fatalf("bad artifact packet record: %+v", record)
+	}
+	status, err := artifact.Status(artifact.StatusOptions{StateDir: stateDir, ArtifactID: imported.ArtifactID})
+	if err != nil {
+		t.Fatalf("Artifact status: %v", err)
+	}
+	if status.Status != "waiting_for_result" || status.LatestPacket == nil || status.LatestPacket.Packet != second.Packet.Digest {
+		t.Fatalf("status should report latest artifact packet: %+v", status)
+	}
+	if validation := state.Validate(stateDir); !validation.OK {
+		t.Fatalf("state should validate: %+v", validation.Errors)
+	}
+}
+
+func TestBuildArtifactPacketRequiresArtifactID(t *testing.T) {
+	_, stateDir := initializedArtifactOnlyState(t)
+	_, err := Build(BuildOptions{StateDir: stateDir, Kind: KindArtifact})
+	if err == nil || !strings.Contains(err.Error(), "--artifact is required") {
+		t.Fatalf("expected missing artifact error, got %v", err)
+	}
+}
+
+func TestBuildArtifactPacketRejectsUnknownArtifactWithoutCoverageError(t *testing.T) {
+	_, stateDir := initializedArtifactOnlyState(t)
+	_, err := Build(BuildOptions{StateDir: stateDir, Kind: KindArtifact, ArtifactID: "artifact-missing"})
+	if err == nil || !strings.Contains(err.Error(), "artifact not found") {
+		t.Fatalf("expected artifact not found error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "coverage manifest") {
+		t.Fatalf("artifact packet should not try coverage manifest lookup: %v", err)
+	}
+}
+
+func TestBuildArtifactPacketContextBudgetOmission(t *testing.T) {
+	repo, stateDir := initializedArtifactOnlyState(t)
+	imported, err := artifact.Import(artifact.ImportOptions{
+		StateDir: stateDir,
+		Kind:     artifact.KindPlan,
+		Path:     writeArtifactPlanFile(t, repo, "plan.md", strings.Repeat("line\n", 20)),
+		Title:    "Big Plan",
+	})
+	if err != nil {
+		t.Fatalf("Import artifact: %v", err)
+	}
+	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindArtifact, ArtifactID: imported.ArtifactID, MaxContextBytes: 8})
+	if err != nil {
+		t.Fatalf("Build artifact packet: %v", err)
+	}
+	if result.SourceCompleteness != "partial" || !hasPacketOmission(result.Context.Omissions, "context_budget_exceeded") {
+		t.Fatalf("expected context budget omission: %+v", result)
+	}
+}
+
+func TestBuildArtifactPacketBinaryContentOmitted(t *testing.T) {
+	repo, stateDir := initializedArtifactOnlyState(t)
+	artifactID := appendRawArtifactRecord(t, stateDir, repo, "artifact-binary", []byte{0, 1, 2})
+	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindArtifact, ArtifactID: artifactID})
+	if err != nil {
+		t.Fatalf("Build artifact packet: %v", err)
+	}
+	if result.SourceCompleteness != "partial" || !hasPacketOmission(result.Context.Omissions, "binary_context_omitted") {
+		t.Fatalf("expected binary context omission: %+v", result)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	markdown, err := store.Read(result.Markdown.Digest)
+	if err != nil {
+		t.Fatalf("Read markdown: %v", err)
+	}
+	if strings.Contains(string(markdown), string([]byte{0, 1, 2})) {
+		t.Fatalf("binary content should not be embedded in markdown")
+	}
+}
+
+func TestBuildArtifactPacketStableDigestIgnoresUnrelatedLedgerEvents(t *testing.T) {
+	repo, stateDir := initializedArtifactOnlyState(t)
+	imported, err := artifact.Import(artifact.ImportOptions{
+		StateDir: stateDir,
+		Kind:     artifact.KindPlan,
+		Path:     writeArtifactPlanFile(t, repo, "plan.md", "same\n"),
+		Title:    "Same Plan",
+		Now:      time.Unix(10, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import artifact: %v", err)
+	}
+	first, err := Build(BuildOptions{StateDir: stateDir, Kind: KindArtifact, ArtifactID: imported.ArtifactID, Now: time.Unix(100, 0)})
+	if err != nil {
+		t.Fatalf("Build artifact packet: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{Type: "unrelated.event", Repo: repo}); err != nil {
+		t.Fatalf("Append unrelated event: %v", err)
+	}
+	second, err := Build(BuildOptions{StateDir: stateDir, Kind: KindArtifact, ArtifactID: imported.ArtifactID, Now: time.Unix(200, 0)})
+	if err != nil {
+		t.Fatalf("Build second artifact packet: %v", err)
+	}
+	if first.StableDigest != second.StableDigest {
+		t.Fatalf("stable digest should ignore unrelated ledger event: %s != %s", first.StableDigest, second.StableDigest)
+	}
+}
+
+func TestBuildArtifactPacketStableDigestIgnoresImportPathAndTime(t *testing.T) {
+	repo, stateDir := initializedArtifactOnlyState(t)
+	firstImport, err := artifact.Import(artifact.ImportOptions{
+		StateDir: stateDir,
+		Kind:     artifact.KindPlan,
+		Path:     writeArtifactPlanFile(t, repo, "first.md", "same\n"),
+		Title:    "Same Plan",
+		Now:      time.Unix(10, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import first artifact: %v", err)
+	}
+	firstPacket, err := Build(BuildOptions{StateDir: stateDir, Kind: KindArtifact, ArtifactID: firstImport.ArtifactID, Now: time.Unix(100, 0)})
+	if err != nil {
+		t.Fatalf("Build first artifact packet: %v", err)
+	}
+	secondStateDir := filepath.Join(t.TempDir(), "state")
+	if _, err := state.Init(state.InitOptions{StateDir: secondStateDir, RepoPath: repo, Now: time.Unix(30, 0)}); err != nil {
+		t.Fatalf("Init second state: %v", err)
+	}
+	secondImport, err := artifact.Import(artifact.ImportOptions{
+		StateDir: secondStateDir,
+		Kind:     artifact.KindPlan,
+		Path:     writeArtifactPlanFile(t, repo, "second.md", "same\n"),
+		Title:    "Same Plan",
+		Now:      time.Unix(40, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import second artifact: %v", err)
+	}
+	secondPacket, err := Build(BuildOptions{StateDir: secondStateDir, Kind: KindArtifact, ArtifactID: secondImport.ArtifactID, Now: time.Unix(200, 0)})
+	if err != nil {
+		t.Fatalf("Build second artifact packet: %v", err)
+	}
+	if firstImport.ArtifactID != secondImport.ArtifactID {
+		t.Fatalf("same artifact content should produce same id across states: first=%+v second=%+v", firstImport, secondImport)
+	}
+	if firstPacket.StableDigest != secondPacket.StableDigest {
+		t.Fatalf("stable digest should ignore import path/time: %s != %s", firstPacket.StableDigest, secondPacket.StableDigest)
+	}
+}
 
 func TestBuildPrimaryPacketStableDigestAndDedupeIgnoreVolatileTime(t *testing.T) {
 	_, stateDir := initializedPacketState(t, "one\n", "one\ntwo\n")
@@ -786,6 +987,18 @@ func initializedModeOnlyPacketState(t *testing.T) (string, string) {
 	return repo, stateDir
 }
 
+func initializedArtifactOnlyState(t *testing.T) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	initGitRepo(t, repo)
+	stateDir := filepath.Join(root, "state")
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(10, 0)}); err != nil {
+		t.Fatalf("Init state: %v", err)
+	}
+	return repo, stateDir
+}
+
 func initializedBinaryPacketState(t *testing.T) (string, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -1051,6 +1264,56 @@ func git(t *testing.T, repo string, args ...string) {
 func writeFile(t *testing.T, root, rel, body string) {
 	t.Helper()
 	writeBytes(t, root, rel, []byte(body))
+}
+
+func writeArtifactPlanFile(t *testing.T, root, rel, body string) string {
+	t.Helper()
+	writeFile(t, root, rel, body)
+	return filepath.Join(root, filepath.FromSlash(rel))
+}
+
+func appendRawArtifactRecord(t *testing.T, stateDir, repo, id string, body []byte) string {
+	t.Helper()
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	content, err := store.PutBytes(body, artifact.MediaTypePlanText)
+	if err != nil {
+		t.Fatalf("Put content: %v", err)
+	}
+	record := artifact.ArtifactRecord{
+		SchemaVersion: artifact.SchemaVersion,
+		ID:            id,
+		Kind:          artifact.KindPlan,
+		Title:         id,
+		SourcePath:    filepath.Join(repo, id+".md"),
+		Repo:          repo,
+		CreatedAt:     time.Unix(20, 0).UTC().Format(time.RFC3339Nano),
+		Content:       content,
+		ContentDigest: content.Digest,
+		Text:          artifact.TextMetadata{Encoding: "binary", UTF8: false, ContainsNUL: true},
+	}
+	artifactRef, err := store.PutJSON(record, artifact.MediaTypeArtifact)
+	if err != nil {
+		t.Fatalf("Put artifact: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          artifact.EventTypeImported,
+		ObjectDigests: []string{artifactRef.Digest, content.Digest},
+		Repo:          repo,
+		Details: map[string]string{
+			"artifact":       artifactRef.Digest,
+			"artifact_id":    id,
+			"kind":           artifact.KindPlan,
+			"title":          id,
+			"content":        content.Digest,
+			"content_digest": content.Digest,
+		},
+	}); err != nil {
+		t.Fatalf("Append artifact event: %v", err)
+	}
+	return id
 }
 
 func writeBytes(t *testing.T, root, rel string, body []byte) {

@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/charlesnpx/subreview/internal/artifact"
 	"github.com/charlesnpx/subreview/internal/gate"
 	"github.com/charlesnpx/subreview/internal/obligation"
 	"github.com/charlesnpx/subreview/internal/policy"
@@ -31,11 +32,13 @@ const (
 
 	KindPrimary      = "primary"
 	KindVerification = "verification"
+	KindArtifact     = "artifact"
 
 	RunKindDiscovery    = "discovery"
 	RunKindVerification = "verification"
 	RoutePrimary        = "primary_review"
 	RouteVerification   = "targeted_verification"
+	RouteArtifact       = "artifact_review"
 
 	MediaTypePacket   = "application/vnd.subreview.packet+json"
 	MediaTypeMarkdown = "text/markdown; charset=utf-8"
@@ -64,6 +67,7 @@ type BuildOptions struct {
 	Kind            string
 	Route           string
 	FindingID       string
+	ArtifactID      string
 	Now             time.Time
 	MaxContextBytes int
 }
@@ -88,6 +92,7 @@ type BuildResult struct {
 	GeneratedAt        string               `json:"generated_at"`
 	CoverageManifest   state.ObjectRef      `json:"coverage_manifest"`
 	Policy             *PolicyRef           `json:"policy,omitempty"`
+	Artifact           *ArtifactRef         `json:"artifact,omitempty"`
 	TargetState        SnapshotRef          `json:"target_state"`
 	SourceCompleteness string               `json:"source_completeness"`
 	Verification       *VerificationSummary `json:"verification,omitempty"`
@@ -101,6 +106,7 @@ type PacketRecord struct {
 	Repo               string              `json:"repo"`
 	GeneratedAt        string              `json:"generated_at"`
 	Policy             *PolicyRef          `json:"policy,omitempty"`
+	Artifact           *ArtifactRef        `json:"artifact,omitempty"`
 	TargetState        SnapshotRef         `json:"target_state"`
 	CoverageManifest   state.ObjectRef     `json:"coverage_manifest"`
 	SourceDiffs        []SourceDiff        `json:"source_diffs"`
@@ -122,6 +128,16 @@ type PolicyRef struct {
 	Profile  string `json:"profile"`
 	PolicyID string `json:"policy_id"`
 	Digest   string `json:"digest"`
+}
+
+type ArtifactRef struct {
+	ID            string          `json:"id"`
+	Kind          string          `json:"kind"`
+	Title         string          `json:"title"`
+	Revises       string          `json:"revises,omitempty"`
+	Content       state.ObjectRef `json:"content"`
+	ContentDigest string          `json:"content_digest"`
+	Artifact      state.ObjectRef `json:"artifact"`
 }
 
 type SnapshotRef struct {
@@ -292,9 +308,166 @@ func Build(opts BuildOptions) (BuildResult, error) {
 		return buildPrimary(opts)
 	case KindVerification:
 		return buildVerification(opts)
+	case KindArtifact:
+		return buildArtifact(opts)
 	default:
 		return BuildResult{}, fmt.Errorf("unsupported packet kind: %s", opts.Kind)
 	}
+}
+
+func buildArtifact(opts BuildOptions) (BuildResult, error) {
+	maxContextBytes := opts.MaxContextBytes
+	if maxContextBytes <= 0 {
+		maxContextBytes = defaultContextBytes
+	}
+	artifactID := strings.TrimSpace(opts.ArtifactID)
+	if artifactID == "" {
+		return BuildResult{}, errors.New("--artifact is required for artifact packets")
+	}
+	route := strings.TrimSpace(opts.Route)
+	if route == "" {
+		route = RouteArtifact
+	}
+	if route != RouteArtifact {
+		return BuildResult{}, fmt.Errorf("unsupported artifact route: %s", route)
+	}
+	now := opts.Now.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	binding, err := stateBindingFromState(opts.StateDir)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	store, err := state.Open(binding.State)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	events, err := state.ReadEvents(binding.State)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	artifactObservation, err := artifactObservationByID(store, events, binding.Repo, artifactID)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	artifactRef := packetArtifactRef(artifactObservation)
+	context := buildArtifactContext(store, artifactObservation.Record, maxContextBytes)
+	context.AllowedContextDigest = digestJSON(contextDigestMaterial(context))
+	context.ContentBundleHash = digestJSON(map[string]any{
+		"schema_version":         SchemaVersion,
+		"packet_kind":            KindArtifact,
+		"artifact_id":            artifactRef.ID,
+		"artifact_kind":          artifactRef.Kind,
+		"artifact_title":         artifactRef.Title,
+		"artifact_revises":       artifactRef.Revises,
+		"artifact_content":       canonicalObject(artifactRef.Content),
+		"allowed_context_digest": context.AllowedContextDigest,
+		"context_omissions":      omissionLeakageMaterial(context.Omissions),
+	})
+	dedupe := NewSemanticDedupeKey(SemanticDedupeFields{
+		Route:                route,
+		TargetState:          "artifact:" + artifactRef.ID,
+		ContentBundleHash:    context.ContentBundleHash,
+		RunKind:              RunKindDiscovery,
+		AllowedContextBundle: context.AllowedContextDigest,
+	})
+	sourceCompleteness := sourceCompleteness(context)
+	tokenTelemetry := NewTokenTelemetry(RunKindDiscovery, sourceCompleteness)
+	stable := renderArtifactStablePrefix(artifactRenderData{
+		Repo:           binding.Repo,
+		Artifact:       artifactRef,
+		Context:        context,
+		Dedupe:         dedupe,
+		SourceComplete: sourceCompleteness,
+		TokenTelemetry: tokenTelemetry,
+	})
+	volatile := renderVolatileSuffix(binding.State, now)
+	stableDigest := digestString(stable)
+	volatileDigest := digestString(volatile)
+	markdown := stable + "\n\n" + volatile + "\n"
+	promptDigest := digestString(markdown)
+	leakage := CheckLeakage(artifactLeakageScanText(artifactLeakageMaterial{
+		Repo:           binding.Repo,
+		Artifact:       artifactRef,
+		Context:        context,
+		Dedupe:         dedupe,
+		SourceComplete: sourceCompleteness,
+		TokenTelemetry: tokenTelemetry,
+	}))
+	if !leakage.OK {
+		return BuildResult{}, fmt.Errorf("packet leakage check failed: %s", strings.Join(leakage.ForbiddenTerms, ", "))
+	}
+	record := PacketRecord{
+		SchemaVersion:      SchemaVersion,
+		Kind:               KindArtifact,
+		RunKind:            RunKindDiscovery,
+		Route:              route,
+		Repo:               binding.Repo,
+		GeneratedAt:        now.Format(time.RFC3339Nano),
+		Artifact:           &artifactRef,
+		Context:            context,
+		StablePrefix:       stable,
+		VolatileSuffix:     volatile,
+		StableDigest:       stableDigest,
+		VolatileDigest:     volatileDigest,
+		PromptDigest:       promptDigest,
+		SemanticDedupeKey:  dedupe,
+		Leakage:            leakage,
+		TokenTelemetry:     tokenTelemetry,
+		SourceCompleteness: sourceCompleteness,
+	}
+	packetRef, err := store.PutJSON(record, MediaTypePacket)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	markdownRef, err := store.PutBytes([]byte(markdown), MediaTypeMarkdown)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	event, err := state.AppendEvent(binding.State, state.Event{
+		Type:          EventTypePacketBuilt,
+		ObjectDigests: []string{packetRef.Digest, markdownRef.Digest},
+		Repo:          binding.Repo,
+		Details: map[string]string{
+			"kind":                   KindArtifact,
+			"run_kind":               RunKindDiscovery,
+			"route":                  route,
+			"packet":                 packetRef.Digest,
+			"markdown":               markdownRef.Digest,
+			"artifact_id":            artifactRef.ID,
+			"artifact":               artifactRef.Artifact.Digest,
+			"artifact_content":       artifactRef.Content.Digest,
+			"stable_digest":          stableDigest,
+			"volatile_digest":        volatileDigest,
+			"prompt_digest":          promptDigest,
+			"semantic_dedupe_digest": dedupe.Digest,
+		},
+	})
+	if err != nil {
+		return BuildResult{}, err
+	}
+	return BuildResult{
+		SchemaVersion:      SchemaVersion,
+		State:              binding.State,
+		Repo:               binding.Repo,
+		Kind:               KindArtifact,
+		RunKind:            RunKindDiscovery,
+		Route:              route,
+		Packet:             packetRef,
+		Markdown:           markdownRef,
+		StableDigest:       stableDigest,
+		VolatileDigest:     volatileDigest,
+		PromptDigest:       promptDigest,
+		SemanticDedupeKey:  dedupe,
+		Context:            contextSummary(context),
+		Leakage:            leakage,
+		TokenTelemetry:     tokenTelemetry,
+		EventID:            event.EventID,
+		GeneratedAt:        now.Format(time.RFC3339Nano),
+		Artifact:           &artifactRef,
+		SourceCompleteness: sourceCompleteness,
+	}, nil
 }
 
 func buildPrimary(opts BuildOptions) (BuildResult, error) {
@@ -907,6 +1080,15 @@ type recordLeakageMaterial struct {
 	TokenTelemetry TokenTelemetry
 }
 
+type artifactLeakageMaterial struct {
+	Repo           string
+	Artifact       ArtifactRef
+	Context        ContextBundle
+	Dedupe         SemanticDedupeKey
+	SourceComplete string
+	TokenTelemetry TokenTelemetry
+}
+
 func leakageScanText(data recordLeakageMaterial) string {
 	type contextEntryMetadata struct {
 		Kind         string `json:"kind"`
@@ -936,6 +1118,34 @@ func leakageScanText(data recordLeakageMaterial) string {
 		"context_metadata":  entries,
 		"context_omissions": omissionLeakageMaterial(data.Context.Omissions),
 		"gates":             gateDigestMaterial(data.Gates),
+		"dedupe":            data.Dedupe,
+		"source_complete":   data.SourceComplete,
+		"token_telemetry":   data.TokenTelemetry,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
+}
+
+func artifactLeakageScanText(data artifactLeakageMaterial) string {
+	type contextEntryMetadata struct {
+		Kind   string `json:"kind"`
+		Digest string `json:"digest"`
+		Bytes  int    `json:"bytes"`
+	}
+	entries := make([]contextEntryMetadata, 0, len(data.Context.Entries))
+	for _, entry := range data.Context.Entries {
+		entries = append(entries, contextEntryMetadata{Kind: entry.Kind, Digest: entry.Digest, Bytes: entry.Bytes})
+	}
+	body, err := json.Marshal(map[string]any{
+		"repo":              data.Repo,
+		"artifact_id":       data.Artifact.ID,
+		"artifact_kind":     data.Artifact.Kind,
+		"artifact_title":    data.Artifact.Title,
+		"artifact_content":  canonicalObject(data.Artifact.Content),
+		"context_metadata":  entries,
+		"context_omissions": omissionLeakageMaterial(data.Context.Omissions),
 		"dedupe":            data.Dedupe,
 		"source_complete":   data.SourceComplete,
 		"token_telemetry":   data.TokenTelemetry,
@@ -1032,6 +1242,84 @@ type stableRenderData struct {
 	Dedupe         SemanticDedupeKey
 	SourceComplete string
 	TokenTelemetry TokenTelemetry
+}
+
+type artifactRenderData struct {
+	Repo           string
+	Artifact       ArtifactRef
+	Context        ContextBundle
+	Dedupe         SemanticDedupeKey
+	SourceComplete string
+	TokenTelemetry TokenTelemetry
+}
+
+func renderArtifactStablePrefix(data artifactRenderData) string {
+	var b strings.Builder
+	fmt.Fprintln(&b, "# Subreview Artifact Review Packet")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Review Contract")
+	fmt.Fprintln(&b, "- Review the included artifact for decision completeness, feasibility, contradictions, missing tests, and actionable issues.")
+	fmt.Fprintln(&b, "- Use only the artifact content, artifact metadata, and explicit omissions in this packet.")
+	fmt.Fprintln(&b, "- Return structured artifact_review results with artifact_refs that cite artifact sections, stories, merge units, or line ranges.")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Identity")
+	fmt.Fprintf(&b, "- route: %s\n", RouteArtifact)
+	fmt.Fprintf(&b, "- run_kind: %s\n", RunKindDiscovery)
+	fmt.Fprintf(&b, "- repo: %s\n", data.Repo)
+	fmt.Fprintf(&b, "- artifact_id: %s\n", data.Artifact.ID)
+	fmt.Fprintf(&b, "- artifact_kind: %s\n", data.Artifact.Kind)
+	fmt.Fprintf(&b, "- artifact_title: %s\n", markdownJSONString(data.Artifact.Title))
+	if data.Artifact.Revises != "" {
+		fmt.Fprintf(&b, "- artifact_revises: %s\n", data.Artifact.Revises)
+	}
+	fmt.Fprintf(&b, "- content_digest: %s\n", data.Artifact.ContentDigest)
+	fmt.Fprintf(&b, "- semantic_dedupe_digest: %s\n", data.Dedupe.Digest)
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Context Budget")
+	fmt.Fprintf(&b, "- max_bytes: %d\n", data.Context.MaxBytes)
+	fmt.Fprintf(&b, "- used_bytes: %d\n", data.Context.UsedBytes)
+	fmt.Fprintf(&b, "- source_completeness: %s\n", data.SourceComplete)
+	fmt.Fprintf(&b, "- allowed_context_digest: %s\n", data.Context.AllowedContextDigest)
+	fmt.Fprintf(&b, "- content_bundle_hash: %s\n", data.Context.ContentBundleHash)
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Artifact Content")
+	if len(data.Context.Entries) == 0 {
+		fmt.Fprintln(&b, "- no artifact content selected")
+	}
+	for _, entry := range data.Context.Entries {
+		fmt.Fprintf(&b, "### %s %s\n", entry.Kind, markdownJSONString(entry.Path))
+		fmt.Fprintf(&b, "digest: %s\n\n", entry.Digest)
+		fence := markdownFence(entry.Content)
+		fmt.Fprintln(&b, fence)
+		fmt.Fprintln(&b, entry.Content)
+		fmt.Fprintln(&b, fence)
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Explicit Omissions")
+	if len(data.Context.Omissions) == 0 {
+		fmt.Fprintln(&b, "- none")
+	} else {
+		for _, omission := range data.Context.Omissions {
+			if omission.Path != "" {
+				fmt.Fprintf(&b, "- %s %s: %s\n", omission.Code, markdownJSONString(omission.Path), omission.Message)
+			} else {
+				fmt.Fprintf(&b, "- %s: %s\n", omission.Code, omission.Message)
+			}
+		}
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Expected Result Shape")
+	fmt.Fprintln(&b, "- schema_version: 1")
+	fmt.Fprintf(&b, "- run_kind: %s\n", RunKindDiscovery)
+	fmt.Fprintf(&b, "- route: %s\n", RouteArtifact)
+	fmt.Fprintln(&b, "- outcome: clean | findings | needs_context")
+	fmt.Fprintln(&b, "- findings[].artifact_refs[]: artifact_id, section, story_id, merge_unit_id, start_line, end_line, quote")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Token Telemetry Schema")
+	fmt.Fprintln(&b, "- gross_discovery_tokens, incremental_discovery_tokens, gross_verification_tokens, incremental_verification_tokens")
+	fmt.Fprintln(&b, "- gross_input_tokens, incremental_input_tokens, cached_input_tokens, output_tokens, reasoning_tokens")
+	fmt.Fprintln(&b, "- latency_ms, backend, model, effort, source_completeness")
+	return strings.TrimSpace(b.String())
 }
 
 func renderStablePrefix(data stableRenderData) string {
@@ -1306,6 +1594,72 @@ func markdownFence(content string) string {
 		return "```"
 	}
 	return strings.Repeat("`", maxRun+1)
+}
+
+func artifactObservationByID(store state.Store, events []state.Event, repo, artifactID string) (artifact.Observation, error) {
+	observations, err := artifact.Observations(store, events, repo)
+	if err != nil {
+		return artifact.Observation{}, err
+	}
+	for i := len(observations) - 1; i >= 0; i-- {
+		if observations[i].Record.ID == artifactID {
+			return observations[i], nil
+		}
+	}
+	return artifact.Observation{}, fmt.Errorf("artifact not found in state: %s", artifactID)
+}
+
+func packetArtifactRef(observation artifact.Observation) ArtifactRef {
+	record := observation.Record
+	return ArtifactRef{
+		ID:            record.ID,
+		Kind:          record.Kind,
+		Title:         record.Title,
+		Revises:       record.Revises,
+		Content:       record.Content,
+		ContentDigest: record.ContentDigest,
+		Artifact:      observation.Artifact,
+	}
+}
+
+func buildArtifactContext(store state.Store, record artifact.ArtifactRecord, maxBytes int) ContextBundle {
+	context := ContextBundle{
+		MaxBytes:                   maxBytes,
+		Entries:                    []ContextEntry{},
+		Omissions:                  []Omission{},
+		ConfiguredRelationships:    []string{},
+		ReviewerRequestedPaths:     []string{},
+		BoundedContextRequestLimit: 0,
+	}
+	body, err := store.Read(record.ContentDigest)
+	if err != nil {
+		context.Omissions = append(context.Omissions, Omission{Code: "context_read_failed", Path: record.ID, Message: err.Error()})
+		sortContext(context.Entries, context.Omissions)
+		return context
+	}
+	if !isTextContextBody(body) {
+		context.Omissions = append(context.Omissions, Omission{Code: "binary_context_omitted", Path: record.ID, Message: "artifact content is binary or not valid UTF-8"})
+		sortContext(context.Entries, context.Omissions)
+		return context
+	}
+	content := strings.TrimRight(string(body), "\n")
+	bytesUsed := len([]byte(content))
+	if bytesUsed > maxBytes {
+		context.Omissions = append(context.Omissions, Omission{Code: "context_budget_exceeded", Path: record.ID, Message: "artifact content exceeded packet context budget"})
+		sortContext(context.Entries, context.Omissions)
+		return context
+	}
+	context.UsedBytes = bytesUsed
+	context.Entries = append(context.Entries, ContextEntry{
+		Kind:         "artifact_content",
+		Path:         record.ID,
+		SnapshotKind: "artifact",
+		Digest:       record.ContentDigest,
+		Bytes:        bytesUsed,
+		Content:      content,
+	})
+	sortContext(context.Entries, context.Omissions)
+	return context
 }
 
 func buildContext(store state.Store, target SnapshotRef, tree map[string]snapshot.TreeEntry, files []patchFile, maxBytes int) ContextBundle {

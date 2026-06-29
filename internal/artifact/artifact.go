@@ -71,6 +71,7 @@ type StatusResult struct {
 	Status              string          `json:"status"`
 	ReviewRequired      bool            `json:"review_required"`
 	Artifact            ArtifactSummary `json:"artifact"`
+	LatestPacket        *PacketSummary  `json:"latest_packet,omitempty"`
 	SupersededBy        []string        `json:"superseded_by,omitempty"`
 	Blockers            []Blocker       `json:"blockers,omitempty"`
 }
@@ -93,6 +94,14 @@ type ArtifactSummary struct {
 	ContentDigest string          `json:"content_digest"`
 	Artifact      state.ObjectRef `json:"artifact"`
 	EventID       string          `json:"event_id"`
+}
+
+type PacketSummary struct {
+	Packet  string `json:"packet"`
+	EventID string `json:"event_id"`
+	Route   string `json:"route"`
+	Kind    string `json:"kind"`
+	RunKind string `json:"run_kind"`
 }
 
 type ArtifactRecord struct {
@@ -270,8 +279,12 @@ func Status(opts StatusOptions) (StatusResult, error) {
 	blockers := revisionBlockers(observations, children, component)
 	supersededBy := append([]string(nil), children[artifactID]...)
 	sort.Strings(supersededBy)
+	latestPacket := latestPacketForArtifact(events, binding.Repo, artifactID)
 	status := "no_review_packet"
 	reviewRequired := true
+	if latestPacket != nil {
+		status = "waiting_for_result"
+	}
 	if len(blockers) > 0 {
 		status = "blocked"
 		reviewRequired = false
@@ -285,6 +298,7 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		Status:              status,
 		ReviewRequired:      reviewRequired,
 		Artifact:            artifactSummary(observation),
+		LatestPacket:        latestPacket,
 		SupersededBy:        supersededBy,
 		Blockers:            blockers,
 	}, nil
@@ -626,6 +640,27 @@ func uniqueSorted(values []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func latestPacketForArtifact(events []state.Event, repo, artifactID string) *PacketSummary {
+	var latest *PacketSummary
+	for _, event := range events {
+		if event.Type != "packet.built" || event.Repo != repo || event.Details["artifact_id"] != artifactID {
+			continue
+		}
+		packet := strings.TrimSpace(event.Details["packet"])
+		if packet == "" {
+			continue
+		}
+		latest = &PacketSummary{
+			Packet:  packet,
+			EventID: event.EventID,
+			Route:   event.Details["route"],
+			Kind:    event.Details["kind"],
+			RunKind: event.Details["run_kind"],
+		}
+	}
+	return latest
 }
 
 func containsDigest(digests []string, digest string) bool {
