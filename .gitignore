@@ -1,2 +1,6 @@
 # Generated/private research corpus and replay artifacts.
 research/codex-subagent-review-corpus/
+.env
+todo.txt
+todo-completed.txt
+.idea

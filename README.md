@@ -135,3 +135,17 @@ subreview artifact status \
 The final status is clean only when the latest artifact has a matching latest artifact packet and a clean imported `artifact_review` result. Rebuilding the packet after importing a result returns the artifact to `waiting_for_result` until a result for that latest packet is imported.
 
 Generated/private research corpora and replay artifacts are intentionally not included in this public runtime repository. The generated corpus path is ignored so local research outputs are not tracked accidentally.
+
+## Optional private smoke tests
+
+Private artifact smoke tests are opt-in and excluded from the default test suite. Configure the local artifacts root with `SUBREVIEW_PRIVATE_ARTIFACTS_DIR`; `.env.example` points at the sibling private checkout used during development:
+
+```sh
+SUBREVIEW_PRIVATE_ARTIFACTS_DIR=~/WebstormProjects/subreview_with_context
+```
+
+Local `.env` files are ignored and loaded by the private smoke test when present. Run the smoke test only when the private artifacts checkout is available:
+
+```sh
+go test -tags private_smoke ./cmd/subreview
+```
