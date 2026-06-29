@@ -34,6 +34,7 @@ const (
 	RouteIndependentFinal     = "independent_final_review"
 	RouteTargetedVerification = "targeted_verification"
 	RouteCompactFreshVerify   = "compact_fresh_verification"
+	RouteArtifactReview       = "artifact_review"
 
 	OutcomeClean        = "clean"
 	OutcomeFindings     = "findings"
@@ -101,6 +102,7 @@ type ImportResult struct {
 	State                           string          `json:"state"`
 	Repo                            string          `json:"repo"`
 	PacketID                        string          `json:"packet_id"`
+	ArtifactID                      string          `json:"artifact_id,omitempty"`
 	Outcome                         string          `json:"outcome"`
 	RawResult                       state.ObjectRef `json:"raw_result"`
 	Result                          state.ObjectRef `json:"result"`
@@ -133,15 +135,16 @@ type WorkerResult struct {
 }
 
 type FindingInput struct {
-	ID                 string       `json:"id,omitempty"`
-	State              string       `json:"state,omitempty"`
-	Severity           string       `json:"severity"`
-	Class              string       `json:"class"`
-	Claim              string       `json:"claim"`
-	FailureScenario    string       `json:"failure_scenario"`
-	Citations          []LineRef    `json:"citations,omitempty"`
-	Anchors            []AnchorRef  `json:"anchors,omitempty"`
-	ExpectedFixSurface []FixSurface `json:"expected_fix_surface,omitempty"`
+	ID                 string        `json:"id,omitempty"`
+	State              string        `json:"state,omitempty"`
+	Severity           string        `json:"severity"`
+	Class              string        `json:"class"`
+	Claim              string        `json:"claim"`
+	FailureScenario    string        `json:"failure_scenario"`
+	Citations          []LineRef     `json:"citations,omitempty"`
+	Anchors            []AnchorRef   `json:"anchors,omitempty"`
+	ArtifactRefs       []ArtifactRef `json:"artifact_refs,omitempty"`
+	ExpectedFixSurface []FixSurface  `json:"expected_fix_surface,omitempty"`
 }
 
 type LineRef struct {
@@ -165,6 +168,16 @@ type FixSurface struct {
 	Path      string `json:"path"`
 	StartLine int    `json:"start_line,omitempty"`
 	EndLine   int    `json:"end_line,omitempty"`
+}
+
+type ArtifactRef struct {
+	ArtifactID  string `json:"artifact_id"`
+	Section     string `json:"section,omitempty"`
+	StoryID     string `json:"story_id,omitempty"`
+	MergeUnitID string `json:"merge_unit_id,omitempty"`
+	StartLine   int    `json:"start_line,omitempty"`
+	EndLine     int    `json:"end_line,omitempty"`
+	Quote       string `json:"quote,omitempty"`
 }
 
 type ContextRequest struct {
@@ -253,6 +266,7 @@ type PacketRef struct {
 	StableDigest          string          `json:"stable_digest"`
 	SemanticDedupeDigest  string          `json:"semantic_dedupe_digest"`
 	Policy                *PolicyRef      `json:"policy,omitempty"`
+	Artifact              *PacketArtifact `json:"artifact,omitempty"`
 	CoverageManifest      state.ObjectRef `json:"coverage_manifest"`
 	TargetState           SnapshotRef     `json:"target_state"`
 	SourceCompleteness    string          `json:"source_completeness"`
@@ -271,22 +285,33 @@ type SnapshotRef struct {
 	Tree   string `json:"tree,omitempty"`
 }
 
+type PacketArtifact struct {
+	ID            string          `json:"id"`
+	Kind          string          `json:"kind"`
+	Title         string          `json:"title"`
+	Revises       string          `json:"revises,omitempty"`
+	Content       state.ObjectRef `json:"content"`
+	ContentDigest string          `json:"content_digest"`
+	Artifact      state.ObjectRef `json:"artifact"`
+}
+
 type FindingRecord struct {
-	ID                 string       `json:"id"`
-	SourceID           string       `json:"source_id,omitempty"`
-	DedupeDigest       string       `json:"dedupe_digest"`
-	State              string       `json:"state"`
-	Severity           string       `json:"severity"`
-	Class              string       `json:"class"`
-	Claim              string       `json:"claim"`
-	FailureScenario    string       `json:"failure_scenario"`
-	Citations          []LineRef    `json:"citations"`
-	Anchors            []AnchorRef  `json:"anchors"`
-	ExpectedFixSurface []FixSurface `json:"expected_fix_surface"`
-	Accepted           bool         `json:"accepted"`
-	Blocking           bool         `json:"blocking"`
-	DuplicateOf        string       `json:"duplicate_of,omitempty"`
-	RejectionReason    string       `json:"rejection_reason,omitempty"`
+	ID                 string        `json:"id"`
+	SourceID           string        `json:"source_id,omitempty"`
+	DedupeDigest       string        `json:"dedupe_digest"`
+	State              string        `json:"state"`
+	Severity           string        `json:"severity"`
+	Class              string        `json:"class"`
+	Claim              string        `json:"claim"`
+	FailureScenario    string        `json:"failure_scenario"`
+	Citations          []LineRef     `json:"citations"`
+	Anchors            []AnchorRef   `json:"anchors"`
+	ArtifactRefs       []ArtifactRef `json:"artifact_refs,omitempty"`
+	ExpectedFixSurface []FixSurface  `json:"expected_fix_surface"`
+	Accepted           bool          `json:"accepted"`
+	Blocking           bool          `json:"blocking"`
+	DuplicateOf        string        `json:"duplicate_of,omitempty"`
+	RejectionReason    string        `json:"rejection_reason,omitempty"`
 }
 
 type VerifierOutcome struct {
@@ -341,6 +366,7 @@ type packetRecord struct {
 	Route             string          `json:"route"`
 	Repo              string          `json:"repo"`
 	Policy            *PolicyRef      `json:"policy,omitempty"`
+	Artifact          *PacketArtifact `json:"artifact,omitempty"`
 	CoverageManifest  state.ObjectRef `json:"coverage_manifest"`
 	TargetState       SnapshotRef     `json:"target_state"`
 	StableDigest      string          `json:"stable_digest"`
@@ -390,7 +416,7 @@ func Import(opts ImportOptions) (ImportResult, error) {
 	if err := decodeStrict(raw, &input); err != nil {
 		return ImportResult{}, fmt.Errorf("malformed worker result: %w", err)
 	}
-	existingDigests, existingIDs, err := existingFindingIdentity(store, events, binding.Repo, packetRef.CoverageManifest.Digest)
+	existingDigests, existingIDs, err := existingFindingIdentity(store, events, binding.Repo, packetRef)
 	if err != nil {
 		return ImportResult{}, err
 	}
@@ -411,18 +437,31 @@ func Import(opts ImportOptions) (ImportResult, error) {
 		"result":                            resultRef.Digest,
 		"raw_result":                        rawRef.Digest,
 		"packet":                            packetRef.Digest,
-		"coverage_manifest":                 packetRef.CoverageManifest.Digest,
-		"target_state":                      packetRef.TargetState.Digest,
 		"run_kind":                          record.RunKind,
 		"route":                             record.Route,
 		"outcome":                           record.Outcome,
+		"clean":                             strconv.FormatBool(record.Outcome == OutcomeClean),
 		"findings":                          strconv.Itoa(len(record.Findings)),
 		"accepted_findings":                 strconv.Itoa(countAcceptedFindings(record.Findings)),
 		"duplicate_findings":                strconv.Itoa(countFindingState(record.Findings, StateDuplicate)),
 		"rejected_structural":               strconv.Itoa(countFindingState(record.Findings, StateRejectedStructural)),
 		"needs_context":                     strconv.FormatBool(len(record.NeedsContext) > 0),
+		"needs_context_count":               strconv.Itoa(len(record.NeedsContext)),
 		"primary_review_evidence":           strconv.FormatBool(record.Evidence.PrimaryReviewEvidence),
 		"deterministic_refutation_evidence": strconv.FormatBool(record.Evidence.DeterministicRefutationEvidence),
+	}
+	if packetRef.CoverageManifest.Digest != "" {
+		details["coverage_manifest"] = packetRef.CoverageManifest.Digest
+	}
+	if packetRef.TargetState.Digest != "" {
+		details["target_state"] = packetRef.TargetState.Digest
+	}
+	artifactID := ""
+	if packetRef.Artifact != nil {
+		artifactID = packetRef.Artifact.ID
+		details["artifact_id"] = packetRef.Artifact.ID
+		details["artifact"] = packetRef.Artifact.Artifact.Digest
+		details["artifact_content"] = packetRef.Artifact.Content.Digest
 	}
 	if record.Evidence.IndependentFinalReviewEvidence {
 		details["independent_final_review_evidence"] = "true"
@@ -441,6 +480,7 @@ func Import(opts ImportOptions) (ImportResult, error) {
 		State:                           binding.State,
 		Repo:                            binding.Repo,
 		PacketID:                        packetRef.Digest,
+		ArtifactID:                      artifactID,
 		Outcome:                         record.Outcome,
 		RawResult:                       rawRef,
 		Result:                          resultRef,
@@ -459,6 +499,10 @@ func Import(opts ImportOptions) (ImportResult, error) {
 }
 
 func Observations(store state.Store, events []state.Event, repo string) ([]EvidenceObservation, error) {
+	return observations(store, events, repo, false)
+}
+
+func observations(store state.Store, events []state.Event, repo string, includeArtifact bool) ([]EvidenceObservation, error) {
 	observations := []EvidenceObservation{}
 	for i := len(events) - 1; i >= 0; i-- {
 		event := events[i]
@@ -485,6 +529,9 @@ func Observations(store state.Store, events []state.Event, repo string) ([]Evide
 		}
 		if err := validateRecord(record, repo, event.Details["packet"]); err != nil {
 			return nil, err
+		}
+		if !includeArtifact && record.Route == RouteArtifactReview {
+			continue
 		}
 		observations = append(observations, EvidenceObservation{Record: record, Digest: digest, EventID: event.EventID})
 	}
@@ -673,6 +720,16 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 	if !validRoute(route) {
 		return ResultRecord{}, fmt.Errorf("invalid route: %s", input.Route)
 	}
+	if route == RouteArtifactReview {
+		if packet.Kind != "artifact" || packet.Route != RouteArtifactReview || packet.Artifact == nil || strings.TrimSpace(packet.Artifact.ID) == "" {
+			return ResultRecord{}, errors.New("artifact_review result requires an artifact packet")
+		}
+		if runKind != RunKindDiscovery || packet.RunKind != RunKindDiscovery {
+			return ResultRecord{}, errors.New("artifact_review result requires discovery run_kind")
+		}
+	} else if packet.Kind == "artifact" || packet.Route == RouteArtifactReview {
+		return ResultRecord{}, errors.New("artifact packets only accept artifact_review results")
+	}
 	if runKind == RunKindDiscovery && (packet.RunKind != runKind || packet.Route != route) {
 		return ResultRecord{}, fmt.Errorf("discovery result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
 	}
@@ -750,7 +807,7 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 	seenDigests := map[string]struct{}{}
 	seenIDs := map[string]string{}
 	for i, finding := range input.Findings {
-		normalized := normalizeFinding(finding, i)
+		normalized := normalizeFinding(finding, i, packet)
 		if normalized.Accepted {
 			if priorDigest, exists := existingIDs[normalized.ID]; exists && priorDigest != normalized.DedupeDigest {
 				normalized.Accepted = false
@@ -822,7 +879,10 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 	}, nil
 }
 
-func normalizeFinding(input FindingInput, index int) FindingRecord {
+func normalizeFinding(input FindingInput, index int, packet PacketRef) FindingRecord {
+	if packet.Route == RouteArtifactReview {
+		return normalizeArtifactFinding(input, index, packet)
+	}
 	sourceID := strings.TrimSpace(input.ID)
 	stateValue := strings.TrimSpace(input.State)
 	if stateValue == "" {
@@ -853,6 +913,9 @@ func normalizeFinding(input FindingInput, index int) FindingRecord {
 	if len(failureScenario) == 0 || len([]byte(failureScenario)) > maxFailureScenarioBytes {
 		reasons = append(reasons, "failure_scenario is required and must be concise")
 	}
+	if len(input.ArtifactRefs) > 0 {
+		reasons = append(reasons, "artifact_refs are not allowed for code review routes")
+	}
 	citations, citationErrs := normalizeLineRefs(input.Citations, true)
 	reasons = append(reasons, citationErrs...)
 	anchors, anchorErrs := normalizeAnchors(input.Anchors, true)
@@ -878,6 +941,80 @@ func normalizeFinding(input FindingInput, index int) FindingRecord {
 		ExpectedFixSurface: fixSurface,
 		Accepted:           true,
 		Blocking:           blocksClosure(stateValue),
+	}
+	if len(reasons) > 0 {
+		record.ID = fallbackFindingID(record.ID, dedupe, index)
+		record.State = StateRejectedStructural
+		record.Accepted = false
+		record.Blocking = false
+		record.RejectionReason = strings.Join(reasons, "; ")
+	}
+	return record
+}
+
+func normalizeArtifactFinding(input FindingInput, index int, packet PacketRef) FindingRecord {
+	sourceID := strings.TrimSpace(input.ID)
+	stateValue := strings.TrimSpace(input.State)
+	if stateValue == "" {
+		stateValue = StateOpen
+	}
+	severity := strings.ToLower(strings.TrimSpace(input.Severity))
+	class := strings.ToLower(strings.TrimSpace(input.Class))
+	claim := strings.TrimSpace(input.Claim)
+	failureScenario := strings.TrimSpace(input.FailureScenario)
+	reasons := []string{}
+	if sourceID != "" && !idPattern.MatchString(sourceID) {
+		reasons = append(reasons, "invalid finding id")
+	}
+	if !validLifecycleState(stateValue) {
+		reasons = append(reasons, "invalid lifecycle state")
+	} else if !blocksClosure(stateValue) {
+		stateValue = StateNeedsConfirmation
+	}
+	if !validSeverity(severity) {
+		reasons = append(reasons, "invalid severity")
+	}
+	if !validFindingClass(class) {
+		reasons = append(reasons, "invalid class")
+	}
+	if len(claim) == 0 || len([]byte(claim)) > maxClaimBytes {
+		reasons = append(reasons, "claim is required and must be concise")
+	}
+	if len(failureScenario) == 0 || len([]byte(failureScenario)) > maxFailureScenarioBytes {
+		reasons = append(reasons, "failure_scenario is required and must be concise")
+	}
+	if len(input.Citations) > 0 {
+		reasons = append(reasons, "citations are not allowed for artifact_review findings")
+	}
+	if len(input.Anchors) > 0 {
+		reasons = append(reasons, "anchors are not allowed for artifact_review findings")
+	}
+	if len(input.ExpectedFixSurface) > 0 {
+		reasons = append(reasons, "expected_fix_surface is not allowed for artifact_review findings")
+	}
+	artifactID := ""
+	if packet.Artifact != nil {
+		artifactID = packet.Artifact.ID
+	}
+	artifactRefs, artifactRefErrs := normalizeArtifactRefs(input.ArtifactRefs, true, artifactID)
+	reasons = append(reasons, artifactRefErrs...)
+	dedupe := artifactFindingDedupeDigest(severity, class, claim, failureScenario, artifactRefs)
+	id := sourceID
+	if id == "" {
+		id = "finding_" + strings.TrimPrefix(dedupe, "sha256:")[:16]
+	}
+	record := FindingRecord{
+		ID:              id,
+		SourceID:        sourceID,
+		DedupeDigest:    dedupe,
+		State:           stateValue,
+		Severity:        severity,
+		Class:           class,
+		Claim:           claim,
+		FailureScenario: failureScenario,
+		ArtifactRefs:    artifactRefs,
+		Accepted:        true,
+		Blocking:        blocksClosure(stateValue),
 	}
 	if len(reasons) > 0 {
 		record.ID = fallbackFindingID(record.ID, dedupe, index)
@@ -1015,6 +1152,96 @@ func normalizeFixSurface(input []FixSurface) ([]FixSurface, []string) {
 		return out[i].Path < out[j].Path
 	})
 	return out, reasons
+}
+
+func normalizeArtifactRefs(input []ArtifactRef, required bool, packetArtifactID string) ([]ArtifactRef, []string) {
+	reasons := []string{}
+	if required && len(input) == 0 {
+		return []ArtifactRef{}, []string{"at least one artifact_ref is required"}
+	}
+	if len(input) > maxRefsPerFinding {
+		reasons = append(reasons, fmt.Sprintf("too many artifact_refs: %d > %d", len(input), maxRefsPerFinding))
+	}
+	out := make([]ArtifactRef, 0, min(len(input), maxRefsPerFinding))
+	for i, ref := range input {
+		if i >= maxRefsPerFinding {
+			break
+		}
+		artifactID := strings.TrimSpace(ref.ArtifactID)
+		if artifactID == "" {
+			reasons = append(reasons, "artifact_ref artifact_id is required")
+			continue
+		}
+		if artifactID != packetArtifactID {
+			reasons = append(reasons, "artifact_ref artifact_id does not match packet artifact")
+			continue
+		}
+		section, err := normalizeBoundedString(ref.Section, 200, "artifact_ref section", false)
+		if err != nil {
+			reasons = append(reasons, err.Error())
+			continue
+		}
+		storyID := strings.TrimSpace(ref.StoryID)
+		if storyID != "" && !idPattern.MatchString(storyID) {
+			reasons = append(reasons, "invalid artifact_ref story_id")
+			continue
+		}
+		mergeUnitID := strings.TrimSpace(ref.MergeUnitID)
+		if mergeUnitID != "" && !idPattern.MatchString(mergeUnitID) {
+			reasons = append(reasons, "invalid artifact_ref merge_unit_id")
+			continue
+		}
+		if ref.StartLine < 0 || ref.EndLine < 0 || (ref.EndLine > 0 && ref.StartLine > ref.EndLine) || (ref.EndLine > 0 && ref.StartLine == 0) {
+			reasons = append(reasons, "invalid artifact_ref line range")
+			continue
+		}
+		quote, err := normalizeBoundedString(ref.Quote, maxSummaryBytes, "artifact_ref quote", false)
+		if err != nil {
+			reasons = append(reasons, err.Error())
+			continue
+		}
+		out = append(out, ArtifactRef{
+			ArtifactID:  artifactID,
+			Section:     section,
+			StoryID:     storyID,
+			MergeUnitID: mergeUnitID,
+			StartLine:   ref.StartLine,
+			EndLine:     ref.EndLine,
+			Quote:       quote,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ArtifactID != out[j].ArtifactID {
+			return out[i].ArtifactID < out[j].ArtifactID
+		}
+		if out[i].Section != out[j].Section {
+			return out[i].Section < out[j].Section
+		}
+		if out[i].StoryID != out[j].StoryID {
+			return out[i].StoryID < out[j].StoryID
+		}
+		if out[i].MergeUnitID != out[j].MergeUnitID {
+			return out[i].MergeUnitID < out[j].MergeUnitID
+		}
+		if out[i].StartLine != out[j].StartLine {
+			return out[i].StartLine < out[j].StartLine
+		}
+		if out[i].EndLine != out[j].EndLine {
+			return out[i].EndLine < out[j].EndLine
+		}
+		return out[i].Quote < out[j].Quote
+	})
+	deduped := out[:0]
+	seen := map[string]struct{}{}
+	for _, ref := range out {
+		key := digestJSON(ref)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		deduped = append(deduped, ref)
+	}
+	return deduped, reasons
 }
 
 func normalizeContextRequests(input []ContextRequest) ([]ContextRequest, error) {
@@ -1356,6 +1583,27 @@ func resolvePacket(store state.Store, events []state.Event, stateDir, repo, pack
 		if record.Repo != repo {
 			return PacketRef{}, errors.New("packet repo mismatch")
 		}
+		if record.Kind == "artifact" || record.Route == RouteArtifactReview {
+			if record.Kind != "artifact" || record.RunKind != RunKindDiscovery || record.Route != RouteArtifactReview {
+				return PacketRef{}, errors.New("artifact packet route is malformed")
+			}
+			if record.Artifact == nil || strings.TrimSpace(record.Artifact.ID) == "" || strings.TrimSpace(record.Artifact.Artifact.Digest) == "" || strings.TrimSpace(record.Artifact.Content.Digest) == "" {
+				return PacketRef{}, errors.New("artifact packet missing artifact reference")
+			}
+			artifact := *record.Artifact
+			return PacketRef{
+				Digest:               digest,
+				EventID:              event.EventID,
+				Kind:                 record.Kind,
+				RunKind:              record.RunKind,
+				Route:                record.Route,
+				PromptDigest:         record.PromptDigest,
+				StableDigest:         record.StableDigest,
+				SemanticDedupeDigest: record.SemanticDedupeKey.Digest,
+				Artifact:             &artifact,
+				SourceCompleteness:   record.SourceCompleteness,
+			}, nil
+		}
 		if record.CoverageManifest.Digest == "" || record.TargetState.Digest == "" {
 			return PacketRef{}, errors.New("packet missing coverage_manifest or target_state")
 		}
@@ -1419,15 +1667,15 @@ func readBoundedRegularFile(path string) ([]byte, error) {
 	return body, nil
 }
 
-func existingFindingIdentity(store state.Store, events []state.Event, repo, manifestDigest string) (map[string]struct{}, map[string]string, error) {
-	observations, err := Observations(store, events, repo)
+func existingFindingIdentity(store state.Store, events []state.Event, repo string, packet PacketRef) (map[string]struct{}, map[string]string, error) {
+	observations, err := observations(store, events, repo, true)
 	if err != nil {
 		return nil, nil, err
 	}
 	digests := map[string]struct{}{}
 	ids := map[string]string{}
 	for _, observation := range observations {
-		if observation.Record.Packet.CoverageManifest.Digest != manifestDigest {
+		if !findingIdentityScopeMatches(observation.Record, packet) {
 			continue
 		}
 		for _, finding := range observation.Record.Findings {
@@ -1440,6 +1688,16 @@ func existingFindingIdentity(store state.Store, events []state.Event, repo, mani
 	return digests, ids, nil
 }
 
+func findingIdentityScopeMatches(record ResultRecord, packet PacketRef) bool {
+	if packet.Route == RouteArtifactReview {
+		return record.Route == RouteArtifactReview &&
+			record.Packet.Artifact != nil &&
+			packet.Artifact != nil &&
+			record.Packet.Artifact.ID == packet.Artifact.ID
+	}
+	return record.Route != RouteArtifactReview && record.Packet.CoverageManifest.Digest == packet.CoverageManifest.Digest
+}
+
 func validateRecord(record ResultRecord, repo, packetDigest string) error {
 	if record.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("unsupported result schema_version: %d", record.SchemaVersion)
@@ -1450,11 +1708,30 @@ func validateRecord(record ResultRecord, repo, packetDigest string) error {
 	if packetDigest != "" && record.Packet.Digest != packetDigest {
 		return errors.New("result packet mismatch")
 	}
+	if !validRunKind(record.RunKind) || !validRoute(record.Route) || !validOutcome(record.Outcome) {
+		return errors.New("result run_kind, route, or outcome is invalid")
+	}
+	if record.Route == RouteArtifactReview {
+		if record.RunKind != RunKindDiscovery || record.Packet.Kind != "artifact" || record.Packet.Route != RouteArtifactReview {
+			return errors.New("artifact result packet reference is invalid")
+		}
+		if record.Packet.Artifact == nil || strings.TrimSpace(record.Packet.Artifact.ID) == "" {
+			return errors.New("artifact result packet reference is incomplete")
+		}
+		for _, finding := range record.Findings {
+			if len(finding.Citations) > 0 || len(finding.Anchors) > 0 || len(finding.ExpectedFixSurface) > 0 {
+				return errors.New("artifact result contains code-review finding references")
+			}
+		}
+		return nil
+	}
 	if record.Packet.CoverageManifest.Digest == "" || record.Packet.TargetState.Digest == "" {
 		return errors.New("result packet reference is incomplete")
 	}
-	if !validRunKind(record.RunKind) || !validRoute(record.Route) || !validOutcome(record.Outcome) {
-		return errors.New("result run_kind, route, or outcome is invalid")
+	for _, finding := range record.Findings {
+		if len(finding.ArtifactRefs) > 0 {
+			return errors.New("code-review result contains artifact_refs")
+		}
 	}
 	return nil
 }
@@ -1544,7 +1821,7 @@ func validRunKind(value string) bool {
 
 func validRoute(value string) bool {
 	switch value {
-	case RoutePrimaryReview, RouteIndependentFinal, RouteTargetedVerification, RouteCompactFreshVerify:
+	case RoutePrimaryReview, RouteIndependentFinal, RouteTargetedVerification, RouteCompactFreshVerify, RouteArtifactReview:
 		return true
 	default:
 		return false
@@ -1748,6 +2025,16 @@ func findingDedupeDigest(severity, class, claim, failureScenario string, citatio
 		"failure_scenario": failureScenario,
 		"citations":        citations,
 		"anchors":          anchors,
+	})
+}
+
+func artifactFindingDedupeDigest(severity, class, claim, failureScenario string, refs []ArtifactRef) string {
+	return digestJSON(map[string]any{
+		"severity":         severity,
+		"class":            class,
+		"claim":            claim,
+		"failure_scenario": failureScenario,
+		"artifact_refs":    refs,
 	})
 }
 
