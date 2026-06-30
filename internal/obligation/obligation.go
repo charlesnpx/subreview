@@ -70,6 +70,7 @@ type StatusResult struct {
 	UnsatisfiedSatisfactionKinds []string           `json:"unsatisfied_satisfaction_kinds"`
 	Blockers                     []Blocker          `json:"blockers"`
 	Obligations                  []ObligationStatus `json:"obligations"`
+	NextActions                  []NextAction       `json:"next_actions,omitempty"`
 }
 
 type CoverageManifest struct {
@@ -135,6 +136,12 @@ type Blocker struct {
 	Status       string `json:"status,omitempty"`
 	Transition   string `json:"transition,omitempty"`
 	Path         string `json:"path,omitempty"`
+}
+
+type NextAction struct {
+	Code    string   `json:"code"`
+	Message string   `json:"message"`
+	Command []string `json:"command,omitempty"`
 }
 
 type ObligationStatus struct {
@@ -337,17 +344,22 @@ func Status(opts StatusOptions) (StatusResult, error) {
 	if err != nil {
 		return StatusResult{}, err
 	}
-	primaryReviewEvidence, hasPrimaryReviewEvidence := reviewresult.LatestPrimaryReviewForManifest(resultEvidence, manifestRef.Digest)
-	proposalDigest := proposalTargetDigest(manifest)
-	activePolicyDigest := policyDigest(manifest.Policy)
-	var carriedProposalReview reviewresult.EvidenceObservation
-	var hasCarriedProposalReview bool
-	if proposalDigest != "" {
-		carriedProposalReview, hasCarriedProposalReview = reviewresult.LatestPrimaryReviewForTargetState(resultEvidence, proposalDigest, activePolicyDigest)
+	transitionKeys := transitionKeysByTransition(manifest)
+	transitionKeySet := map[string]struct{}{}
+	for _, key := range transitionKeys {
+		transitionKeySet[key] = struct{}{}
 	}
+	activePolicyDigest := policyDigest(manifest.Policy)
+	primaryReviewEvidence := map[string]reviewresult.EvidenceObservation{}
+	for transition, key := range transitionKeys {
+		if evidence, ok := reviewresult.LatestPrimaryReviewForTransition(resultEvidence, key, activePolicyDigest); ok {
+			primaryReviewEvidence[transition] = evidence
+		}
+	}
+	finalPrimaryEvidence, hasFinalPrimaryEvidence := primaryReviewEvidence["base->final"]
 	independentFinalEvidence, hasIndependentFinalEvidence := reviewresult.LatestIndependentFinalReviewForManifest(resultEvidence, manifestRef.Digest)
-	blockers = append(blockers, contextBlockers(resultEvidence, manifestRef.Digest, proposalDigest, activePolicyDigest)...)
-	for _, finding := range reviewresult.ClosureFindingBlockers(resultEvidence, manifestRef.Digest, proposalDigest, activePolicyDigest) {
+	blockers = append(blockers, contextBlockers(resultEvidence, transitionKeys, activePolicyDigest)...)
+	for _, finding := range reviewresult.ClosureFindingBlockersForTransitions(resultEvidence, transitionKeySet, activePolicyDigest) {
 		blockers = append(blockers, Blocker{
 			Code:    "open_finding",
 			Message: "blocking finding remains " + finding.State + ": " + finding.Claim,
@@ -405,13 +417,15 @@ func Status(opts StatusOptions) (StatusResult, error) {
 			}
 		}
 		if isCoverageObligation(obligation) && obligation.Required {
-			if hasPrimaryReviewEvidence {
-				markStatusSatisfied(&status, SatisfactionPrimaryReviewEvidence, primaryReviewEvidence.EventID, primaryReviewEvidence.Digest)
-			} else if obligation.Transition == "base->proposal" && hasCarriedProposalReview {
-				markStatusSatisfied(&status, SatisfactionCarriedForward, carriedProposalReview.EventID, carriedProposalReview.Digest)
-			} else if verification, ok := verificationCoversObligation(resultEvidence, manifestRef.Digest, proposalDigest, activePolicyDigest, obligation); ok {
+			if evidence, ok := primaryReviewEvidence[obligation.Transition]; ok {
+				kind := SatisfactionPrimaryReviewEvidence
+				if evidence.Record.Packet.CoverageManifest.Digest != manifestRef.Digest {
+					kind = SatisfactionCarriedForward
+				}
+				markStatusSatisfied(&status, kind, evidence.EventID, evidence.Digest)
+			} else if verification, ok := verificationCoversObligation(resultEvidence, transitionKeys[obligation.Transition], activePolicyDigest, obligation); ok {
 				markStatusSatisfied(&status, SatisfactionVerificationEvidence, verification.EventID, verification.Digest)
-			} else if refutations := reviewresult.DeterministicRefutationsForObligation(resultEvidence, manifestRef.Digest, obligation.ID); len(refutations) > 0 {
+			} else if refutations := reviewresult.DeterministicRefutationsForObligationTransition(resultEvidence, transitionKeys[obligation.Transition], activePolicyDigest, obligation.ID); len(refutations) > 0 {
 				markStatusSatisfied(&status, SatisfactionDeterministicRefute, refutations[0].EventID, refutations[0].Digest)
 			} else {
 				status.Blockers = append(status.Blockers, Blocker{
@@ -424,7 +438,9 @@ func Status(opts StatusOptions) (StatusResult, error) {
 			}
 		}
 		if obligation.Kind == KindPolicyFinalReview && obligation.Required {
-			if hasIndependentFinalEvidence {
+			if hasFinalPrimaryEvidence {
+				markStatusSatisfied(&status, SatisfactionPrimaryReviewEvidence, finalPrimaryEvidence.EventID, finalPrimaryEvidence.Digest)
+			} else if hasIndependentFinalEvidence {
 				markStatusSatisfied(&status, SatisfactionPrimaryReviewEvidence, independentFinalEvidence.EventID, independentFinalEvidence.Digest)
 			} else {
 				status.Blockers = append(status.Blockers, Blocker{
@@ -445,6 +461,7 @@ func Status(opts StatusOptions) (StatusResult, error) {
 	}
 	sortBlockers(blockers)
 	kinds := sortedKeys(unsatisfiedKinds)
+	nextActions := statusNextActions(binding.State, manifest, blockers, statuses)
 	return StatusResult{
 		SchemaVersion:                SchemaVersion,
 		State:                        binding.State,
@@ -456,6 +473,7 @@ func Status(opts StatusOptions) (StatusResult, error) {
 		UnsatisfiedSatisfactionKinds: kinds,
 		Blockers:                     blockers,
 		Obligations:                  statuses,
+		NextActions:                  nextActions,
 	}, nil
 }
 
@@ -511,6 +529,32 @@ func proposalTargetDigest(manifest CoverageManifest) string {
 	return ""
 }
 
+func transitionKeysByTransition(manifest CoverageManifest) map[string]string {
+	keys := map[string]string{}
+	for _, diff := range manifest.SourceDiffs {
+		key := transitionKeyForDiff(diff)
+		if key == "" {
+			continue
+		}
+		keys[diff.Transition] = key
+	}
+	return keys
+}
+
+func transitionKeyForDiff(diff TransitionDiff) string {
+	parts := []string{
+		strings.TrimSpace(diff.FromKind) + "->" + strings.TrimSpace(diff.ToKind),
+		strings.TrimSpace(diff.FromSnapshot),
+		strings.TrimSpace(diff.ToSnapshot),
+	}
+	for _, part := range parts {
+		if part == "" || strings.Contains(part, "|") {
+			return ""
+		}
+	}
+	return strings.Join(parts, "|")
+}
+
 func policyDigest(policy *PolicyRef) string {
 	if policy == nil {
 		return ""
@@ -541,10 +585,10 @@ func markStatusSatisfied(status *ObligationStatus, kind, eventID, digest string)
 	status.UnsatisfiedSatisfactionKinds = []string{}
 }
 
-func verificationCoversObligation(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string, obligation Obligation) (reviewresult.EvidenceObservation, bool) {
+func verificationCoversObligation(observations []reviewresult.EvidenceObservation, transitionKey, policyDigest string, obligation Obligation) (reviewresult.EvidenceObservation, bool) {
 	for _, observation := range observations {
 		record := observation.Record
-		if record.Packet.CoverageManifest.Digest != manifestDigest || record.RunKind != reviewresult.RunKindVerification {
+		if record.RunKind != reviewresult.RunKindVerification || !resultPacketPolicyMatches(record.Packet.Policy, policyDigest) {
 			continue
 		}
 		if !hasPositiveFixVerification(record) {
@@ -557,7 +601,10 @@ func verificationCoversObligation(observations []reviewresult.EvidenceObservatio
 		if findingID == "" {
 			continue
 		}
-		finding, ok := acceptedFindingForVerification(observations, manifestDigest, proposalDigest, policyDigest, findingID)
+		if verificationTargetTransition(record.Packet, findingID) != transitionKey {
+			continue
+		}
+		finding, ok := acceptedFindingForVerification(observations, transitionKey, policyDigest, findingID)
 		if !ok || !findingCoversObligation(finding, obligation) {
 			continue
 		}
@@ -590,14 +637,14 @@ func firstVerifiedFindingID(record reviewresult.ResultRecord) string {
 	return ""
 }
 
-func acceptedFindingForVerification(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest, findingID string) (reviewresult.FindingRecord, bool) {
+func acceptedFindingForVerification(observations []reviewresult.EvidenceObservation, transitionKey, policyDigest, findingID string) (reviewresult.FindingRecord, bool) {
 	for _, observation := range observations {
 		record := observation.Record
-		if record.Packet.CoverageManifest.Digest != manifestDigest && !carriedProposalRecordApplies(record, proposalDigest, policyDigest) {
+		if !carriedProposalRecordApplies(record, transitionKey, policyDigest) {
 			continue
 		}
 		for _, finding := range record.Findings {
-			if finding.ID == findingID && finding.Accepted {
+			if finding.ID == findingID && finding.Accepted && finding.OriginTransitionKey == transitionKey {
 				return finding, true
 			}
 		}
@@ -605,12 +652,20 @@ func acceptedFindingForVerification(observations []reviewresult.EvidenceObservat
 	return reviewresult.FindingRecord{}, false
 }
 
-func carriedProposalRecordApplies(record reviewresult.ResultRecord, proposalDigest, policyDigest string) bool {
+func carriedProposalRecordApplies(record reviewresult.ResultRecord, transitionKey, policyDigest string) bool {
 	return record.Evidence.PrimaryReviewEvidence &&
-		proposalDigest != "" &&
-		record.Packet.TargetState.Kind == "proposal" &&
-		record.Packet.TargetState.Digest == proposalDigest &&
+		transitionKey != "" &&
+		record.Packet.TransitionKey == transitionKey &&
 		resultPacketPolicyMatches(record.Packet.Policy, policyDigest)
+}
+
+func verificationTargetTransition(packet reviewresult.PacketRef, findingID string) string {
+	for _, target := range packet.VerificationTargets {
+		if target.FindingID == findingID {
+			return target.TransitionKey
+		}
+	}
+	return ""
 }
 
 func resultPacketPolicyMatches(policy *reviewresult.PolicyRef, policyDigest string) bool {
@@ -1373,21 +1428,24 @@ func transitionKey(fromKind, toKind, fromSnapshot, toSnapshot string) string {
 	return fromKind + "\x00" + toKind + "\x00" + fromSnapshot + "\x00" + toSnapshot
 }
 
-func contextBlockers(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string) []Blocker {
-	for _, observation := range observations {
-		record := observation.Record
-		if record.Packet.CoverageManifest.Digest != manifestDigest || record.RunKind != reviewresult.RunKindDiscovery {
+func contextBlockers(observations []reviewresult.EvidenceObservation, transitionKeys map[string]string, policyDigest string) []Blocker {
+	blockers := []Blocker{}
+	transitions := make([]string, 0, len(transitionKeys))
+	for transition := range transitionKeys {
+		transitions = append(transitions, transition)
+	}
+	sort.Strings(transitions)
+	for _, transition := range transitions {
+		observation, ok := reviewresult.LatestDiscoveryForTransition(observations, transitionKeys[transition], policyDigest)
+		if !ok {
 			continue
 		}
-		return contextBlockerForRecord(record)
-	}
-	if proposalDigest != "" {
-		observation, ok := reviewresult.LatestDiscoveryForTargetState(observations, proposalDigest, policyDigest)
-		if ok {
-			return contextBlockerForRecord(observation.Record)
+		for _, blocker := range contextBlockerForRecord(observation.Record) {
+			blocker.Transition = transition
+			blockers = append(blockers, blocker)
 		}
 	}
-	return nil
+	return blockers
 }
 
 func contextBlockerForRecord(record reviewresult.ResultRecord) []Blocker {
@@ -1398,6 +1456,99 @@ func contextBlockerForRecord(record reviewresult.ResultRecord) []Blocker {
 		Code:    "needs_context",
 		Message: "latest discovery review requested context and must be resolved before closure",
 	}}
+}
+
+func statusNextActions(stateDir string, manifest CoverageManifest, blockers []Blocker, statuses []ObligationStatus) []NextAction {
+	seen := map[string]struct{}{}
+	actions := []NextAction{}
+	add := func(action NextAction) {
+		if action.Code == "" {
+			return
+		}
+		key := action.Code + "\x00" + action.Message + "\x00" + strings.Join(action.Command, "\x00")
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		actions = append(actions, action)
+	}
+	hasFinal := manifestHasTransition(manifest, "base", "final")
+	for _, blocker := range blockers {
+		switch blocker.Code {
+		case "stale_coverage_manifest":
+			add(NextAction{
+				Code:    "rebuild_coverage_manifest",
+				Message: "Rebuild obligations after snapshot, diff, or policy changes.",
+				Command: []string{"subreview", "obligations", "build", "--state", stateDir},
+			})
+		case "unsatisfied_required_check", "stale_gate_evidence", "gate_failed_blocks_review", "gate_error_blocks_review":
+			add(NextAction{
+				Code:    "record_final_gate_evidence",
+				Message: "Record fresh required gate evidence for the final snapshot before closure.",
+			})
+		case "open_finding":
+			add(NextAction{
+				Code:    "resolve_unresolved_findings",
+				Message: "Resolve or explicitly verify unresolved blocking findings before closure.",
+			})
+		case "needs_context":
+			add(NextAction{
+				Code:    "answer_context_request",
+				Message: "Rebuild the relevant primary packet with the requested context and import the next result.",
+			})
+		case "unsatisfied_policy_final_review":
+			add(NextAction{
+				Code:    "build_final_review_packet",
+				Message: "Build a final-target primary review packet and import its result.",
+				Command: []string{"subreview", "packet", "build", "--state", stateDir, "--kind", "primary"},
+			})
+		}
+	}
+	for _, status := range statuses {
+		if status.Satisfied || !status.Obligation.Required {
+			continue
+		}
+		if !isCoverageObligation(status.Obligation) {
+			continue
+		}
+		switch status.Obligation.Transition {
+		case "base->proposal":
+			if hasFinal {
+				add(NextAction{
+					Code:    "missing_proposal_review",
+					Message: "Import or rebuild matching proposal review evidence; current primary packets target the final transition.",
+				})
+			} else {
+				add(NextAction{
+					Code:    "build_proposal_review_packet",
+					Message: "Build a proposal primary review packet and import its result.",
+					Command: []string{"subreview", "packet", "build", "--state", stateDir, "--kind", "primary"},
+				})
+			}
+		case "base->final":
+			add(NextAction{
+				Code:    "build_final_review_packet",
+				Message: "Build a final primary review packet and import its result.",
+				Command: []string{"subreview", "packet", "build", "--state", stateDir, "--kind", "primary"},
+			})
+		}
+	}
+	sort.Slice(actions, func(i, j int) bool {
+		if actions[i].Code == actions[j].Code {
+			return actions[i].Message < actions[j].Message
+		}
+		return actions[i].Code < actions[j].Code
+	})
+	return actions
+}
+
+func manifestHasTransition(manifest CoverageManifest, fromKind, toKind string) bool {
+	for _, diff := range manifest.SourceDiffs {
+		if diff.FromKind == fromKind && diff.ToKind == toKind {
+			return true
+		}
+	}
+	return false
 }
 
 func stateBindingFromState(stateDir string) (stateBinding, error) {

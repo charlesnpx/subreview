@@ -96,6 +96,7 @@ type BuildResult struct {
 	Policy             *PolicyRef           `json:"policy,omitempty"`
 	Artifact           *ArtifactRef         `json:"artifact,omitempty"`
 	TargetState        SnapshotRef          `json:"target_state"`
+	TransitionKey      string               `json:"transition_key,omitempty"`
 	SourceCompleteness string               `json:"source_completeness"`
 	Verification       *VerificationSummary `json:"verification,omitempty"`
 }
@@ -112,6 +113,7 @@ type PacketRecord struct {
 	TargetState        SnapshotRef         `json:"target_state"`
 	CoverageManifest   state.ObjectRef     `json:"coverage_manifest"`
 	SourceDiffs        []SourceDiff        `json:"source_diffs"`
+	TransitionKey      string              `json:"transition_key"`
 	Context            ContextBundle       `json:"context"`
 	Gates              []GateSummary       `json:"gates"`
 	StablePrefix       string              `json:"stable_prefix"`
@@ -511,7 +513,7 @@ func buildPrimary(opts BuildOptions) (BuildResult, error) {
 	if err := validateManifestFreshness(store, events, binding.State, binding.Repo, manifest, policyBinding); err != nil {
 		return BuildResult{}, err
 	}
-	target, err := primaryTargetSnapshot(store, manifest, events, binding.Repo)
+	selectedDiff, target, transitionKey, err := primaryReviewTransition(store, manifest, events, binding.Repo)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -519,7 +521,7 @@ func buildPrimary(opts BuildOptions) (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, err
 	}
-	sourceDiffs, patchFiles, err := sourceDiffSummaries(store, manifest.SourceDiffs)
+	sourceDiffs, patchFiles, err := sourceDiffSummaries(store, []obligation.TransitionDiff{selectedDiff})
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -594,6 +596,7 @@ func buildPrimary(opts BuildOptions) (BuildResult, error) {
 		TargetState:        target,
 		CoverageManifest:   manifestRef,
 		SourceDiffs:        sourceDiffs,
+		TransitionKey:      transitionKey,
 		Context:            context,
 		Gates:              gates,
 		StablePrefix:       stable,
@@ -630,6 +633,7 @@ func buildPrimary(opts BuildOptions) (BuildResult, error) {
 			"prompt_digest":          promptDigest,
 			"semantic_dedupe_digest": dedupe.Digest,
 			"target_state":           target.Digest,
+			"transition_key":         transitionKey,
 			"source_completeness":    sourceCompleteness,
 		},
 	})
@@ -657,6 +661,7 @@ func buildPrimary(opts BuildOptions) (BuildResult, error) {
 		CoverageManifest:   manifestRef,
 		Policy:             policyRef,
 		TargetState:        target,
+		TransitionKey:      transitionKey,
 		SourceCompleteness: sourceCompleteness,
 	}, nil
 }
@@ -713,11 +718,16 @@ func buildVerification(opts BuildOptions) (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, err
 	}
+	proposalDiff, ok := manifestTransition(manifest, "base", "proposal")
+	if !ok {
+		return BuildResult{}, errors.New("base->proposal diff is required for verification packet")
+	}
+	proposalTransitionKey := transitionKey(proposalDiff.FromKind, proposalDiff.ToKind, proposalDiff.FromSnapshot, proposalDiff.ToSnapshot)
 	findingIDs, err := normalizeVerificationFindingIDs(opts.FindingID, opts.FindingIDs)
 	if err != nil {
 		return BuildResult{}, err
 	}
-	findings, err := latestFindingsForVerification(store, events, binding.Repo, manifestRef.Digest, proposal.Digest, policyDigest, findingIDs)
+	findings, err := latestFindingsForVerification(store, events, binding.Repo, proposalTransitionKey, policyDigest, findingIDs)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -733,6 +743,7 @@ func buildVerification(opts BuildOptions) (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, err
 	}
+	packetTransitionKey := transitionKey(proposalFinal.FromKind, proposalFinal.ToKind, proposalFinal.FromSnapshot, proposalFinal.ToSnapshot)
 	patchFiles, err := patchFilesForDiff(store, proposalFinal)
 	if err != nil {
 		return BuildResult{}, err
@@ -817,6 +828,7 @@ func buildVerification(opts BuildOptions) (BuildResult, error) {
 		TargetState:        final,
 		CoverageManifest:   manifestRef,
 		SourceDiffs:        []SourceDiff{proposalFinal},
+		TransitionKey:      packetTransitionKey,
 		Context:            context,
 		Gates:              gates,
 		StablePrefix:       stable,
@@ -850,6 +862,7 @@ func buildVerification(opts BuildOptions) (BuildResult, error) {
 		"prompt_digest":          promptDigest,
 		"semantic_dedupe_digest": dedupe.Digest,
 		"target_state":           final.Digest,
+		"transition_key":         packetTransitionKey,
 		"proposal_state":         proposal.Digest,
 		"final_state":            final.Digest,
 		"proposal_final_patch":   proposalFinal.Patch.Digest,
@@ -890,6 +903,7 @@ func buildVerification(opts BuildOptions) (BuildResult, error) {
 		CoverageManifest:   manifestRef,
 		Policy:             policyRef,
 		TargetState:        final,
+		TransitionKey:      packetTransitionKey,
 		SourceCompleteness: sourceCompleteness,
 		Verification: &VerificationSummary{
 			FindingID:          singletonFindingID(findingIDs),
@@ -1872,9 +1886,7 @@ func sourceDiffSummaries(store state.Store, diffs []obligation.TransitionDiff) (
 		for _, file := range files {
 			paths = append(paths, file.Path)
 			hunks += len(file.Hunks)
-			if diff.FromKind == "base" && diff.ToKind == "proposal" {
-				allFiles = append(allFiles, file)
-			}
+			allFiles = append(allFiles, file)
 		}
 		sort.Strings(paths)
 		summaries = append(summaries, SourceDiff{
@@ -2166,17 +2178,53 @@ func parseHunk(line string) (patchHunk, bool) {
 	return patchHunk{NewStart: start, NewCount: count, Patch: line}, true
 }
 
-func primaryTargetSnapshot(store state.Store, manifest obligation.CoverageManifest, events []state.Event, repo string) (SnapshotRef, error) {
+func primaryReviewTransition(store state.Store, manifest obligation.CoverageManifest, events []state.Event, repo string) (obligation.TransitionDiff, SnapshotRef, string, error) {
+	if diff, ok := manifestTransition(manifest, "base", "final"); ok {
+		target, err := snapshotForTransitionDiff(store, events, repo, diff)
+		if err != nil {
+			return obligation.TransitionDiff{}, SnapshotRef{}, "", err
+		}
+		return diff, target, transitionKey(diff.FromKind, diff.ToKind, diff.FromSnapshot, diff.ToSnapshot), nil
+	}
+	if diff, ok := manifestTransition(manifest, "base", "proposal"); ok {
+		target, err := snapshotForTransitionDiff(store, events, repo, diff)
+		if err != nil {
+			return obligation.TransitionDiff{}, SnapshotRef{}, "", err
+		}
+		return diff, target, transitionKey(diff.FromKind, diff.ToKind, diff.FromSnapshot, diff.ToSnapshot), nil
+	}
+	return obligation.TransitionDiff{}, SnapshotRef{}, "", errors.New("base->proposal diff is required for primary packet")
+}
+
+func manifestTransition(manifest obligation.CoverageManifest, fromKind, toKind string) (obligation.TransitionDiff, bool) {
 	for _, diff := range manifest.SourceDiffs {
-		if diff.FromKind == "base" && diff.ToKind == "proposal" {
-			binding, err := snapshotBindingFromDigest(store, events, repo, diff.ToKind, diff.ToSnapshot)
-			if err != nil {
-				return SnapshotRef{}, err
-			}
-			return SnapshotRef{Kind: binding.Kind, Digest: binding.Digest, Tree: binding.Tree}, nil
+		if diff.FromKind == fromKind && diff.ToKind == toKind {
+			return diff, true
 		}
 	}
-	return SnapshotRef{}, errors.New("base->proposal diff is required for primary packet")
+	return obligation.TransitionDiff{}, false
+}
+
+func snapshotForTransitionDiff(store state.Store, events []state.Event, repo string, diff obligation.TransitionDiff) (SnapshotRef, error) {
+	binding, err := snapshotBindingFromDigest(store, events, repo, diff.ToKind, diff.ToSnapshot)
+	if err != nil {
+		return SnapshotRef{}, err
+	}
+	return SnapshotRef{Kind: binding.Kind, Digest: binding.Digest, Tree: binding.Tree}, nil
+}
+
+func transitionKey(fromKind, toKind, fromSnapshot, toSnapshot string) string {
+	parts := []string{
+		strings.TrimSpace(fromKind) + "->" + strings.TrimSpace(toKind),
+		strings.TrimSpace(fromSnapshot),
+		strings.TrimSpace(toSnapshot),
+	}
+	for _, part := range parts {
+		if part == "" || strings.Contains(part, "|") {
+			return ""
+		}
+	}
+	return strings.Join(parts, "|")
 }
 
 func snapshotForManifestTransition(store state.Store, events []state.Event, repo string, manifest obligation.CoverageManifest, fromKind, toKind string) (SnapshotRef, error) {
@@ -2218,33 +2266,27 @@ func normalizeVerificationFindingIDs(single string, values []string) ([]string, 
 	return out, nil
 }
 
-func latestFindingsForVerification(store state.Store, events []state.Event, repo, manifestDigest, proposalDigest, policyDigest string, findingIDs []string) ([]reviewresult.FindingRecord, error) {
+func latestFindingsForVerification(store state.Store, events []state.Event, repo, proposalTransitionKey, policyDigest string, findingIDs []string) ([]reviewresult.FindingRecord, error) {
 	observations, err := reviewresult.Observations(store, events, repo)
 	if err != nil {
 		return nil, err
 	}
 	results := make([]reviewresult.FindingRecord, 0, len(findingIDs))
 	for _, findingID := range findingIDs {
-		var carried *reviewresult.FindingRecord
 		for _, observation := range observations {
+			if !carriedFindingRecordApplies(observation.Record, proposalTransitionKey, policyDigest) {
+				continue
+			}
 			for _, finding := range observation.Record.Findings {
 				if finding.ID != findingID || !finding.Accepted {
 					continue
 				}
-				if observation.Record.Packet.CoverageManifest.Digest == manifestDigest {
-					results = append(results, finding)
-					carried = nil
-					goto nextFinding
+				if finding.OriginTransitionKey != proposalTransitionKey {
+					continue
 				}
-				if carried == nil && carriedFindingRecordApplies(observation.Record, proposalDigest, policyDigest) {
-					value := finding
-					carried = &value
-				}
+				results = append(results, finding)
+				goto nextFinding
 			}
-		}
-		if carried != nil {
-			results = append(results, *carried)
-			continue
 		}
 		return nil, fmt.Errorf("accepted finding not found for verification: %s", findingID)
 	nextFinding:
@@ -2253,11 +2295,10 @@ func latestFindingsForVerification(store state.Store, events []state.Event, repo
 	return results, nil
 }
 
-func carriedFindingRecordApplies(record reviewresult.ResultRecord, proposalDigest, policyDigest string) bool {
+func carriedFindingRecordApplies(record reviewresult.ResultRecord, proposalTransitionKey, policyDigest string) bool {
 	return record.Evidence.PrimaryReviewEvidence &&
-		proposalDigest != "" &&
-		record.Packet.TargetState.Kind == "proposal" &&
-		record.Packet.TargetState.Digest == proposalDigest &&
+		proposalTransitionKey != "" &&
+		record.Packet.TransitionKey == proposalTransitionKey &&
 		resultPacketPolicyMatches(record.Packet.Policy, policyDigest)
 }
 

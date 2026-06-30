@@ -41,6 +41,27 @@ func TestEvaluateClosesFromLedgerFactsAndRejectsWrongProfile(t *testing.T) {
 	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
 		t.Fatalf("CreateDiff base->proposal: %v", err)
 	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build proposal obligations: %v", err)
+	}
+	proposalPrimary, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary})
+	if err != nil {
+		t.Fatalf("Build proposal primary packet: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: proposalPrimary.Packet.Digest,
+		ResultPath: writeClosureWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        proposalPrimary.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable proposal findings.",
+		}),
+	}); err != nil {
+		t.Fatalf("Import proposal clean result: %v", err)
+	}
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
 		t.Fatalf("Capture final: %v", err)
 	}
@@ -92,10 +113,10 @@ func TestEvaluateClosesFromLedgerFactsAndRejectsWrongProfile(t *testing.T) {
 	if !closed.Facts.PolicyBound || !closed.Facts.PrimaryReviewCompleted || !closed.Facts.CoverageObligationsSatisfied || !closed.Facts.BlockingFindingsVerified || !closed.Facts.ContextRequestsResolved || !closed.Facts.BasisClean {
 		t.Fatalf("closure facts should reflect satisfied ledger evidence: %+v", closed.Facts)
 	}
-	if closed.Facts.IndependentFinalCompleted {
-		t.Fatalf("independent final evidence should not be invented: %+v", closed.Facts)
+	if !closed.Facts.IndependentFinalCompleted || closed.Runs.IndependentFinalRuns != 0 || closed.Scheduler.Observed.FreshFinalReviews != 0 {
+		t.Fatalf("final primary should satisfy final-review fact without counting as a legacy final run: facts=%+v runs=%+v scheduler=%+v", closed.Facts, closed.Runs, closed.Scheduler.Observed)
 	}
-	if closed.Runs.DiscoveryRuns != 1 || closed.Runs.PrimaryRuns != 1 || closed.Runs.VerificationRuns != 0 {
+	if closed.Runs.DiscoveryRuns != 2 || closed.Runs.PrimaryRuns != 2 || closed.Runs.VerificationRuns != 0 {
 		t.Fatalf("bad run summary: %+v", closed.Runs)
 	}
 	if !closed.Tokens.FullCycle.Available || closed.Tokens.Discovery.IncrementalDiscoveryTokens != 80 || closed.Tokens.FullCycle.IncrementalTokens != 80 {
@@ -163,6 +184,27 @@ func TestEvaluateEnforcesAllowedClosureBasis(t *testing.T) {
 	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
 		t.Fatalf("CreateDiff base->proposal: %v", err)
 	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build proposal obligations: %v", err)
+	}
+	proposalPrimary, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary})
+	if err != nil {
+		t.Fatalf("Build proposal primary packet: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: proposalPrimary.Packet.Digest,
+		ResultPath: writeClosureWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        proposalPrimary.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable proposal findings.",
+		}),
+	}); err != nil {
+		t.Fatalf("Import proposal clean result: %v", err)
+	}
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
 		t.Fatalf("Capture final: %v", err)
 	}
@@ -222,6 +264,27 @@ func TestEvaluateSkipsClosureBasisWhenNotRequired(t *testing.T) {
 	}
 	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
 		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build proposal obligations: %v", err)
+	}
+	proposalPrimary, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary})
+	if err != nil {
+		t.Fatalf("Build proposal primary packet: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: proposalPrimary.Packet.Digest,
+		ResultPath: writeClosureWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        proposalPrimary.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable proposal findings.",
+		}),
+	}); err != nil {
+		t.Fatalf("Import proposal clean result: %v", err)
 	}
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
 		t.Fatalf("Capture final: %v", err)
@@ -366,6 +429,27 @@ func TestEvaluateDoesNotCountContextExpansionAsPrimaryLimit(t *testing.T) {
 	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
 		t.Fatalf("CreateDiff base->proposal: %v", err)
 	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build proposal obligations: %v", err)
+	}
+	proposalPrimary, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary})
+	if err != nil {
+		t.Fatalf("Build proposal primary packet: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: proposalPrimary.Packet.Digest,
+		ResultPath: writeClosureWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        proposalPrimary.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable proposal findings.",
+		}),
+	}); err != nil {
+		t.Fatalf("Import proposal clean result: %v", err)
+	}
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
 		t.Fatalf("Capture final: %v", err)
 	}
@@ -417,6 +501,77 @@ func TestEvaluateDoesNotCountContextExpansionAsPrimaryLimit(t *testing.T) {
 	}
 	if !closed.Closed || closed.Scheduler.OverLimit || closed.Scheduler.Observed.PrimarySemanticReviews != 1 || closed.Scheduler.Observed.ContextExpansionRounds != 1 {
 		t.Fatalf("one context expansion plus one clean review should stay within route limits: %+v", closed)
+	}
+}
+
+func TestEvaluateReportsUnsupportedStrongerPolicyFactNextAction(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	stateDir := filepath.Join(root, "state")
+	initClosureGitRepo(t, repo)
+	writeClosureFile(t, repo, "alpha.txt", "one\n")
+	runClosureGit(t, repo, "add", ".")
+	runClosureGit(t, repo, "commit", "-m", "initial")
+	policyPath := filepath.Join(root, "policy.json")
+	if err := os.WriteFile(policyPath, []byte(`{
+  "schema_version": 1,
+  "policy_id": "unsupported-fact-policy",
+  "profiles": {
+    "default": {
+      "gate_requirements": [],
+      "route_limits": {"primary_semantic_reviews": 1, "targeted_verifications": 1, "fresh_final_reviews": 0, "context_expansion_rounds": 1},
+      "required_evidence_facts": ["primary_review_completed", "coverage_obligations_satisfied", "blocking_findings_verified", "policy_bound", "fresh_blinded_review"],
+      "risk_routing": [],
+      "closure_basis": {"allowed_basis": ["clean"], "require_basis_for_unresolved": true}
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo}); err != nil {
+		t.Fatalf("Init state: %v", err)
+	}
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: policyPath, Profile: "default"}); err != nil {
+		t.Fatalf("Bind policy: %v", err)
+	}
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "base", Ref: "HEAD"}); err != nil {
+		t.Fatalf("Capture base: %v", err)
+	}
+	writeClosureFile(t, repo, "alpha.txt", "one\ntwo\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal"}); err != nil {
+		t.Fatalf("Capture proposal: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
+		t.Fatalf("CreateDiff base->proposal: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build obligations: %v", err)
+	}
+	primary, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary})
+	if err != nil {
+		t.Fatalf("Build primary: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: primary.Packet.Digest,
+		ResultPath: writeClosureWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        primary.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable findings.",
+		}),
+	}); err != nil {
+		t.Fatalf("Import primary result: %v", err)
+	}
+	blocked, err := closure.Evaluate(closure.EvaluateOptions{StateDir: stateDir, PolicyProfile: "default"})
+	if err != nil {
+		t.Fatalf("Evaluate closure: %v", err)
+	}
+	action, ok := closureNextActionByCode(blocked.NextActions, "unsupported_policy_fact")
+	if !ok || len(action.Command) != 0 {
+		t.Fatalf("unsupported policy fact should produce no-command action: %+v", blocked.NextActions)
 	}
 }
 
@@ -506,4 +661,13 @@ func hasClosureBlocker(blockers []closure.Blocker, code string) bool {
 		}
 	}
 	return false
+}
+
+func closureNextActionByCode(actions []closure.NextAction, code string) (closure.NextAction, bool) {
+	for _, action := range actions {
+		if action.Code == code {
+			return action, true
+		}
+	}
+	return closure.NextAction{}, false
 }
