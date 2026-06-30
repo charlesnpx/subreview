@@ -2317,7 +2317,7 @@ func patchFilesForDiff(store state.Store, diff SourceDiff) ([]patchFile, error) 
 
 func verificationQuestions() []VerificationQuestion {
 	return []VerificationQuestion{
-		{ID: "resolution", Question: "Did the proposal-to-final changes resolve the referenced finding in the final state?"},
+		{ID: "resolution", Question: "Did the proposal-to-final changes resolve each referenced finding in the final state?"},
 		{ID: "regression", Question: "Did the fix introduce a new regression or unexpected scope change?"},
 		{ID: "context", Question: "Is the included context sufficient to verify the outcome?"},
 		{ID: "deterministic", Question: "Is there deterministic or executable evidence that refutes the finding?"},
