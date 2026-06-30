@@ -882,6 +882,19 @@ func TestBuildVerificationPacketSupportsBatchFindingIDs(t *testing.T) {
 	if record.Verification == nil || record.Verification.Finding != nil || len(record.Verification.Findings) != 2 || strings.Join(record.Verification.FindingIDs, ",") != firstID+","+secondID {
 		t.Fatalf("bad batch verification record: %+v", record.Verification)
 	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	markdown, err := store.Read(result.Markdown.Digest)
+	if err != nil {
+		t.Fatalf("Read markdown: %v", err)
+	}
+	for _, want := range []string{"resolved each referenced finding", "exactly one logical verdict per finding_id"} {
+		if !strings.Contains(string(markdown), want) {
+			t.Fatalf("batch verification markdown missing %q:\n%s", want, markdown)
+		}
+	}
 	events, err := state.ReadEvents(stateDir)
 	if err != nil {
 		t.Fatalf("ReadEvents: %v", err)

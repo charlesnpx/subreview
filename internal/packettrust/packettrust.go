@@ -177,8 +177,11 @@ func validateRecord(record packetRecord, repo string) error {
 	if record.CoverageManifest.Digest == "" || record.TargetState.Digest == "" {
 		return errors.New("packet missing coverage_manifest or target_state")
 	}
+	ids, err := validatedVerificationIDs(record.Verification)
+	if err != nil {
+		return err
+	}
 	if record.RunKind == "verification" || record.Route == "targeted_verification" {
-		ids := verificationIDs(record.Verification)
 		if len(ids) == 0 {
 			return errors.New("verification packet missing finding_ids")
 		}
@@ -296,33 +299,78 @@ func refFromRecord(stateDir, digest, eventID string, record packetRecord) Ref {
 }
 
 func verificationIDs(record *verificationRecord) []string {
+	ids, err := validatedVerificationIDs(record)
+	if err == nil {
+		return ids
+	}
+	return nil
+}
+
+func validatedVerificationIDs(record *verificationRecord) ([]string, error) {
 	if record == nil {
+		return nil, nil
+	}
+	var canonical []string
+	for _, source := range []struct {
+		name string
+		ids  []string
+	}{
+		{name: "finding_ids", ids: record.FindingIDs},
+		{name: "finding", ids: singletonVerificationID(record.Finding)},
+		{name: "findings", ids: verificationFindingListIDs(record.Findings)},
+	} {
+		ids, err := normalizedVerificationIDSet(source.name, source.ids)
+		if err != nil {
+			return nil, err
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		if canonical == nil {
+			canonical = ids
+			continue
+		}
+		if strings.Join(canonical, ",") != strings.Join(ids, ",") {
+			return nil, fmt.Errorf("verification finding ids mismatch between packet fields: %s != %s", strings.Join(canonical, ","), strings.Join(ids, ","))
+		}
+	}
+	if canonical == nil {
+		return nil, nil
+	}
+	return append([]string(nil), canonical...), nil
+}
+
+func singletonVerificationID(finding *verificationFinding) []string {
+	if finding == nil {
 		return nil
 	}
+	return []string{finding.ID}
+}
+
+func verificationFindingListIDs(findings []verificationFinding) []string {
+	ids := make([]string, 0, len(findings))
+	for _, finding := range findings {
+		ids = append(ids, finding.ID)
+	}
+	return ids
+}
+
+func normalizedVerificationIDSet(source string, input []string) ([]string, error) {
 	seen := map[string]struct{}{}
-	out := []string{}
-	add := func(id string) {
-		id = strings.TrimSpace(id)
+	out := make([]string, 0, len(input))
+	for _, raw := range input {
+		id := strings.TrimSpace(raw)
 		if id == "" {
-			return
+			return nil, fmt.Errorf("verification %s contains empty finding_id", source)
 		}
 		if _, ok := seen[id]; ok {
-			return
+			return nil, fmt.Errorf("verification %s contains duplicate finding_id: %s", source, id)
 		}
 		seen[id] = struct{}{}
 		out = append(out, id)
 	}
-	for _, id := range record.FindingIDs {
-		add(id)
-	}
-	if record.Finding != nil {
-		add(record.Finding.ID)
-	}
-	for _, finding := range record.Findings {
-		add(finding.ID)
-	}
 	sort.Strings(out)
-	return out
+	return out, nil
 }
 
 func splitIDs(value string) []string {
