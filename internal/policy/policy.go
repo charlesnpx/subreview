@@ -12,16 +12,17 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/charlesnpx/subreview/internal/ident"
 	"github.com/charlesnpx/subreview/internal/state"
 )
 
 const SchemaVersion = 1
 
-var knownCommandIDs = map[string]struct{}{
-	"go_test_all":              {},
-	"go_test_internal_state":   {},
-	"go_test_race":             {},
-	"subreview_state_validate": {},
+var legacyCommandDescriptions = map[string]string{
+	"go_test_all":              "Run go test ./...",
+	"go_test_internal_state":   "Run go test ./internal/state",
+	"go_test_race":             "Run go test -race ./...",
+	"subreview_state_validate": "Run subreview state validate",
 }
 
 var knownFacts = map[string]struct{}{
@@ -274,7 +275,7 @@ func Explain(opts ExplainOptions) (ExplainResult, error) {
 	if err := decodeStrict(body, &effective); err != nil {
 		return ExplainResult{}, err
 	}
-	if err := validateBoundEffectivePolicy(effective, opts.Profile, repo, binding.PolicyID); err != nil {
+	if err := ValidateBoundEffectivePolicy(effective, opts.Profile, repo, binding.PolicyID); err != nil {
 		return ExplainResult{}, err
 	}
 	return ExplainResult{
@@ -351,7 +352,7 @@ func Effective(cfg Config, profileName, repo string) (EffectivePolicy, error) {
 			RequireBasisForUnresolved: profile.ClosureBasis.RequireBasisForUnresolved,
 		},
 		ClosurePredicates: predicates,
-		CommandCatalog:    commandCatalog(),
+		CommandCatalog:    commandCatalogFromGateRequirements(profile.GateRequirements),
 	}, nil
 }
 
@@ -372,15 +373,21 @@ func validateConfig(cfg Config) error {
 		if len(profile.RequiredEvidenceFacts) == 0 {
 			return fmt.Errorf("profile %s requires at least one evidence fact", name)
 		}
+		seenGateCommands := map[string]struct{}{}
 		for _, gate := range profile.GateRequirements {
-			if _, ok := knownCommandIDs[gate.CommandID]; !ok {
-				return fmt.Errorf("profile %s references unknown command_id: %s", name, gate.CommandID)
+			commandID, err := ident.NormalizeCommandID(gate.CommandID)
+			if err != nil {
+				return fmt.Errorf("profile %s references invalid command_id: %s", name, gate.CommandID)
 			}
+			if _, exists := seenGateCommands[commandID]; exists {
+				return fmt.Errorf("profile %s has duplicate gate requirement command_id: %s", name, commandID)
+			}
+			seenGateCommands[commandID] = struct{}{}
 			if gate.Required && strings.TrimSpace(gate.CommandDigest) == "" {
-				return fmt.Errorf("profile %s required gate %s requires command_digest", name, gate.CommandID)
+				return fmt.Errorf("profile %s required gate %s requires command_digest", name, commandID)
 			}
 			if strings.TrimSpace(gate.CommandDigest) != "" && !validCommandDigest(gate.CommandDigest) {
-				return fmt.Errorf("profile %s gate %s has invalid command_digest: %s", name, gate.CommandID, gate.CommandDigest)
+				return fmt.Errorf("profile %s gate %s has invalid command_digest: %s", name, commandID, gate.CommandDigest)
 			}
 		}
 		if err := validateRouteLimits(name, profile.RouteLimits); err != nil {
@@ -466,12 +473,28 @@ func rejectScalarGrades(body []byte) error {
 	return walk(raw)
 }
 
-func commandCatalog() []CommandDefinition {
-	catalog := []CommandDefinition{
-		{ID: "go_test_all", Description: "Run go test ./..."},
-		{ID: "go_test_internal_state", Description: "Run go test ./internal/state"},
-		{ID: "go_test_race", Description: "Run go test -race ./..."},
-		{ID: "subreview_state_validate", Description: "Run subreview state validate"},
+func commandCatalogFromGateRequirements(gates []GateRequirement) []CommandDefinition {
+	catalog := []CommandDefinition{}
+	seen := map[string]struct{}{}
+	for _, gate := range gates {
+		id := strings.TrimSpace(gate.CommandID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		catalog = append(catalog, CommandDefinition{ID: id, Description: legacyCommandDescriptions[id]})
+	}
+	sort.Slice(catalog, func(i, j int) bool { return catalog[i].ID < catalog[j].ID })
+	return catalog
+}
+
+func legacyCommandCatalog() []CommandDefinition {
+	catalog := make([]CommandDefinition, 0, len(legacyCommandDescriptions))
+	for id, description := range legacyCommandDescriptions {
+		catalog = append(catalog, CommandDefinition{ID: id, Description: description})
 	}
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].ID < catalog[j].ID })
 	return catalog
@@ -522,7 +545,18 @@ func parseBoundPolicyBinding(event state.Event, profile, repo string) (boundPoli
 	return boundPolicyBinding{Digest: digest, PolicyID: policyID}, nil
 }
 
-func validateBoundEffectivePolicy(effective EffectivePolicy, profile, repo, policyID string) error {
+func DecodeBoundEffectivePolicy(body []byte, profile, repo, policyID string) (EffectivePolicy, error) {
+	var effective EffectivePolicy
+	if err := decodeStrict(body, &effective); err != nil {
+		return EffectivePolicy{}, err
+	}
+	if err := ValidateBoundEffectivePolicy(effective, profile, repo, policyID); err != nil {
+		return EffectivePolicy{}, err
+	}
+	return effective, nil
+}
+
+func ValidateBoundEffectivePolicy(effective EffectivePolicy, profile, repo, policyID string) error {
 	if effective.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("bound policy object does not match profile %s: unsupported schema_version %d", profile, effective.SchemaVersion)
 	}
@@ -561,10 +595,32 @@ func validateBoundEffectivePolicy(effective EffectivePolicy, profile, repo, poli
 	if err != nil {
 		return fmt.Errorf("bound policy object does not match profile %s: %w", profile, err)
 	}
+	if reflect.DeepEqual(effective, expected) {
+		return nil
+	}
+	if legacyFixedCommandCatalogAllowed(effective, expected) {
+		return nil
+	}
 	if !reflect.DeepEqual(effective, expected) {
 		return fmt.Errorf("bound policy object does not match profile %s: object is not canonical", profile)
 	}
 	return nil
+}
+
+func legacyFixedCommandCatalogAllowed(effective, expected EffectivePolicy) bool {
+	copyEffective := effective
+	copyExpected := expected
+	copyEffective.CommandCatalog = nil
+	copyExpected.CommandCatalog = nil
+	if !reflect.DeepEqual(copyEffective, copyExpected) {
+		return false
+	}
+	for _, gate := range effective.GateRequirements {
+		if _, ok := legacyCommandDescriptions[gate.CommandID]; !ok {
+			return false
+		}
+	}
+	return reflect.DeepEqual(effective.CommandCatalog, legacyCommandCatalog())
 }
 
 func stateValidationError(result state.ValidationResult) error {

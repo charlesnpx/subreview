@@ -78,6 +78,111 @@ func TestImportRejectsMalformedAndOversizedWithoutLedgerProgress(t *testing.T) {
 	}
 }
 
+func TestValidateDoesNotWriteState(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	beforeEvents := readEvents(t, stateDir)
+	beforeObjects := countStateObjects(t, stateDir)
+	validated, err := reviewresult.Validate(reviewresult.ValidateOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable findings.",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("Validate clean result: %v", err)
+	}
+	if !validated.Valid || validated.Error != "" {
+		t.Fatalf("expected valid result: %+v", validated)
+	}
+	invalidPath := filepath.Join(t.TempDir(), "invalid.json")
+	if err := os.WriteFile(invalidPath, []byte(`{"schema_version": 1,`), 0o644); err != nil {
+		t.Fatalf("write invalid result: %v", err)
+	}
+	invalid, err := reviewresult.Validate(reviewresult.ValidateOptions{StateDir: stateDir, PacketID: built.Packet.Digest, ResultPath: invalidPath})
+	if err != nil {
+		t.Fatalf("Validate malformed result: %v", err)
+	}
+	if invalid.Valid || invalid.Error == "" {
+		t.Fatalf("expected invalid result: %+v", invalid)
+	}
+	if after := readEvents(t, stateDir); len(after) != len(beforeEvents) {
+		t.Fatalf("validate should not append ledger event: before=%d after=%d", len(beforeEvents), len(after))
+	}
+	if afterObjects := countStateObjects(t, stateDir); afterObjects != beforeObjects {
+		t.Fatalf("validate should not write CAS objects: before=%d after=%d", beforeObjects, afterObjects)
+	}
+}
+
+func TestObservationsRejectStoredResultPacketMismatch(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	imported, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable findings.",
+		}),
+		Now: time.Unix(211, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import result: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	body, err := store.Read(imported.Result.Digest)
+	if err != nil {
+		t.Fatalf("Read result: %v", err)
+	}
+	var record reviewresult.ResultRecord
+	if err := json.Unmarshal(body, &record); err != nil {
+		t.Fatalf("Unmarshal result: %v", err)
+	}
+	record.Packet.StableDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	forged, err := store.PutJSON(record, reviewresult.MediaTypeResult)
+	if err != nil {
+		t.Fatalf("Put forged result: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          reviewresult.EventTypeImported,
+		ObjectDigests: []string{forged.Digest, imported.RawResult.Digest},
+		Repo:          record.Repo,
+		Details: map[string]string{
+			"result":                  forged.Digest,
+			"raw_result":              imported.RawResult.Digest,
+			"packet":                  built.Packet.Digest,
+			"run_kind":                record.RunKind,
+			"route":                   record.Route,
+			"outcome":                 record.Outcome,
+			"clean":                   "true",
+			"findings":                "0",
+			"accepted_findings":       "0",
+			"duplicate_findings":      "0",
+			"rejected_structural":     "0",
+			"needs_context":           "false",
+			"needs_context_count":     "0",
+			"primary_review_evidence": "true",
+		},
+	}); err != nil {
+		t.Fatalf("Append forged event: %v", err)
+	}
+	events := readEvents(t, stateDir)
+	if _, err := reviewresult.Observations(store, events, events[0].Repo); err == nil {
+		t.Fatal("observations should reject stored result packet mismatch")
+	}
+}
+
 func TestImportRejectsDiscoveryRouteMismatch(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	before := readEvents(t, stateDir)
@@ -97,6 +202,150 @@ func TestImportRejectsDiscoveryRouteMismatch(t *testing.T) {
 	}
 	if after := readEvents(t, stateDir); len(after) != len(before) {
 		t.Fatalf("route mismatch should not append ledger event: before=%d after=%d", len(before), len(after))
+	}
+}
+
+func TestBatchTargetedVerificationRequiresOneVerdictPerFinding(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	secondFinding := validFinding("finding-two")
+	secondFinding.Claim = "alpha.txt can also omit a second independent release note."
+	secondFinding.FailureScenario = "A reader sees the implementation change but not the corresponding release note."
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings: []reviewresult.FindingInput{
+				validFinding("finding-one"),
+				secondFinding,
+			},
+		}),
+		Now: time.Unix(245, 0),
+	}); err != nil {
+		t.Fatalf("Import findings: %v", err)
+	}
+	verificationPacket, err := packet.Build(packet.BuildOptions{
+		StateDir:   stateDir,
+		Kind:       packet.KindVerification,
+		FindingIDs: []string{"finding-two", "finding-one"},
+		Now:        time.Unix(246, 0),
+	})
+	if err != nil {
+		t.Fatalf("Build batch verification packet: %v", err)
+	}
+	if verificationPacket.Verification == nil || strings.Join(verificationPacket.Verification.FindingIDs, ",") != "finding-one,finding-two" || verificationPacket.Verification.FindingID != "" {
+		t.Fatalf("bad batch verification summary: %+v", verificationPacket.Verification)
+	}
+	before := readEvents(t, stateDir)
+	cases := []struct {
+		name   string
+		result reviewresult.WorkerResult
+	}{
+		{
+			name: "missing verdict",
+			result: reviewresult.WorkerResult{
+				SchemaVersion: reviewresult.SchemaVersion,
+				Packet:        verificationPacket.Packet.Digest,
+				RunKind:       reviewresult.RunKindVerification,
+				Route:         reviewresult.RouteTargetedVerification,
+				Outcome:       reviewresult.OutcomeVerification,
+				VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
+					FindingID: "finding-one",
+					Outcome:   reviewresult.VerificationResolved,
+					Summary:   "Only one finding was checked.",
+				}},
+			},
+		},
+		{
+			name: "out of packet",
+			result: reviewresult.WorkerResult{
+				SchemaVersion: reviewresult.SchemaVersion,
+				Packet:        verificationPacket.Packet.Digest,
+				RunKind:       reviewresult.RunKindVerification,
+				Route:         reviewresult.RouteTargetedVerification,
+				Outcome:       reviewresult.OutcomeVerification,
+				VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
+					FindingID: "finding-three",
+					Outcome:   reviewresult.VerificationResolved,
+					Summary:   "This finding was not in the packet.",
+				}},
+			},
+		},
+		{
+			name: "duplicate outcomes",
+			result: reviewresult.WorkerResult{
+				SchemaVersion: reviewresult.SchemaVersion,
+				Packet:        verificationPacket.Packet.Digest,
+				RunKind:       reviewresult.RunKindVerification,
+				Route:         reviewresult.RouteTargetedVerification,
+				Outcome:       reviewresult.OutcomeVerification,
+				VerifierOutcomes: []reviewresult.VerifierOutcomeInput{
+					{FindingID: "finding-one", Outcome: reviewresult.VerificationResolved, Summary: "First verdict."},
+					{FindingID: "finding-one", Outcome: reviewresult.VerificationNotResolved, Summary: "Conflicting verdict."},
+					{FindingID: "finding-two", Outcome: reviewresult.VerificationResolved, Summary: "Second finding verdict."},
+				},
+			},
+		},
+		{
+			name: "obligation refutation",
+			result: reviewresult.WorkerResult{
+				SchemaVersion: reviewresult.SchemaVersion,
+				Packet:        verificationPacket.Packet.Digest,
+				RunKind:       reviewresult.RunKindVerification,
+				Route:         reviewresult.RouteTargetedVerification,
+				Outcome:       reviewresult.OutcomeVerification,
+				DeterministicRefutations: []reviewresult.DeterministicRefutationInput{{
+					FindingID:     "finding-one",
+					ObligationIDs: []string{"coverage-alpha"},
+					EvidenceKind:  "test",
+					Summary:       "This mixes finding and obligation refutation.",
+					Citations:     []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 1}},
+				}},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := reviewresult.Import(reviewresult.ImportOptions{StateDir: stateDir, PacketID: verificationPacket.Packet.Digest, ResultPath: writeWorkerResult(t, tc.result), Now: time.Unix(247, 0)}); err == nil {
+				t.Fatalf("expected %s to be rejected", tc.name)
+			}
+			if after := readEvents(t, stateDir); len(after) != len(before) {
+				t.Fatalf("%s should not append ledger event: before=%d after=%d", tc.name, len(before), len(after))
+			}
+		})
+	}
+	imported, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: verificationPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        verificationPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindVerification,
+			Route:         reviewresult.RouteTargetedVerification,
+			Outcome:       reviewresult.OutcomeVerification,
+			VerifierOutcomes: []reviewresult.VerifierOutcomeInput{{
+				FindingID: "finding-one",
+				Outcome:   reviewresult.VerificationResolved,
+				Summary:   "The final state resolves the first finding.",
+			}},
+			DeterministicRefutations: []reviewresult.DeterministicRefutationInput{{
+				FindingID:    "finding-two",
+				EvidenceKind: "test",
+				Summary:      "The second finding is refuted by direct citation.",
+				Citations:    []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 1}},
+			}},
+		}),
+		Now: time.Unix(248, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import mixed batch verdicts: %v", err)
+	}
+	if imported.VerifierOutcomeCount != 1 || imported.DeterministicRefutationCount != 1 {
+		t.Fatalf("bad batch import counts: %+v", imported)
 	}
 }
 
@@ -2008,6 +2257,24 @@ func readEvents(t *testing.T, stateDir string) []state.Event {
 		t.Fatalf("ReadEvents: %v", err)
 	}
 	return events
+}
+
+func countStateObjects(t *testing.T, stateDir string) int {
+	t.Helper()
+	count := 0
+	root := filepath.Join(stateDir, "objects", "sha256")
+	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			count++
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("count state objects: %v", err)
+	}
+	return count
 }
 
 func readObservations(t *testing.T, stateDir string) []reviewresult.EvidenceObservation {

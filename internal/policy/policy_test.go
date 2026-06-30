@@ -38,14 +38,42 @@ func TestCheckExpandsValidConfig(t *testing.T) {
 	}
 }
 
-func TestCheckRejectsUnknownCommand(t *testing.T) {
+func TestCheckRejectsInvalidCommandID(t *testing.T) {
 	root := t.TempDir()
 	cfg := validPolicyConfig()
 	profile := cfg["profiles"].(map[string]any)["default"].(map[string]any)
-	profile["gate_requirements"] = []any{map[string]any{"command_id": "not_a_command", "required": true}}
+	profile["gate_requirements"] = []any{map[string]any{"command_id": "not:a:command", "required": true}}
 	_, err := Check(CheckOptions{ConfigPath: writePolicyConfig(t, root, cfg), RepoPath: root})
-	if err == nil || !strings.Contains(err.Error(), "unknown command_id") {
-		t.Fatalf("expected unknown command error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "invalid command_id") {
+		t.Fatalf("expected invalid command id error, got %v", err)
+	}
+}
+
+func TestCheckAllowsCustomCommandIDAndDerivesCatalog(t *testing.T) {
+	root := t.TempDir()
+	cfg := validPolicyConfig()
+	profile := cfg["profiles"].(map[string]any)["default"].(map[string]any)
+	profile["gate_requirements"] = []any{map[string]any{"command_id": "ci.custom-check_1", "command_digest": testCommandDigest, "required": true}}
+	result, err := Check(CheckOptions{ConfigPath: writePolicyConfig(t, root, cfg), RepoPath: root})
+	if err != nil {
+		t.Fatalf("Check custom command: %v", err)
+	}
+	if len(result.Profiles) != 1 || len(result.Profiles[0].CommandCatalog) != 1 || result.Profiles[0].CommandCatalog[0].ID != "ci.custom-check_1" {
+		t.Fatalf("command catalog should be derived from gate requirements: %+v", result.Profiles)
+	}
+}
+
+func TestCheckRejectsDuplicateGateRequirementCommandID(t *testing.T) {
+	root := t.TempDir()
+	cfg := validPolicyConfig()
+	profile := cfg["profiles"].(map[string]any)["default"].(map[string]any)
+	profile["gate_requirements"] = []any{
+		map[string]any{"command_id": "go_test_all", "command_digest": testCommandDigest, "required": true},
+		map[string]any{"command_id": "go_test_all", "command_digest": testCommandDigest, "required": true},
+	}
+	_, err := Check(CheckOptions{ConfigPath: writePolicyConfig(t, root, cfg), RepoPath: root})
+	if err == nil || !strings.Contains(err.Error(), "duplicate gate requirement") {
+		t.Fatalf("expected duplicate gate requirement error, got %v", err)
 	}
 }
 

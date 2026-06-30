@@ -377,11 +377,7 @@ func readEffectivePolicy(store state.Store, manifest obligation.CoverageManifest
 	if err != nil {
 		return policy.EffectivePolicy{}, err
 	}
-	var effective policy.EffectivePolicy
-	if err := json.Unmarshal(body, &effective); err != nil {
-		return policy.EffectivePolicy{}, err
-	}
-	return effective, nil
+	return policy.DecodeBoundEffectivePolicy(body, manifest.Policy.Profile, manifest.Repo, manifest.Policy.PolicyID)
 }
 
 func factsFromEvidence(status obligation.StatusResult, manifest obligation.CoverageManifest, observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string, findings FindingFacts) Facts {

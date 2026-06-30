@@ -12,12 +12,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/charlesnpx/subreview/internal/ident"
 	"github.com/charlesnpx/subreview/internal/policy"
 	"github.com/charlesnpx/subreview/internal/snapshot"
 	"github.com/charlesnpx/subreview/internal/state"
@@ -51,8 +52,6 @@ const (
 	maxTimeoutSeconds     = 600
 	maxDiagnosticBytes    = 4096
 )
-
-var commandIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 
 type CheckOptions struct {
 	CatalogPath string
@@ -403,8 +402,8 @@ func evidenceObservationFromEvent(store state.Store, event state.Event, repo str
 		return "", EvidenceObservation{}, errors.New("malformed gate.evidence_recorded event: repo mismatch")
 	}
 	commandID := event.Details["command_id"]
-	if strings.TrimSpace(commandID) == "" {
-		return "", EvidenceObservation{}, errors.New("malformed gate.evidence_recorded event: missing command_id")
+	if err := ident.ValidateCommandID(commandID); err != nil {
+		return "", EvidenceObservation{}, fmt.Errorf("malformed gate.evidence_recorded event: %w", err)
 	}
 	digest := event.Details["evidence"]
 	if strings.TrimSpace(digest) == "" {
@@ -421,7 +420,7 @@ func evidenceObservationFromEvent(store state.Store, event state.Event, repo str
 	if err := decodeStrict(body, &record); err != nil {
 		return "", EvidenceObservation{}, err
 	}
-	if err := validateEvidenceRecord(record, repo, commandID); err != nil {
+	if err := validateEvidenceRecord(store, event, record, repo, commandID, digest); err != nil {
 		return "", EvidenceObservation{}, err
 	}
 	return commandID, EvidenceObservation{Record: record, Digest: digest, EventID: event.EventID}, nil
@@ -453,7 +452,7 @@ func normalizeCatalog(catalog Catalog) (Catalog, error) {
 
 func normalizeCommand(command CommandDefinition) (CommandDefinition, error) {
 	command.ID = strings.TrimSpace(command.ID)
-	if !commandIDPattern.MatchString(command.ID) {
+	if err := ident.ValidateCommandID(command.ID); err != nil {
 		return CommandDefinition{}, fmt.Errorf("invalid gate command id: %s", command.ID)
 	}
 	if len(command.Argv) == 0 {
@@ -793,12 +792,9 @@ func latestPolicyBinding(events []state.Event, store state.Store, repo string) (
 		if err != nil {
 			return nil, err
 		}
-		var effective policy.EffectivePolicy
-		if err := decodeStrict(body, &effective); err != nil {
+		effective, err := policy.DecodeBoundEffectivePolicy(body, profile, repo, policyID)
+		if err != nil {
 			return nil, err
-		}
-		if effective.SchemaVersion != policy.SchemaVersion || effective.Repo != repo || effective.Profile != profile || effective.PolicyID != policyID {
-			return nil, errors.New("bound policy object does not match policy.bound event")
 		}
 		return &policyBinding{Ref: PolicyRef{Profile: profile, PolicyID: policyID, Digest: digest}, Effective: effective}, nil
 	}
@@ -834,7 +830,7 @@ func requireBoundPolicyCommandDigest(effective policy.EffectivePolicy, command C
 	return fmt.Errorf("bound policy does not define gate command: %s", command.ID)
 }
 
-func validateEvidenceRecord(record EvidenceRecord, repo, commandID string) error {
+func validateEvidenceRecord(store state.Store, event state.Event, record EvidenceRecord, repo, commandID, digest string) error {
 	if record.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("unsupported gate evidence schema_version: %d", record.SchemaVersion)
 	}
@@ -844,6 +840,12 @@ func validateEvidenceRecord(record EvidenceRecord, repo, commandID string) error
 	if record.CommandID != commandID {
 		return fmt.Errorf("gate evidence command id mismatch: %s != %s", record.CommandID, commandID)
 	}
+	if err := ident.ValidateCommandID(record.CommandID); err != nil {
+		return err
+	}
+	if record.Command.ID != record.CommandID {
+		return errors.New("gate evidence embedded command id mismatch")
+	}
 	if record.CommandDigest == "" || record.CommandDigest != CommandDigest(record.Command) {
 		return errors.New("gate evidence command digest mismatch")
 	}
@@ -852,6 +854,61 @@ func validateEvidenceRecord(record EvidenceRecord, repo, commandID string) error
 	}
 	if record.Provenance != ProvenanceCLIWitnessed && record.Provenance != ProvenanceExternalAsserted {
 		return fmt.Errorf("invalid gate evidence provenance: %s", record.Provenance)
+	}
+	if record.CommandDigest != event.Details["command_digest"] {
+		return errors.New("gate evidence event command_digest mismatch")
+	}
+	if digest != event.Details["evidence"] {
+		return errors.New("gate evidence event digest mismatch")
+	}
+	if record.Catalog.Digest != event.Details["catalog"] {
+		return errors.New("gate evidence event catalog mismatch")
+	}
+	if record.Catalog.Digest != "" && !containsDigest(event.ObjectDigests, record.Catalog.Digest) {
+		return errors.New("malformed gate.evidence_recorded event: object_digests missing catalog")
+	}
+	if record.InputSnapshot.Kind != event.Details["snapshot_kind"] || record.InputSnapshot.Digest != event.Details["input_snapshot"] {
+		return errors.New("gate evidence event snapshot mismatch")
+	}
+	if record.Outcome != event.Details["outcome"] || record.Provenance != event.Details["provenance"] {
+		return errors.New("gate evidence event outcome or provenance mismatch")
+	}
+	if record.ReplayClass != event.Details["replay_class"] || record.SideEffects != event.Details["side_effects"] {
+		return errors.New("gate evidence event replay or side_effects mismatch")
+	}
+	if strconv.FormatBool(record.ExecutesRepoCode) != event.Details["executes_repo_code"] || strconv.FormatBool(record.EnvironmentPinned) != event.Details["environment_pinned"] {
+		return errors.New("gate evidence event execution flags mismatch")
+	}
+	if record.ReplayClass != record.Command.ReplayClass || record.SideEffects != record.Command.SideEffects || record.ExecutesRepoCode != record.Command.ExecutesRepoCode || record.EnvironmentPinned != record.Command.EnvironmentPinned {
+		return errors.New("gate evidence command metadata mismatch")
+	}
+	if record.Policy == nil {
+		if strings.TrimSpace(event.Details["policy"]) != "" || strings.TrimSpace(event.Details["profile"]) != "" || strings.TrimSpace(event.Details["policy_id"]) != "" {
+			return errors.New("gate evidence event policy mismatch")
+		}
+	} else if record.Policy.Digest != event.Details["policy"] || record.Policy.Profile != event.Details["profile"] || record.Policy.PolicyID != event.Details["policy_id"] {
+		return errors.New("gate evidence event policy mismatch")
+	}
+	if record.Catalog.Digest != "" {
+		body, err := store.Read(record.Catalog.Digest)
+		if err != nil {
+			return err
+		}
+		var catalog Catalog
+		if err := decodeStrict(body, &catalog); err != nil {
+			return err
+		}
+		normalized, err := normalizeCatalog(catalog)
+		if err != nil {
+			return err
+		}
+		command, err := resolveCommand(normalized, record.CommandID)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(command, record.Command) {
+			return errors.New("gate evidence embedded command does not match catalog command")
+		}
 	}
 	return nil
 }

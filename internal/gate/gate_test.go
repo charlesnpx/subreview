@@ -230,6 +230,44 @@ func TestRecordStoresExternalAssertedGateEvidence(t *testing.T) {
 	}
 }
 
+func TestCustomCommandIDGateEvidenceValidates(t *testing.T) {
+	command := testCommand("ci.custom-check_1", []string{"/bin/sh", "-c", "printf custom"})
+	repo, stateDir := initializedGateStateForCommand(t, command)
+	catalogPath := writeCatalog(t, t.TempDir(), Catalog{
+		SchemaVersion: SchemaVersion,
+		Commands:      []CommandDefinition{command},
+	})
+	result, err := Record(RecordOptions{
+		StateDir:     stateDir,
+		CatalogPath:  catalogPath,
+		CommandID:    command.ID,
+		SnapshotKind: "proposal",
+		Outcome:      OutcomePass,
+		Provenance:   ProvenanceExternalAsserted,
+		Diagnostic:   "custom gate passed",
+		Now:          time.Unix(310, 0),
+	})
+	if err != nil {
+		t.Fatalf("Record custom gate: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	events, err := state.ReadEvents(stateDir)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	latest, err := LatestEvidenceByCommand(store, events, repo)
+	if err != nil {
+		t.Fatalf("LatestEvidenceByCommand: %v", err)
+	}
+	observation, ok := latest[command.ID]
+	if !ok || observation.Digest != result.Evidence.Digest || observation.Record.CommandID != command.ID {
+		t.Fatalf("custom command evidence missing: %+v", latest)
+	}
+}
+
 func TestTailBufferKeepsBoundedSuffix(t *testing.T) {
 	var tail tailBuffer
 	first := strings.Repeat("a", maxDiagnosticBytes)
@@ -324,7 +362,7 @@ func initializedGateStateForCommand(t *testing.T, command CommandDefinition) (st
 	if _, err := state.Init(state.InitOptions{StateDir: stateDir, RepoPath: repo, Now: time.Unix(100, 0)}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfig(t, root, CommandDigest(command)), Profile: "default"}); err != nil {
+	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfigForCommand(t, root, command.ID, CommandDigest(command)), Profile: "default"}); err != nil {
 		t.Fatalf("Bind policy: %v", err)
 	}
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "proposal", Ref: "HEAD"}); err != nil {
@@ -380,12 +418,17 @@ func writeCatalog(t *testing.T, root string, catalog Catalog) string {
 
 func writePolicyConfig(t *testing.T, root, commandDigest string) string {
 	t.Helper()
+	return writePolicyConfigForCommand(t, root, "go_test_all", commandDigest)
+}
+
+func writePolicyConfigForCommand(t *testing.T, root, commandID, commandDigest string) string {
+	t.Helper()
 	body := []byte(`{
   "schema_version": 1,
   "policy_id": "test-policy",
   "profiles": {
     "default": {
-      "gate_requirements": [{"command_id": "go_test_all", "command_digest": "` + commandDigest + `", "required": true}],
+      "gate_requirements": [{"command_id": "` + commandID + `", "command_digest": "` + commandDigest + `", "required": true}],
       "route_limits": {"primary_semantic_reviews": 1, "targeted_verifications": 1, "fresh_final_reviews": 0, "context_expansion_rounds": 1},
       "required_evidence_facts": ["required_gates_satisfied", "primary_review_completed", "blocking_findings_verified", "coverage_obligations_satisfied", "policy_bound"],
       "risk_routing": [],

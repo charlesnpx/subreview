@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	reviewresult "github.com/charlesnpx/subreview/internal/result"
 	"github.com/charlesnpx/subreview/internal/state"
 )
 
@@ -792,7 +793,7 @@ type artifactResultObservation struct {
 	ArtifactID string
 	Result     string
 	EventID    string
-	Record     artifactResultRecord
+	Record     reviewresult.ResultRecord
 }
 
 type artifactResultRecord struct {
@@ -828,45 +829,23 @@ type artifactResultFinding struct {
 
 func artifactResultObservations(store state.Store, events []state.Event, repo string) ([]artifactResultObservation, error) {
 	observations := []artifactResultObservation{}
-	for _, event := range events {
-		if event.Type != "result.imported" {
+	resultObservations, err := reviewresult.AllObservations(store, events, repo)
+	if err != nil {
+		return nil, err
+	}
+	for _, observation := range resultObservations {
+		record := observation.Record
+		if record.Route != reviewresult.RouteArtifactReview {
 			continue
-		}
-		if event.Repo != repo {
-			return nil, errors.New("malformed result.imported event: repo mismatch")
-		}
-		if event.Details["route"] != "artifact_review" {
-			continue
-		}
-		digest := strings.TrimSpace(event.Details["result"])
-		if digest == "" {
-			return nil, errors.New("malformed result.imported event: missing result")
-		}
-		if !containsDigest(event.ObjectDigests, digest) {
-			return nil, errors.New("malformed result.imported event: object_digests missing result")
-		}
-		body, err := store.Read(digest)
-		if err != nil {
-			return nil, err
-		}
-		var record artifactResultRecord
-		if err := json.Unmarshal(body, &record); err != nil {
-			return nil, err
-		}
-		if record.Route != "artifact_review" || record.Packet.Kind != "artifact" || record.Packet.Route != "artifact_review" || record.Packet.RunKind != "discovery" {
-			return nil, errors.New("malformed artifact result record")
 		}
 		if record.Packet.Artifact == nil || strings.TrimSpace(record.Packet.Artifact.ID) == "" {
 			return nil, errors.New("malformed artifact result record: missing artifact")
 		}
 		artifactID := record.Packet.Artifact.ID
-		if detailArtifactID := strings.TrimSpace(event.Details["artifact_id"]); detailArtifactID != "" && detailArtifactID != artifactID {
-			return nil, errors.New("malformed result.imported event: artifact_id mismatch")
-		}
 		observations = append(observations, artifactResultObservation{
 			ArtifactID: artifactID,
-			Result:     digest,
-			EventID:    event.EventID,
+			Result:     observation.Digest,
+			EventID:    observation.EventID,
 			Record:     record,
 		})
 	}
@@ -874,7 +853,7 @@ func artifactResultObservations(store state.Store, events []state.Event, repo st
 }
 
 func latestResultForArtifact(observations []artifactResultObservation, artifactID string) *artifactResultObservation {
-	for i := len(observations) - 1; i >= 0; i-- {
+	for i := range observations {
 		if observations[i].ArtifactID == artifactID {
 			return &observations[i]
 		}
@@ -897,7 +876,7 @@ func (observation artifactResultObservation) summary() ResultSummary {
 	}
 }
 
-func countArtifactFindings(findings []artifactResultFinding, kind string) int {
+func countArtifactFindings(findings []reviewresult.FindingRecord, kind string) int {
 	count := 0
 	for _, finding := range findings {
 		switch kind {
