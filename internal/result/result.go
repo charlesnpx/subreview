@@ -272,22 +272,25 @@ type ResultRecord struct {
 }
 
 type PacketRef struct {
-	Digest                 string          `json:"digest"`
-	EventID                string          `json:"event_id"`
-	Kind                   string          `json:"kind"`
-	RunKind                string          `json:"run_kind"`
-	Route                  string          `json:"route"`
-	PromptDigest           string          `json:"prompt_digest"`
-	StableDigest           string          `json:"stable_digest"`
-	VolatileDigest         string          `json:"volatile_digest,omitempty"`
-	SemanticDedupeDigest   string          `json:"semantic_dedupe_digest"`
-	Policy                 *PolicyRef      `json:"policy,omitempty"`
-	Artifact               *PacketArtifact `json:"artifact,omitempty"`
-	CoverageManifest       state.ObjectRef `json:"coverage_manifest"`
-	TargetState            SnapshotRef     `json:"target_state"`
-	SourceCompleteness     string          `json:"source_completeness"`
-	VerificationFindingID  string          `json:"verification_finding_id,omitempty"`
-	VerificationFindingIDs []string        `json:"verification_finding_ids,omitempty"`
+	Digest                 string                      `json:"digest"`
+	EventID                string                      `json:"event_id"`
+	Kind                   string                      `json:"kind"`
+	RunKind                string                      `json:"run_kind"`
+	Route                  string                      `json:"route"`
+	PromptDigest           string                      `json:"prompt_digest"`
+	StableDigest           string                      `json:"stable_digest"`
+	VolatileDigest         string                      `json:"volatile_digest"`
+	SemanticDedupeDigest   string                      `json:"semantic_dedupe_digest"`
+	Policy                 *PolicyRef                  `json:"policy,omitempty"`
+	Artifact               *PacketArtifact             `json:"artifact,omitempty"`
+	CoverageManifest       state.ObjectRef             `json:"coverage_manifest"`
+	TargetState            SnapshotRef                 `json:"target_state"`
+	SourceDiffs            []SourceDiff                `json:"source_diffs"`
+	TransitionKey          string                      `json:"transition_key"`
+	SourceCompleteness     string                      `json:"source_completeness"`
+	VerificationFindingID  string                      `json:"verification_finding_id,omitempty"`
+	VerificationFindingIDs []string                    `json:"verification_finding_ids,omitempty"`
+	VerificationTargets    []VerificationFindingTarget `json:"verification_finding_targets,omitempty"`
 }
 
 type PolicyRef struct {
@@ -302,6 +305,25 @@ type SnapshotRef struct {
 	Tree   string `json:"tree,omitempty"`
 }
 
+type SourceDiff struct {
+	Transition   string          `json:"transition"`
+	FromKind     string          `json:"from_kind"`
+	ToKind       string          `json:"to_kind"`
+	FromSnapshot string          `json:"from_snapshot"`
+	ToSnapshot   string          `json:"to_snapshot"`
+	Diff         state.ObjectRef `json:"diff"`
+	Patch        state.ObjectRef `json:"patch"`
+	PatchDigest  string          `json:"patch_digest"`
+	HasChanges   bool            `json:"has_changes"`
+	ChangedPaths []string        `json:"changed_paths"`
+	HunkCount    int             `json:"hunk_count"`
+}
+
+type VerificationFindingTarget struct {
+	FindingID     string `json:"finding_id"`
+	TransitionKey string `json:"transition_key"`
+}
+
 type PacketArtifact struct {
 	ID            string          `json:"id"`
 	Kind          string          `json:"kind"`
@@ -313,22 +335,23 @@ type PacketArtifact struct {
 }
 
 type FindingRecord struct {
-	ID                 string        `json:"id"`
-	SourceID           string        `json:"source_id,omitempty"`
-	DedupeDigest       string        `json:"dedupe_digest"`
-	State              string        `json:"state"`
-	Severity           string        `json:"severity"`
-	Class              string        `json:"class"`
-	Claim              string        `json:"claim"`
-	FailureScenario    string        `json:"failure_scenario"`
-	Citations          []LineRef     `json:"citations"`
-	Anchors            []AnchorRef   `json:"anchors"`
-	ArtifactRefs       []ArtifactRef `json:"artifact_refs,omitempty"`
-	ExpectedFixSurface []FixSurface  `json:"expected_fix_surface"`
-	Accepted           bool          `json:"accepted"`
-	Blocking           bool          `json:"blocking"`
-	DuplicateOf        string        `json:"duplicate_of,omitempty"`
-	RejectionReason    string        `json:"rejection_reason,omitempty"`
+	ID                  string        `json:"id"`
+	SourceID            string        `json:"source_id,omitempty"`
+	DedupeDigest        string        `json:"dedupe_digest"`
+	OriginTransitionKey string        `json:"origin_transition_key,omitempty"`
+	State               string        `json:"state"`
+	Severity            string        `json:"severity"`
+	Class               string        `json:"class"`
+	Claim               string        `json:"claim"`
+	FailureScenario     string        `json:"failure_scenario"`
+	Citations           []LineRef     `json:"citations"`
+	Anchors             []AnchorRef   `json:"anchors"`
+	ArtifactRefs        []ArtifactRef `json:"artifact_refs,omitempty"`
+	ExpectedFixSurface  []FixSurface  `json:"expected_fix_surface"`
+	Accepted            bool          `json:"accepted"`
+	Blocking            bool          `json:"blocking"`
+	DuplicateOf         string        `json:"duplicate_of,omitempty"`
+	RejectionReason     string        `json:"rejection_reason,omitempty"`
 }
 
 type VerifierOutcome struct {
@@ -367,13 +390,14 @@ type EvidenceObservation struct {
 }
 
 type FindingBlocker struct {
-	FindingID string `json:"finding_id"`
-	State     string `json:"state"`
-	Severity  string `json:"severity"`
-	Class     string `json:"class"`
-	Claim     string `json:"claim"`
-	EventID   string `json:"event_id"`
-	Digest    string `json:"digest"`
+	FindingID     string `json:"finding_id"`
+	TransitionKey string `json:"transition_key,omitempty"`
+	State         string `json:"state"`
+	Severity      string `json:"severity"`
+	Class         string `json:"class"`
+	Claim         string `json:"claim"`
+	EventID       string `json:"event_id"`
+	Digest        string `json:"digest"`
 }
 
 type packetRecord struct {
@@ -472,6 +496,9 @@ func Import(opts ImportOptions) (ImportResult, error) {
 	}
 	if packetRef.TargetState.Digest != "" {
 		details["target_state"] = packetRef.TargetState.Digest
+	}
+	if packetRef.TransitionKey != "" {
+		details["transition_key"] = packetRef.TransitionKey
 	}
 	artifactID := ""
 	if packetRef.Artifact != nil {
@@ -623,6 +650,14 @@ func LatestPrimaryReviewForManifest(observations []EvidenceObservation, manifest
 	return EvidenceObservation{}, false
 }
 
+func LatestPrimaryReviewForTransition(observations []EvidenceObservation, transitionKey, policyDigest string) (EvidenceObservation, bool) {
+	observation, ok := LatestDiscoveryForTransition(observations, transitionKey, policyDigest)
+	if !ok || !observation.Record.Evidence.PrimaryReviewEvidence {
+		return EvidenceObservation{}, false
+	}
+	return observation, true
+}
+
 func LatestPrimaryReviewForTargetState(observations []EvidenceObservation, targetDigest, policyDigest string) (EvidenceObservation, bool) {
 	observation, ok := LatestDiscoveryForTargetState(observations, targetDigest, policyDigest)
 	if !ok || !observation.Record.Evidence.PrimaryReviewEvidence {
@@ -638,6 +673,27 @@ func LatestDiscoveryForTargetState(observations []EvidenceObservation, targetDig
 			continue
 		}
 		if record.Packet.TargetState.Kind != "proposal" || record.Packet.TargetState.Digest != targetDigest {
+			continue
+		}
+		if !packetPolicyMatches(record.Packet.Policy, policyDigest) {
+			continue
+		}
+		return observation, true
+	}
+	return EvidenceObservation{}, false
+}
+
+func LatestDiscoveryForTransition(observations []EvidenceObservation, transitionKey, policyDigest string) (EvidenceObservation, bool) {
+	transitionKey = strings.TrimSpace(transitionKey)
+	if transitionKey == "" {
+		return EvidenceObservation{}, false
+	}
+	for _, observation := range observations {
+		record := observation.Record
+		if record.RunKind != RunKindDiscovery || record.Route != RoutePrimaryReview {
+			continue
+		}
+		if record.Packet.TransitionKey != transitionKey {
 			continue
 		}
 		if !packetPolicyMatches(record.Packet.Policy, policyDigest) {
@@ -677,9 +733,44 @@ func DeterministicRefutationsForObligation(observations []EvidenceObservation, m
 	return matches
 }
 
+func DeterministicRefutationsForObligationTransition(observations []EvidenceObservation, transitionKey, policyDigest, obligationID string) []EvidenceObservation {
+	matches := []EvidenceObservation{}
+	for _, observation := range observations {
+		record := observation.Record
+		if record.Packet.TransitionKey != transitionKey || !packetPolicyMatches(record.Packet.Policy, policyDigest) {
+			continue
+		}
+		for _, refutation := range record.DeterministicRefutations {
+			if containsString(refutation.ObligationIDs, obligationID) {
+				matches = append(matches, observation)
+				break
+			}
+		}
+	}
+	return matches
+}
+
 func ActiveFindingBlockers(observations []EvidenceObservation, manifestDigest string) []FindingBlocker {
+	transitionKeys := map[string]struct{}{}
+	for _, observation := range observations {
+		record := observation.Record
+		if record.Packet.CoverageManifest.Digest != manifestDigest {
+			continue
+		}
+		if record.Packet.TransitionKey != "" {
+			transitionKeys[record.Packet.TransitionKey] = struct{}{}
+		}
+	}
 	return findingBlockers(observations, func(record ResultRecord) bool {
-		return record.Packet.CoverageManifest.Digest == manifestDigest
+		if record.Packet.CoverageManifest.Digest == manifestDigest {
+			return true
+		}
+		for _, target := range record.Packet.VerificationTargets {
+			if _, ok := transitionKeys[target.TransitionKey]; ok {
+				return true
+			}
+		}
+		return false
 	})
 }
 
@@ -695,14 +786,35 @@ func ClosureFindingBlockers(observations []EvidenceObservation, manifestDigest, 
 	})
 }
 
+func ClosureFindingBlockersForTransitions(observations []EvidenceObservation, transitionKeys map[string]struct{}, policyDigest string) []FindingBlocker {
+	return findingBlockers(observations, func(record ResultRecord) bool {
+		if !packetPolicyMatches(record.Packet.Policy, policyDigest) {
+			return false
+		}
+		if _, ok := transitionKeys[record.Packet.TransitionKey]; ok {
+			return true
+		}
+		for _, target := range record.Packet.VerificationTargets {
+			if _, ok := transitionKeys[target.TransitionKey]; ok {
+				return true
+			}
+		}
+		return false
+	})
+}
+
 func findingBlockers(observations []EvidenceObservation, applies func(ResultRecord) bool) []FindingBlocker {
+	type lifecycleKey struct {
+		transitionKey string
+		findingID     string
+	}
 	type lifecycle struct {
 		finding FindingRecord
 		state   string
 		eventID string
 		digest  string
 	}
-	byID := map[string]lifecycle{}
+	byID := map[lifecycleKey]lifecycle{}
 	for i := len(observations) - 1; i >= 0; i-- {
 		observation := observations[i]
 		record := observation.Record
@@ -713,45 +825,50 @@ func findingBlockers(observations []EvidenceObservation, applies func(ResultReco
 			if !finding.Accepted {
 				continue
 			}
-			byID[finding.ID] = lifecycle{finding: finding, state: finding.State, eventID: observation.EventID, digest: observation.Digest}
+			key := lifecycleKey{transitionKey: finding.OriginTransitionKey, findingID: finding.ID}
+			byID[key] = lifecycle{finding: finding, state: finding.State, eventID: observation.EventID, digest: observation.Digest}
 		}
+		targetTransitions := verificationTargetTransitionMap(record.Packet)
 		for _, outcome := range record.VerifierOutcomes {
-			current, ok := byID[outcome.FindingID]
+			key := lifecycleKey{transitionKey: targetTransitions[outcome.FindingID], findingID: outcome.FindingID}
+			current, ok := byID[key]
 			if !ok {
 				continue
 			}
 			current.state = outcome.State
 			current.eventID = observation.EventID
 			current.digest = observation.Digest
-			byID[outcome.FindingID] = current
+			byID[key] = current
 		}
 		for _, refutation := range record.DeterministicRefutations {
 			if refutation.FindingID == "" {
 				continue
 			}
-			current, ok := byID[refutation.FindingID]
+			key := lifecycleKey{transitionKey: targetTransitions[refutation.FindingID], findingID: refutation.FindingID}
+			current, ok := byID[key]
 			if !ok {
 				continue
 			}
 			current.state = StateInvalidated
 			current.eventID = observation.EventID
 			current.digest = observation.Digest
-			byID[refutation.FindingID] = current
+			byID[key] = current
 		}
 	}
 	blockers := []FindingBlocker{}
-	for id, item := range byID {
+	for key, item := range byID {
 		if !blocksClosure(item.state) {
 			continue
 		}
 		blockers = append(blockers, FindingBlocker{
-			FindingID: id,
-			State:     item.state,
-			Severity:  item.finding.Severity,
-			Class:     item.finding.Class,
-			Claim:     item.finding.Claim,
-			EventID:   item.eventID,
-			Digest:    item.digest,
+			FindingID:     key.findingID,
+			TransitionKey: key.transitionKey,
+			State:         item.state,
+			Severity:      item.finding.Severity,
+			Class:         item.finding.Class,
+			Claim:         item.finding.Claim,
+			EventID:       item.eventID,
+			Digest:        item.digest,
 		})
 	}
 	sort.Slice(blockers, func(i, j int) bool {
@@ -1005,19 +1122,20 @@ func normalizeFinding(input FindingInput, index int, packet PacketRef) FindingRe
 		id = "finding_" + strings.TrimPrefix(dedupe, "sha256:")[:16]
 	}
 	record := FindingRecord{
-		ID:                 id,
-		SourceID:           sourceID,
-		DedupeDigest:       dedupe,
-		State:              stateValue,
-		Severity:           severity,
-		Class:              class,
-		Claim:              claim,
-		FailureScenario:    failureScenario,
-		Citations:          citations,
-		Anchors:            anchors,
-		ExpectedFixSurface: fixSurface,
-		Accepted:           true,
-		Blocking:           blocksClosure(stateValue),
+		ID:                  id,
+		SourceID:            sourceID,
+		DedupeDigest:        dedupe,
+		OriginTransitionKey: packet.TransitionKey,
+		State:               stateValue,
+		Severity:            severity,
+		Class:               class,
+		Claim:               claim,
+		FailureScenario:     failureScenario,
+		Citations:           citations,
+		Anchors:             anchors,
+		ExpectedFixSurface:  fixSurface,
+		Accepted:            true,
+		Blocking:            blocksClosure(stateValue),
 	}
 	if len(reasons) > 0 {
 		record.ID = fallbackFindingID(record.ID, dedupe, index)
@@ -1534,9 +1652,17 @@ func validateTargetedVerificationEvidence(packet PacketRef, outcomes []VerifierO
 	if len(targetIDs) == 0 {
 		return errors.New("targeted verification packet requires at least one finding_id")
 	}
+	targetTransitions := verificationTargetTransitionMap(packet)
 	targetSet := map[string]struct{}{}
 	for _, id := range targetIDs {
 		targetSet[id] = struct{}{}
+		key := strings.TrimSpace(targetTransitions[id])
+		if key == "" {
+			return fmt.Errorf("targeted verification packet missing origin transition for finding_id %q", id)
+		}
+		if !strings.HasPrefix(key, "base->proposal|") {
+			return fmt.Errorf("targeted verification only supports proposal findings; finding_id %q targets %s", id, key)
+		}
 	}
 	outcomeByFinding := map[string]VerifierOutcome{}
 	for _, outcome := range outcomes {
@@ -1585,6 +1711,19 @@ func validateTargetedVerificationEvidence(packet PacketRef, outcomes []VerifierO
 		}
 	}
 	return nil
+}
+
+func verificationTargetTransitionMap(packet PacketRef) map[string]string {
+	out := map[string]string{}
+	for _, target := range packet.VerificationTargets {
+		id := strings.TrimSpace(target.FindingID)
+		key := strings.TrimSpace(target.TransitionKey)
+		if id == "" || key == "" {
+			continue
+		}
+		out[id] = key
+	}
+	return out
 }
 
 func normalizeEvidenceRefs(input []EvidenceRef) ([]EvidenceRef, error) {
@@ -1710,10 +1849,41 @@ func packetRefFromTrusted(ref packettrust.Ref) PacketRef {
 		Artifact:               artifactRefFromTrusted(ref.Artifact),
 		CoverageManifest:       ref.CoverageManifest,
 		TargetState:            SnapshotRef{Kind: ref.TargetState.Kind, Digest: ref.TargetState.Digest, Tree: ref.TargetState.Tree},
+		SourceDiffs:            sourceDiffsFromTrusted(ref.SourceDiffs),
+		TransitionKey:          ref.TransitionKey,
 		SourceCompleteness:     ref.SourceCompleteness,
 		VerificationFindingID:  ref.VerificationFindingID,
 		VerificationFindingIDs: append([]string(nil), ref.VerificationFindingIDs...),
+		VerificationTargets:    verificationTargetsFromTrusted(ref.VerificationTargets),
 	}
+}
+
+func sourceDiffsFromTrusted(sourceDiffs []packettrust.SourceDiff) []SourceDiff {
+	out := make([]SourceDiff, 0, len(sourceDiffs))
+	for _, diff := range sourceDiffs {
+		out = append(out, SourceDiff{
+			Transition:   diff.Transition,
+			FromKind:     diff.FromKind,
+			ToKind:       diff.ToKind,
+			FromSnapshot: diff.FromSnapshot,
+			ToSnapshot:   diff.ToSnapshot,
+			Diff:         diff.Diff,
+			Patch:        diff.Patch,
+			PatchDigest:  diff.PatchDigest,
+			HasChanges:   diff.HasChanges,
+			ChangedPaths: append([]string(nil), diff.ChangedPaths...),
+			HunkCount:    diff.HunkCount,
+		})
+	}
+	return out
+}
+
+func verificationTargetsFromTrusted(targets []packettrust.VerificationFindingTarget) []VerificationFindingTarget {
+	out := make([]VerificationFindingTarget, 0, len(targets))
+	for _, target := range targets {
+		out = append(out, VerificationFindingTarget{FindingID: target.FindingID, TransitionKey: target.TransitionKey})
+	}
+	return out
 }
 
 func policyRefFromTrusted(policy *packettrust.PolicyRef) *PolicyRef {
@@ -1794,7 +1964,7 @@ func findingIdentityScopeMatches(record ResultRecord, packet PacketRef) bool {
 			packet.Artifact != nil &&
 			record.Packet.Artifact.ID == packet.Artifact.ID
 	}
-	return record.Route != RouteArtifactReview && record.Packet.CoverageManifest.Digest == packet.CoverageManifest.Digest
+	return record.Route != RouteArtifactReview && record.Packet.TransitionKey == packet.TransitionKey
 }
 
 func validateRecord(record ResultRecord, repo, packetDigest string, trusted *PacketRef) error {
@@ -1846,9 +2016,15 @@ func validateRecord(record ResultRecord, repo, packetDigest string, trusted *Pac
 	if record.Packet.CoverageManifest.Digest == "" || record.Packet.TargetState.Digest == "" {
 		return errors.New("result packet reference is incomplete")
 	}
+	if strings.TrimSpace(record.Packet.TransitionKey) == "" || len(record.Packet.SourceDiffs) != 1 {
+		return errors.New("result packet transition reference is incomplete")
+	}
 	for _, finding := range record.Findings {
 		if len(finding.ArtifactRefs) > 0 {
 			return errors.New("code-review result contains artifact_refs")
+		}
+		if finding.Accepted && strings.TrimSpace(finding.OriginTransitionKey) == "" {
+			return errors.New("accepted code-review finding is missing origin transition key")
 		}
 	}
 	return nil
@@ -1864,11 +2040,14 @@ func comparePacketRefs(record PacketRef, trusted PacketRef) error {
 	if record.PromptDigest != trusted.PromptDigest || record.StableDigest != trusted.StableDigest || record.SemanticDedupeDigest != trusted.SemanticDedupeDigest {
 		return errors.New("result packet digest reference does not match packet object")
 	}
-	if record.VolatileDigest != "" && record.VolatileDigest != trusted.VolatileDigest {
+	if record.VolatileDigest != trusted.VolatileDigest {
 		return errors.New("result packet volatile digest reference does not match packet object")
 	}
 	if record.SourceCompleteness != trusted.SourceCompleteness {
 		return errors.New("result packet source completeness does not match packet object")
+	}
+	if record.TransitionKey != trusted.TransitionKey || !sameSourceDiffs(record.SourceDiffs, trusted.SourceDiffs) {
+		return errors.New("result packet transition reference does not match packet object")
 	}
 	if !samePolicyRef(record.Policy, trusted.Policy) {
 		return errors.New("result packet policy reference does not match packet object")
@@ -1882,7 +2061,58 @@ func comparePacketRefs(record PacketRef, trusted PacketRef) error {
 	if strings.Join(verificationFindingIDs(record), ",") != strings.Join(verificationFindingIDs(trusted), ",") {
 		return errors.New("result packet verification finding ids do not match packet object")
 	}
+	if !sameVerificationTargets(record.VerificationTargets, trusted.VerificationTargets) {
+		return errors.New("result packet verification target mappings do not match packet object")
+	}
 	return nil
+}
+
+func sameSourceDiffs(a, b []SourceDiff) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Transition != b[i].Transition ||
+			a[i].FromKind != b[i].FromKind ||
+			a[i].ToKind != b[i].ToKind ||
+			a[i].FromSnapshot != b[i].FromSnapshot ||
+			a[i].ToSnapshot != b[i].ToSnapshot ||
+			a[i].PatchDigest != b[i].PatchDigest ||
+			a[i].HasChanges != b[i].HasChanges ||
+			a[i].HunkCount != b[i].HunkCount ||
+			!sameObjectRef(a[i].Diff, b[i].Diff) ||
+			!sameObjectRef(a[i].Patch, b[i].Patch) ||
+			strings.Join(a[i].ChangedPaths, "\x00") != strings.Join(b[i].ChangedPaths, "\x00") {
+			return false
+		}
+	}
+	return true
+}
+
+func sameVerificationTargets(a, b []VerificationFindingTarget) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	left := append([]VerificationFindingTarget(nil), a...)
+	right := append([]VerificationFindingTarget(nil), b...)
+	sort.Slice(left, func(i, j int) bool {
+		if left[i].FindingID == left[j].FindingID {
+			return left[i].TransitionKey < left[j].TransitionKey
+		}
+		return left[i].FindingID < left[j].FindingID
+	})
+	sort.Slice(right, func(i, j int) bool {
+		if right[i].FindingID == right[j].FindingID {
+			return right[i].TransitionKey < right[j].TransitionKey
+		}
+		return right[i].FindingID < right[j].FindingID
+	})
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func samePolicyRef(a, b *PolicyRef) bool {

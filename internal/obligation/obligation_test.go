@@ -503,6 +503,34 @@ func TestStatusUsesLatestAnchorMigrationForActiveTransition(t *testing.T) {
 	}
 }
 
+func TestStatusNextActionsForFinalManifestReviewGaps(t *testing.T) {
+	manifest := CoverageManifest{
+		SourceDiffs: []TransitionDiff{
+			{Transition: "base->proposal", FromKind: "base", ToKind: "proposal", FromSnapshot: "sha256:base", ToSnapshot: "sha256:proposal"},
+			{Transition: "base->final", FromKind: "base", ToKind: "final", FromSnapshot: "sha256:base", ToSnapshot: "sha256:final"},
+		},
+	}
+	statuses := []ObligationStatus{
+		{Obligation: Obligation{ID: "proposal", Kind: KindChangedFile, Required: true, Transition: "base->proposal"}},
+		{Obligation: Obligation{ID: "final", Kind: KindChangedFile, Required: true, Transition: "base->final"}},
+	}
+	actions := statusNextActions("/tmp/subreview-state", manifest, nil, statuses)
+	proposal, ok := nextActionByCode(actions, "missing_proposal_review")
+	if !ok {
+		t.Fatalf("missing proposal action not found: %+v", actions)
+	}
+	if len(proposal.Command) != 0 {
+		t.Fatalf("proposal action should not invent a command after final manifest exists: %+v", proposal)
+	}
+	final, ok := nextActionByCode(actions, "build_final_review_packet")
+	if !ok {
+		t.Fatalf("missing final action not found: %+v", actions)
+	}
+	if got := strings.Join(final.Command, " "); got != "subreview packet build --state /tmp/subreview-state --kind primary" {
+		t.Fatalf("bad final command: %q", got)
+	}
+}
+
 func TestStatusDoesNotSupersedeDifferentAnchorOnSameTransition(t *testing.T) {
 	repo, stateDir := initializedReviewState(t)
 	writeObligationFile(t, repo, "ambiguous.txt", "dup\nstay\n")
@@ -775,6 +803,15 @@ func hasBlocker(blockers []Blocker, code string) bool {
 		}
 	}
 	return false
+}
+
+func nextActionByCode(actions []NextAction, code string) (NextAction, bool) {
+	for _, action := range actions {
+		if action.Code == code {
+			return action, true
+		}
+	}
+	return NextAction{}, false
 }
 
 func containsString(values []string, want string) bool {

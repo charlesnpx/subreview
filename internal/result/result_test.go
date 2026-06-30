@@ -39,6 +39,25 @@ func TestImportCleanPrimaryReviewSatisfiesCoverageStatus(t *testing.T) {
 	if !imported.PrimaryReviewEvidence || imported.FindingCount != 0 || imported.Result.Digest == "" {
 		t.Fatalf("bad import result: %+v", imported)
 	}
+	finalPacket, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary, Now: time.Unix(201, 0)})
+	if err != nil {
+		t.Fatalf("Build final packet: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: finalPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        finalPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable final findings.",
+		}),
+		Now: time.Unix(202, 0),
+	}); err != nil {
+		t.Fatalf("Import final clean result: %v", err)
+	}
 	status, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
 	if err != nil {
 		t.Fatalf("Status: %v", err)
@@ -183,7 +202,7 @@ func TestObservationsRejectStoredResultPacketMismatch(t *testing.T) {
 	}
 }
 
-func TestObservationsAcceptLegacyResultWithoutVolatileDigest(t *testing.T) {
+func TestObservationsRejectResultWithoutVolatileDigest(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	imported, err := reviewresult.Import(reviewresult.ImportOptions{
 		StateDir: stateDir,
@@ -243,11 +262,8 @@ func TestObservationsAcceptLegacyResultWithoutVolatileDigest(t *testing.T) {
 	}
 	events := readEvents(t, stateDir)
 	observations, err := reviewresult.Observations(store, events, events[0].Repo)
-	if err != nil {
-		t.Fatalf("Observations should accept legacy missing volatile digest: %v", err)
-	}
-	if len(observations) == 0 || observations[0].Digest != legacy.Digest {
-		t.Fatalf("expected latest legacy observation first, got %+v", observations)
+	if err == nil {
+		t.Fatalf("observations should reject result missing volatile digest, got %+v", observations)
 	}
 }
 
@@ -1119,6 +1135,32 @@ func TestVerificationPacketDoesNotCarryFindingAcrossPolicy(t *testing.T) {
 	}
 	if _, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindVerification, FindingID: "old-policy-finding"}); err == nil {
 		t.Fatal("verification packet should not carry finding from a different policy")
+	}
+}
+
+func TestVerificationPacketRejectsFinalTargetFinding(t *testing.T) {
+	_, stateDir, _, _ := initializedResultState(t)
+	finalPacket, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary, Now: time.Unix(242, 1)})
+	if err != nil {
+		t.Fatalf("Build final primary packet: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: finalPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        finalPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings:      []reviewresult.FindingInput{validFinding("final-target-finding")},
+		}),
+		Now: time.Unix(242, 2),
+	}); err != nil {
+		t.Fatalf("Import final-target finding: %v", err)
+	}
+	if _, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindVerification, FindingID: "final-target-finding"}); err == nil {
+		t.Fatal("targeted verification should reject final-target findings")
 	}
 }
 
@@ -2080,6 +2122,25 @@ func TestArtifactResultsDoNotAffectCodeReviewClosure(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Import clean primary: %v", err)
 	}
+	finalPacket, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary, Now: time.Unix(311, 1)})
+	if err != nil {
+		t.Fatalf("Build clean final packet: %v", err)
+	}
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: finalPacket.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        finalPacket.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable final code findings.",
+		}),
+		Now: time.Unix(311, 2),
+	}); err != nil {
+		t.Fatalf("Import clean final primary: %v", err)
+	}
 	before, err := obligation.Status(obligation.StatusOptions{StateDir: stateDir})
 	if err != nil {
 		t.Fatalf("Status before artifact result: %v", err)
@@ -2119,8 +2180,13 @@ func TestArtifactResultsDoNotAffectCodeReviewClosure(t *testing.T) {
 		t.Fatalf("artifact finding should not reopen code obligations: %+v", after.Blockers)
 	}
 	observations := readObservations(t, stateDir)
-	if len(observations) != 1 || observations[0].Record.Route != reviewresult.RoutePrimaryReview {
-		t.Fatalf("code observations should exclude artifact result: %+v", observations)
+	if len(observations) != 2 {
+		t.Fatalf("code observations should include proposal/final reviews only: %+v", observations)
+	}
+	for _, observation := range observations {
+		if observation.Record.Route != reviewresult.RoutePrimaryReview {
+			t.Fatalf("code observations should exclude artifact result: %+v", observations)
+		}
 	}
 }
 
@@ -2149,6 +2215,13 @@ func initializedResultState(t *testing.T) (string, string, packet.BuildResult, o
 	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
 		t.Fatalf("CreateDiff base->proposal: %v", err)
 	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build proposal obligations: %v", err)
+	}
+	builtPacket, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary, Now: time.Unix(110, 0)})
+	if err != nil {
+		t.Fatalf("Build proposal packet: %v", err)
+	}
 	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
 		t.Fatalf("Capture final: %v", err)
 	}
@@ -2161,10 +2234,6 @@ func initializedResultState(t *testing.T) (string, string, packet.BuildResult, o
 	builtObligations, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir})
 	if err != nil {
 		t.Fatalf("Build obligations: %v", err)
-	}
-	builtPacket, err := packet.Build(packet.BuildOptions{StateDir: stateDir, Kind: packet.KindPrimary, Now: time.Unix(110, 0)})
-	if err != nil {
-		t.Fatalf("Build packet: %v", err)
 	}
 	store, err := state.Open(stateDir)
 	if err != nil {
@@ -2411,6 +2480,14 @@ func satisfiedByKind(status obligation.ObligationStatus, kind string) bool {
 
 func firstCoverageObligationID(t *testing.T, manifest obligation.CoverageManifest) string {
 	t.Helper()
+	for _, item := range manifest.Obligations {
+		if item.Transition == "base->proposal" {
+			switch item.Kind {
+			case obligation.KindChangedHunk, obligation.KindChangedFile, obligation.KindChangedPath:
+				return item.ID
+			}
+		}
+	}
 	for _, item := range manifest.Obligations {
 		if item.Kind == obligation.KindChangedHunk || item.Kind == obligation.KindChangedFile || item.Kind == obligation.KindChangedPath {
 			return item.ID

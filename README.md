@@ -59,13 +59,44 @@ The installed skills are intentionally thin. They tell agents to invoke the CLI,
 
 `subreview gates check-catalog` validates an operator-authored trusted gate catalog and reports each command digest. Command ids use `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`; `:` is not valid. Required policy gate requirements include the expected `command_digest`, and policy `command_catalog` entries are derived from those gate requirements. `subreview gates run` executes only catalog command ids and stores CLI-witnessed gate evidence bound to the current policy and input snapshot. `subreview gates record` stores externally asserted gate evidence without executing commands. Gate evidence records replay class, environment pinning, repo-code execution, side-effect class, provenance, command digest, snapshot digest, outcome, and concise diagnostics, and stored evidence is validated against its ledger event and embedded catalog command before it is consumed. `subreview obligations status` consumes passing gate evidence for gate-requirement obligations and reports failed required gates as review blockers.
 
-`subreview obligations build` creates a CAS-backed coverage manifest from captured base-to-proposal and base-to-final diffs plus the bound policy. The manifest records hunk, file, path, gate-requirement, context-request placeholder, and policy-final-review obligations. `subreview obligations status` reports unsatisfied evidence slots and explicit blockers for missing gate evidence, missing review evidence, unresolved context, unresolved anchors, hidden final-state scope, and unsatisfied required checks.
+`subreview obligations build` creates a CAS-backed coverage manifest from captured base-to-proposal and base-to-final diffs plus the bound policy. The manifest records hunk, file, path, gate-requirement, context-request placeholder, and policy-final-review obligations. `subreview obligations status` reports unsatisfied evidence slots, `next_actions`, and explicit blockers for missing gate evidence, missing review evidence, unresolved context, unresolved anchors, hidden final-state scope, stale evidence, and unsatisfied required checks.
 
-`subreview packet build --kind primary` creates a CAS-backed primary review packet and Markdown prompt from the latest coverage manifest. Use `--max-context-bytes <n>` to raise or lower the packet context budget up to 262144 bytes; programmatic `MaxContextBytes == 0` keeps the default. `subreview packet build --kind verification --finding <id>` creates a finding-targeted proposal-to-final verification packet when proposal and final snapshots plus a proposal-to-final diff are captured. Repeat `--finding` to build one verification packet for multiple findings; batch packets store `verification.findings[]` and sorted `verification.finding_ids[]`, while singleton packets also keep the legacy `finding_id` fields. Packets separate stable prefix and volatile suffix digests, include semantic dedupe keys, run-kind and route metadata, leakage checks for replay/evaluation labels, compact selected context, explicit omissions, and token telemetry fields for later worker result import.
+`subreview packet build --kind primary` creates a CAS-backed primary review packet and Markdown prompt from the latest coverage manifest. Proposal-only manifests target the `base->proposal` transition. Once the manifest includes `base->final`, primary packets target `base->final`; matching proposal review evidence is carried by transition key, not by coverage-manifest digest. Use `--max-context-bytes <n>` to raise or lower the packet context budget up to 262144 bytes; programmatic `MaxContextBytes == 0` keeps the default. Bounded context can still omit relevant source, so reviewers may return `needs_context` and the loop must rebuild/import rather than treating the packet as complete. `subreview packet build --kind verification --finding <id>` creates a proposal-finding-targeted proposal-to-final verification packet when proposal and final snapshots plus a proposal-to-final diff are captured. Repeat `--finding` to build one verification packet for multiple proposal findings; final-target findings are not accepted by targeted verification. Batch packets store `verification.findings[]` and sorted `verification.finding_ids[]`, while singleton packets also keep the legacy `finding_id` fields. Packets separate stable prefix and volatile suffix digests, include semantic dedupe keys, run-kind and route metadata, leakage checks for replay/evaluation labels, compact selected context, explicit omissions, and token telemetry fields for later worker result import.
 
 `subreview result validate --json` checks a bounded structured worker result against the same packet resolution, strict JSON decode, normalization, and targeted-verification rules used by import, without writing CAS objects or ledger events. Invalid validation output is compact JSON on stdout and exits non-zero. `subreview result import` ingests a validated structured worker result for a built packet. It normalizes clean reviews, findings, context requests, verifier outcomes, deterministic refutations, and token telemetry into CAS, deduplicates findings, records lifecycle states, and lets `subreview obligations status` consume primary-review and deterministic-refutation evidence without treating open findings as closed. Stored result records re-resolve the trusted packet object from `packet.built` ledger events before they are consumed.
 
-`subreview close` evaluates final-state closure from the latest ledger evidence and the requested bound policy profile. It persists a `closure.evaluated` report object and reports closure facts, blockers, gates, findings, discovery runs, verification runs, measured discovery/verification tokens, estimated full-cycle tokens when telemetry is available, and anti-thrash scheduler status. Closure succeeds only when the obligation engine has satisfied required gates, coverage obligations, context requests, active finding lifecycle requirements, and policy-triggered final review predicates; a clean primary reviewer response alone is not sufficient.
+`subreview close` evaluates final-state closure from the latest ledger evidence and the requested bound policy profile. It persists a `closure.evaluated` report object and reports closure facts, blockers, `next_actions`, gates, findings, discovery runs, verification runs, measured discovery/verification tokens, estimated full-cycle tokens when telemetry is available, and anti-thrash scheduler status. Closure succeeds only when the obligation engine has satisfied required gates, proposal coverage, final coverage, context requests, active finding lifecycle requirements, and policy-triggered final review predicates; a clean primary reviewer response alone is not sufficient. A final-target primary review satisfies `independent_final_completed`, but it does not satisfy stronger facts such as `fresh_blinded_review` or `cli_witnessed`; unsupported stronger facts are reported as no-command next actions.
+
+## Code-review workflow
+
+A typical final-manifest workflow is:
+
+```sh
+subreview state init --state /tmp/subreview-state --repo . --json
+subreview policy bind --state /tmp/subreview-state --config /tmp/policy.json --profile default --json
+subreview snapshot capture --state /tmp/subreview-state --kind base --repo . --ref HEAD --json
+subreview snapshot capture --state /tmp/subreview-state --kind proposal --repo . --json
+subreview diff create --state /tmp/subreview-state --from base --to proposal --json
+subreview obligations build --state /tmp/subreview-state --json
+subreview packet build --state /tmp/subreview-state --kind primary --json
+# Run the external subagent on the proposal primary packet, then import its structured result.
+subreview result import --state /tmp/subreview-state --packet sha256:... --result /tmp/proposal-result.json --json
+
+subreview snapshot capture --state /tmp/subreview-state --kind final --repo . --json
+subreview diff create --state /tmp/subreview-state --from base --to final --json
+subreview diff create --state /tmp/subreview-state --from proposal --to final --json
+subreview obligations build --state /tmp/subreview-state --json
+subreview gates run --state /tmp/subreview-state --catalog /tmp/gates.json --command-id go_test_all --snapshot final --json
+subreview packet build --state /tmp/subreview-state --kind primary --json
+# Run the external subagent on the final primary packet, then import its structured result.
+subreview result import --state /tmp/subreview-state --packet sha256:... --result /tmp/final-result.json --json
+subreview packet build --state /tmp/subreview-state --kind verification --finding finding-123 --json
+# Run the external verifier on the verification packet, then import its structured result.
+subreview result import --state /tmp/subreview-state --packet sha256:... --result /tmp/verification-result.json --json
+subreview close --state /tmp/subreview-state --policy-profile default --json
+```
+
+`subreview` records state and produces packets; it does not spawn or supervise subagents. The operator runs the actual reviewer/verifier through external tooling and imports the structured result.
 
 ## Standalone artifact review
 

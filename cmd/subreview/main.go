@@ -237,6 +237,7 @@ func closeCommand(args []string) error {
 		status = "closed"
 	}
 	fmt.Printf("closure %s: %d blockers report=%s\n", status, len(result.Blockers), result.Report.Digest)
+	printClosureNextActions(result.NextActions)
 	return nil
 }
 
@@ -635,6 +636,7 @@ func obligationsStatus(args []string) error {
 		return writeJSON(result)
 	}
 	fmt.Printf("obligations status: %d unsatisfied, %d blockers\n", result.UnsatisfiedCount, len(result.Blockers))
+	printObligationNextActions(result.NextActions)
 	return nil
 }
 
@@ -1194,6 +1196,40 @@ func writeCompactJSON(v any) error {
 	}
 	_, err = fmt.Fprintln(os.Stdout, string(body))
 	return err
+}
+
+func printObligationNextActions(actions []obligation.NextAction) {
+	for _, action := range firstObligationActions(actions, 3) {
+		printNextAction(action.Code, action.Message, action.Command)
+	}
+}
+
+func printClosureNextActions(actions []closure.NextAction) {
+	for _, action := range firstClosureActions(actions, 3) {
+		printNextAction(action.Code, action.Message, action.Command)
+	}
+}
+
+func printNextAction(code, message string, command []string) {
+	if len(command) > 0 {
+		fmt.Printf("next: %s: %s (%s)\n", code, message, strings.Join(command, " "))
+		return
+	}
+	fmt.Printf("next: %s: %s\n", code, message)
+}
+
+func firstObligationActions(actions []obligation.NextAction, limit int) []obligation.NextAction {
+	if len(actions) <= limit {
+		return actions
+	}
+	return actions[:limit]
+}
+
+func firstClosureActions(actions []closure.NextAction, limit int) []closure.NextAction {
+	if len(actions) <= limit {
+		return actions
+	}
+	return actions[:limit]
 }
 
 type stringListFlag struct {

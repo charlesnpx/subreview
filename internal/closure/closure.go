@@ -46,6 +46,7 @@ type Result struct {
 	Runs          RunFacts        `json:"runs"`
 	Tokens        TokenFacts      `json:"tokens"`
 	Scheduler     SchedulerFacts  `json:"scheduler"`
+	NextActions   []NextAction    `json:"next_actions,omitempty"`
 }
 
 type Report struct {
@@ -65,6 +66,7 @@ type Report struct {
 	Runs          RunFacts        `json:"runs"`
 	Tokens        TokenFacts      `json:"tokens"`
 	Scheduler     SchedulerFacts  `json:"scheduler"`
+	NextActions   []NextAction    `json:"next_actions,omitempty"`
 }
 
 type Facts struct {
@@ -92,6 +94,12 @@ type Blocker struct {
 	Status       string `json:"status,omitempty"`
 	Transition   string `json:"transition,omitempty"`
 	Path         string `json:"path,omitempty"`
+}
+
+type NextAction struct {
+	Code    string   `json:"code"`
+	Message string   `json:"message"`
+	Command []string `json:"command,omitempty"`
 }
 
 type ObligationFacts struct {
@@ -149,14 +157,15 @@ type FindingBlocker struct {
 }
 
 type RunFacts struct {
-	DiscoveryRuns          int            `json:"discovery_runs"`
-	VerificationRuns       int            `json:"verification_runs"`
-	PrimaryRuns            int            `json:"primary_runs"`
-	IndependentFinalRuns   int            `json:"independent_final_runs"`
-	TargetedVerifications  int            `json:"targeted_verifications"`
-	CompactFreshVerifies   int            `json:"compact_fresh_verifications"`
-	ContextExpansionRounds int            `json:"context_expansion_rounds"`
-	ByRoute                map[string]int `json:"by_route"`
+	DiscoveryRuns                      int            `json:"discovery_runs"`
+	VerificationRuns                   int            `json:"verification_runs"`
+	PrimaryRuns                        int            `json:"primary_runs"`
+	PrimarySemanticReviewsByTransition map[string]int `json:"primary_semantic_reviews_by_transition"`
+	IndependentFinalRuns               int            `json:"independent_final_runs"`
+	TargetedVerifications              int            `json:"targeted_verifications"`
+	CompactFreshVerifies               int            `json:"compact_fresh_verifications"`
+	ContextExpansionRounds             int            `json:"context_expansion_rounds"`
+	ByRoute                            map[string]int `json:"by_route"`
 }
 
 type TokenFacts struct {
@@ -194,10 +203,12 @@ type SchedulerFacts struct {
 }
 
 type SchedulerObserved struct {
-	PrimarySemanticReviews int `json:"primary_semantic_reviews"`
-	TargetedVerifications  int `json:"targeted_verifications"`
-	FreshFinalReviews      int `json:"fresh_final_reviews"`
-	ContextExpansionRounds int `json:"context_expansion_rounds"`
+	PrimarySemanticReviews             int            `json:"primary_semantic_reviews"`
+	PrimarySemanticReviewsTotal        int            `json:"primary_semantic_reviews_total"`
+	PrimarySemanticReviewsByTransition map[string]int `json:"primary_semantic_reviews_by_transition"`
+	TargetedVerifications              int            `json:"targeted_verifications"`
+	FreshFinalReviews                  int            `json:"fresh_final_reviews"`
+	ContextExpansionRounds             int            `json:"context_expansion_rounds"`
 }
 
 type binding struct {
@@ -261,12 +272,12 @@ func Evaluate(opts EvaluateOptions) (Result, error) {
 		}
 	}
 
-	proposalDigest := proposalTargetDigest(manifest)
-	findingFacts := findingFacts(observations, status.Manifest.Digest, proposalDigest, policyDigest)
-	runFacts, tokens := runAndTokenFacts(observations, status.Manifest.Digest, proposalDigest, policyDigest)
+	transitionKeys := transitionKeysByTransition(manifest)
+	findingFacts := findingFacts(observations, transitionKeys, policyDigest)
+	runFacts, tokens := runAndTokenFacts(observations, transitionKeys, policyDigest)
 	obligationFacts := obligationFacts(status)
 	gateFacts := gateFacts(gateEvidence, obligationFacts.RequiredGateCount)
-	facts := factsFromEvidence(status, manifest, observations, status.Manifest.Digest, proposalDigest, policyDigest, findingFacts)
+	facts := factsFromEvidence(status, manifest, observations, transitionKeys, status.Manifest.Digest, policyDigest, findingFacts)
 	scheduler := schedulerFacts(effective, runFacts)
 	if scheduler.OverLimit {
 		blockers = append(blockers, Blocker{
@@ -279,6 +290,7 @@ func Evaluate(opts EvaluateOptions) (Result, error) {
 	closed := status.Closed && facts.PolicyBound && len(blockers) == 0
 
 	sortBlockers(blockers)
+	nextActions := closureNextActions(bind.State, effective, blockers, status.NextActions)
 	report := Report{
 		SchemaVersion: SchemaVersion,
 		State:         bind.State,
@@ -296,6 +308,7 @@ func Evaluate(opts EvaluateOptions) (Result, error) {
 		Runs:          runFacts,
 		Tokens:        tokens,
 		Scheduler:     scheduler,
+		NextActions:   nextActions,
 	}
 	reportRef, err := store.PutJSON(report, MediaTypeReport)
 	if err != nil {
@@ -336,6 +349,7 @@ func Evaluate(opts EvaluateOptions) (Result, error) {
 		Runs:          runFacts,
 		Tokens:        tokens,
 		Scheduler:     scheduler,
+		NextActions:   nextActions,
 	}, nil
 }
 
@@ -380,21 +394,25 @@ func readEffectivePolicy(store state.Store, manifest obligation.CoverageManifest
 	return policy.DecodeBoundEffectivePolicy(body, manifest.Policy.Profile, manifest.Repo, manifest.Policy.PolicyID)
 }
 
-func factsFromEvidence(status obligation.StatusResult, manifest obligation.CoverageManifest, observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string, findings FindingFacts) Facts {
-	_, hasPrimary := reviewresult.LatestPrimaryReviewForManifest(observations, manifestDigest)
-	if !hasPrimary && proposalDigest != "" {
-		_, hasPrimary = reviewresult.LatestPrimaryReviewForTargetState(observations, proposalDigest, policyDigest)
+func factsFromEvidence(status obligation.StatusResult, manifest obligation.CoverageManifest, observations []reviewresult.EvidenceObservation, transitionKeys map[string]string, manifestDigest, policyDigest string, findings FindingFacts) Facts {
+	hasPrimary := false
+	for _, key := range transitionKeys {
+		if _, ok := reviewresult.LatestPrimaryReviewForTransition(observations, key, policyDigest); ok {
+			hasPrimary = true
+			break
+		}
 	}
+	_, hasFinalPrimary := reviewresult.LatestPrimaryReviewForTransition(observations, transitionKeys["base->final"], policyDigest)
 	_, hasFinal := reviewresult.LatestIndependentFinalReviewForManifest(observations, manifestDigest)
-	evidence := evidenceFacts(observations, manifestDigest, proposalDigest, policyDigest)
+	evidence := evidenceFacts(observations, transitionKeys, policyDigest)
 	facts := Facts{
 		PolicyBound:                    manifest.Policy != nil,
 		RequiredGatesSatisfied:         obligationsSatisfied(status, obligation.KindGateRequirement),
 		PrimaryReviewCompleted:         hasPrimary,
 		BlockingFindingsVerified:       findings.OpenBlockingCount == 0,
 		CoverageObligationsSatisfied:   coverageSatisfied(status),
-		ContextRequestsResolved:        contextRequestsResolved(observations, manifestDigest, proposalDigest, policyDigest),
-		IndependentFinalCompleted:      hasFinal,
+		ContextRequestsResolved:        contextRequestsResolved(observations, transitionKeys, policyDigest),
+		IndependentFinalCompleted:      hasFinal || hasFinalPrimary,
 		FreshBlindedReview:             evidence.FreshBlindedReview,
 		CLIWitnessed:                   evidence.CLIWitnessed,
 		BasisClean:                     evidence.BasisClean,
@@ -406,29 +424,25 @@ func factsFromEvidence(status obligation.StatusResult, manifest obligation.Cover
 	return facts
 }
 
-func contextRequestsResolved(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string) bool {
-	for _, observation := range observations {
-		record := observation.Record
-		if record.Packet.CoverageManifest.Digest != manifestDigest || record.RunKind != reviewresult.RunKindDiscovery {
+func contextRequestsResolved(observations []reviewresult.EvidenceObservation, transitionKeys map[string]string, policyDigest string) bool {
+	for _, key := range transitionKeys {
+		observation, ok := reviewresult.LatestDiscoveryForTransition(observations, key, policyDigest)
+		if !ok {
 			continue
 		}
-		return record.Outcome != reviewresult.OutcomeNeedsContext && len(record.NeedsContext) == 0
-	}
-	if proposalDigest != "" {
-		observation, ok := reviewresult.LatestDiscoveryForTargetState(observations, proposalDigest, policyDigest)
-		if ok {
-			record := observation.Record
-			return record.Outcome != reviewresult.OutcomeNeedsContext && len(record.NeedsContext) == 0
+		record := observation.Record
+		if record.Outcome == reviewresult.OutcomeNeedsContext || len(record.NeedsContext) > 0 {
+			return false
 		}
 	}
 	return true
 }
 
-func evidenceFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string) Facts {
+func evidenceFacts(observations []reviewresult.EvidenceObservation, transitionKeys map[string]string, policyDigest string) Facts {
 	facts := Facts{}
 	for _, observation := range observations {
 		record := observation.Record
-		if !closureObservationApplies(record, manifestDigest, proposalDigest, policyDigest) {
+		if !closureObservationApplies(record, transitionKeys, policyDigest) {
 			continue
 		}
 		if record.RunKind == reviewresult.RunKindDiscovery && record.Route == reviewresult.RoutePrimaryReview && record.Outcome == reviewresult.OutcomeClean {
@@ -454,26 +468,24 @@ func evidenceFacts(observations []reviewresult.EvidenceObservation, manifestDige
 	return facts
 }
 
-func closureObservationApplies(record reviewresult.ResultRecord, manifestDigest, proposalDigest, policyDigest string) bool {
-	if record.Packet.CoverageManifest.Digest == manifestDigest {
+func closureObservationApplies(record reviewresult.ResultRecord, transitionKeys map[string]string, policyDigest string) bool {
+	if !packetPolicyMatches(record.Packet.Policy, policyDigest) {
+		return false
+	}
+	keySet := transitionKeySet(transitionKeys)
+	if _, ok := keySet[record.Packet.TransitionKey]; ok {
 		return true
 	}
-	return record.Evidence.PrimaryReviewEvidence &&
-		proposalDigest != "" &&
-		record.Packet.TargetState.Kind == "proposal" &&
-		record.Packet.TargetState.Digest == proposalDigest &&
-		packetPolicyMatches(record.Packet.Policy, policyDigest)
+	for _, target := range record.Packet.VerificationTargets {
+		if _, ok := keySet[target.TransitionKey]; ok {
+			return true
+		}
+	}
+	return false
 }
 
-func closureRunObservationApplies(record reviewresult.ResultRecord, manifestDigest, proposalDigest, policyDigest string) bool {
-	if record.Packet.CoverageManifest.Digest == manifestDigest {
-		return true
-	}
-	return record.RunKind == reviewresult.RunKindDiscovery &&
-		proposalDigest != "" &&
-		record.Packet.TargetState.Kind == "proposal" &&
-		record.Packet.TargetState.Digest == proposalDigest &&
-		packetPolicyMatches(record.Packet.Policy, policyDigest)
+func closureRunObservationApplies(record reviewresult.ResultRecord, transitionKeys map[string]string, policyDigest string) bool {
+	return closureObservationApplies(record, transitionKeys, policyDigest)
 }
 
 func proposalTargetDigest(manifest obligation.CoverageManifest) string {
@@ -483,6 +495,40 @@ func proposalTargetDigest(manifest obligation.CoverageManifest) string {
 		}
 	}
 	return ""
+}
+
+func transitionKeysByTransition(manifest obligation.CoverageManifest) map[string]string {
+	keys := map[string]string{}
+	for _, diff := range manifest.SourceDiffs {
+		key := transitionKey(diff.FromKind, diff.ToKind, diff.FromSnapshot, diff.ToSnapshot)
+		if key == "" {
+			continue
+		}
+		keys[diff.Transition] = key
+	}
+	return keys
+}
+
+func transitionKeySet(transitionKeys map[string]string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, key := range transitionKeys {
+		out[key] = struct{}{}
+	}
+	return out
+}
+
+func transitionKey(fromKind, toKind, fromSnapshot, toSnapshot string) string {
+	parts := []string{
+		strings.TrimSpace(fromKind) + "->" + strings.TrimSpace(toKind),
+		strings.TrimSpace(fromSnapshot),
+		strings.TrimSpace(toSnapshot),
+	}
+	for _, part := range parts {
+		if part == "" || strings.Contains(part, "|") {
+			return ""
+		}
+	}
+	return strings.Join(parts, "|")
 }
 
 func packetPolicyMatches(policy *reviewresult.PolicyRef, policyDigest string) bool {
@@ -666,11 +712,11 @@ func gateFacts(evidence map[string][]gate.EvidenceObservation, requiredCount int
 	return facts
 }
 
-func findingFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string) FindingFacts {
+func findingFacts(observations []reviewresult.EvidenceObservation, transitionKeys map[string]string, policyDigest string) FindingFacts {
 	facts := FindingFacts{ActiveBlockingFindings: []FindingBlocker{}}
 	for _, observation := range observations {
 		record := observation.Record
-		if !closureRunObservationApplies(record, manifestDigest, proposalDigest, policyDigest) {
+		if !closureRunObservationApplies(record, transitionKeys, policyDigest) {
 			continue
 		}
 		for _, finding := range record.Findings {
@@ -681,7 +727,7 @@ func findingFacts(observations []reviewresult.EvidenceObservation, manifestDiges
 		facts.VerifierOutcomeCount += len(record.VerifierOutcomes)
 		facts.DeterministicRefutes += len(record.DeterministicRefutations)
 	}
-	blockers := reviewresult.ClosureFindingBlockers(observations, manifestDigest, proposalDigest, policyDigest)
+	blockers := reviewresult.ClosureFindingBlockersForTransitions(observations, transitionKeySet(transitionKeys), policyDigest)
 	facts.OpenBlockingCount = len(blockers)
 	for _, blocker := range blockers {
 		facts.ActiveBlockingFindings = append(facts.ActiveBlockingFindings, FindingBlocker{
@@ -697,12 +743,12 @@ func findingFacts(observations []reviewresult.EvidenceObservation, manifestDiges
 	return facts
 }
 
-func runAndTokenFacts(observations []reviewresult.EvidenceObservation, manifestDigest, proposalDigest, policyDigest string) (RunFacts, TokenFacts) {
-	runs := RunFacts{ByRoute: map[string]int{}}
+func runAndTokenFacts(observations []reviewresult.EvidenceObservation, transitionKeys map[string]string, policyDigest string) (RunFacts, TokenFacts) {
+	runs := RunFacts{ByRoute: map[string]int{}, PrimarySemanticReviewsByTransition: map[string]int{}}
 	tokens := TokenFacts{}
 	for _, observation := range observations {
 		record := observation.Record
-		if !closureRunObservationApplies(record, manifestDigest, proposalDigest, policyDigest) {
+		if !closureRunObservationApplies(record, transitionKeys, policyDigest) {
 			continue
 		}
 		runs.ByRoute[record.Route]++
@@ -719,6 +765,8 @@ func runAndTokenFacts(observations []reviewresult.EvidenceObservation, manifestD
 			runs.PrimaryRuns++
 			if record.RunKind == reviewresult.RunKindDiscovery && record.Outcome == reviewresult.OutcomeNeedsContext {
 				runs.ContextExpansionRounds++
+			} else if record.RunKind == reviewresult.RunKindDiscovery {
+				runs.PrimarySemanticReviewsByTransition[record.Packet.TransitionKey]++
 			}
 		case reviewresult.RouteIndependentFinal:
 			runs.IndependentFinalRuns++
@@ -771,15 +819,21 @@ func preferredGross(primary, fallback int) int {
 }
 
 func schedulerFacts(effective policy.EffectivePolicy, runs RunFacts) SchedulerFacts {
-	primarySemanticReviews := runs.PrimaryRuns - runs.ContextExpansionRounds
-	if primarySemanticReviews < 0 {
-		primarySemanticReviews = 0
+	primarySemanticReviews := 0
+	primarySemanticReviewsTotal := 0
+	for _, count := range runs.PrimarySemanticReviewsByTransition {
+		primarySemanticReviewsTotal += count
+		if count > primarySemanticReviews {
+			primarySemanticReviews = count
+		}
 	}
 	observed := SchedulerObserved{
-		PrimarySemanticReviews: primarySemanticReviews,
-		TargetedVerifications:  runs.TargetedVerifications,
-		FreshFinalReviews:      runs.IndependentFinalRuns,
-		ContextExpansionRounds: runs.ContextExpansionRounds,
+		PrimarySemanticReviews:             primarySemanticReviews,
+		PrimarySemanticReviewsTotal:        primarySemanticReviewsTotal,
+		PrimarySemanticReviewsByTransition: copyStringIntMap(runs.PrimarySemanticReviewsByTransition),
+		TargetedVerifications:              runs.TargetedVerifications,
+		FreshFinalReviews:                  runs.IndependentFinalRuns,
+		ContextExpansionRounds:             runs.ContextExpansionRounds,
 	}
 	facts := SchedulerFacts{
 		PolicyRouteLimits: effective.RouteLimits,
@@ -801,6 +855,80 @@ func schedulerFacts(effective policy.EffectivePolicy, runs RunFacts) SchedulerFa
 	facts.OverLimit = len(facts.Violations) > 0
 	facts.AntiThrashOK = !facts.OverLimit
 	return facts
+}
+
+func closureNextActions(stateDir string, effective policy.EffectivePolicy, blockers []Blocker, obligationActions []obligation.NextAction) []NextAction {
+	seen := map[string]struct{}{}
+	actions := []NextAction{}
+	add := func(action NextAction) {
+		if action.Code == "" {
+			return
+		}
+		key := action.Code + "\x00" + action.Message + "\x00" + strings.Join(action.Command, "\x00")
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		actions = append(actions, action)
+	}
+	for _, action := range obligationActions {
+		add(NextAction{Code: action.Code, Message: action.Message, Command: append([]string(nil), action.Command...)})
+	}
+	for _, blocker := range blockers {
+		switch blocker.Code {
+		case "unsatisfied_policy_fact":
+			switch blocker.Status {
+			case "fresh_blinded_review", "cli_witnessed":
+				add(NextAction{
+					Code:    "unsupported_policy_fact",
+					Message: "The current controller cannot produce required policy fact " + blocker.Status + "; use a supported policy or record legacy evidence externally.",
+				})
+			case "independent_final_completed":
+				add(NextAction{
+					Code:    "build_final_review_packet",
+					Message: "Build a final primary review packet and import its result.",
+					Command: []string{"subreview", "packet", "build", "--state", stateDir, "--kind", "primary"},
+				})
+			case "coverage_obligations_satisfied":
+				add(NextAction{
+					Code:    "check_obligation_status",
+					Message: "Inspect obligation status for missing review, verification, gate, or stale evidence.",
+					Command: []string{"subreview", "obligations", "status", "--state", stateDir},
+				})
+			}
+		case "scheduler_route_limit_exceeded":
+			add(NextAction{
+				Code:    "route_limit_exceeded",
+				Message: "Start a new artifact/manifest cycle or adjust policy route limits before closing.",
+			})
+		case "unsatisfied_closure_basis":
+			add(NextAction{
+				Code:    "missing_closure_basis",
+				Message: "Import evidence for one allowed closure basis: " + strings.Join(effective.ClosureBasis.AllowedBasis, ", ") + ".",
+			})
+		case "policy_profile_mismatch", "policy_bound_missing":
+			add(NextAction{
+				Code:    "rebuild_coverage_manifest",
+				Message: "Bind the intended policy and rebuild obligations before closing.",
+				Command: []string{"subreview", "obligations", "build", "--state", stateDir},
+			})
+		}
+	}
+	sort.Slice(actions, func(i, j int) bool {
+		if actions[i].Code == actions[j].Code {
+			return actions[i].Message < actions[j].Message
+		}
+		return actions[i].Code < actions[j].Code
+	})
+	return actions
+}
+
+func copyStringIntMap(input map[string]int) map[string]int {
+	out := map[string]int{}
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
 }
 
 func coverageSatisfied(status obligation.StatusResult) bool {

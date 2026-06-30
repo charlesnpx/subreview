@@ -1073,17 +1073,8 @@ func TestResultImportCLI(t *testing.T) {
 	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "proposal", "--json").CombinedOutput(); err != nil {
 		t.Fatalf("diff base->proposal failed: %v\n%s", err, out)
 	}
-	if out, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "final", "--repo", repo, "--json").CombinedOutput(); err != nil {
-		t.Fatalf("snapshot final failed: %v\n%s", err, out)
-	}
-	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "final", "--json").CombinedOutput(); err != nil {
-		t.Fatalf("diff base->final failed: %v\n%s", err, out)
-	}
-	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "proposal", "--to", "final", "--json").CombinedOutput(); err != nil {
-		t.Fatalf("diff proposal->final failed: %v\n%s", err, out)
-	}
 	if out, err := exec.Command(bin, "obligations", "build", "--state", stateDir, "--json").CombinedOutput(); err != nil {
-		t.Fatalf("obligations build failed: %v\n%s", err, out)
+		t.Fatalf("proposal obligations build failed: %v\n%s", err, out)
 	}
 	packetOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "primary", "--json").CombinedOutput()
 	if err != nil {
@@ -1154,6 +1145,18 @@ func TestResultImportCLI(t *testing.T) {
 	}
 	if findingResult.FindingCount != 1 || findingResult.AcceptedFindingCount != 1 {
 		t.Fatalf("bad finding result import: %s", findingOut)
+	}
+	if out, err := exec.Command(bin, "snapshot", "capture", "--state", stateDir, "--kind", "final", "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("snapshot final failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "base", "--to", "final", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("diff base->final failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "diff", "create", "--state", stateDir, "--from", "proposal", "--to", "final", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("diff proposal->final failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(bin, "obligations", "build", "--state", stateDir, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("final obligations build failed: %v\n%s", err, out)
 	}
 	verificationOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "verification", "--finding", "finding-cli", "--json").CombinedOutput()
 	if err != nil {
@@ -1345,6 +1348,31 @@ func TestCloseCLIEndToEndSmoke(t *testing.T) {
 	if out, err := exec.Command(bin, "gates", "run", "--state", stateDir, "--catalog", catalogPath, "--command-id", "go_test_all", "--snapshot", "final", "--json").CombinedOutput(); err != nil {
 		t.Fatalf("final gate run failed: %v\n%s", err, out)
 	}
+	finalPacketOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "primary", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("final primary packet build failed: %v\n%s", err, finalPacketOut)
+	}
+	var finalPrimary struct {
+		Packet struct {
+			Digest string `json:"digest"`
+		} `json:"packet"`
+	}
+	if err := json.Unmarshal(finalPacketOut, &finalPrimary); err != nil {
+		t.Fatalf("final primary packet output is not json: %v\n%s", err, finalPacketOut)
+	}
+	if finalPrimary.Packet.Digest == "" {
+		t.Fatalf("missing final primary packet digest: %s", finalPacketOut)
+	}
+	if out, err := exec.Command(bin, "result", "import", "--state", stateDir, "--packet", finalPrimary.Packet.Digest, "--result", writeCLIWorkerResult(t, reviewresult.WorkerResult{
+		SchemaVersion: reviewresult.SchemaVersion,
+		Packet:        finalPrimary.Packet.Digest,
+		RunKind:       reviewresult.RunKindDiscovery,
+		Route:         reviewresult.RoutePrimaryReview,
+		Outcome:       reviewresult.OutcomeClean,
+		Summary:       "No additional final-state findings.",
+	}), "--json").CombinedOutput(); err != nil {
+		t.Fatalf("final primary result import failed: %v\n%s", err, out)
+	}
 	verificationOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "verification", "--finding", "finding-close", "--json").CombinedOutput()
 	if err != nil {
 		t.Fatalf("verification packet build failed: %v\n%s", err, verificationOut)
@@ -1447,7 +1475,7 @@ func TestCloseCLIEndToEndSmoke(t *testing.T) {
 	if closeResult.Gates.RequiredCount != 1 || closeResult.Gates.PassCount != 2 || closeResult.Findings.AcceptedCount != 1 || closeResult.Findings.OpenBlockingCount != 0 {
 		t.Fatalf("bad gate/finding report: %s", closeOut)
 	}
-	if closeResult.Runs.DiscoveryRuns != 1 || closeResult.Runs.VerificationRuns != 1 || closeResult.Runs.PrimaryRuns != 1 || closeResult.Runs.TargetedVerifications != 1 {
+	if closeResult.Runs.DiscoveryRuns != 2 || closeResult.Runs.VerificationRuns != 1 || closeResult.Runs.PrimaryRuns != 2 || closeResult.Runs.TargetedVerifications != 1 {
 		t.Fatalf("bad run report: %s", closeOut)
 	}
 	if !closeResult.Tokens.FullCycle.Available || closeResult.Tokens.FullCycle.IncrementalTokens != 275 || !closeResult.Scheduler.AntiThrashOK {

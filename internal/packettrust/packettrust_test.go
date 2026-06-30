@@ -38,6 +38,16 @@ func TestResolveEventRejectsMarkdownNotBuiltFromStableAndVolatile(t *testing.T) 
 	record.Repo = repo
 	record.CoverageManifest = state.ObjectRef{Digest: digestString("coverage")}
 	record.TargetState = SnapshotRef{Kind: "proposal", Digest: digestString("target")}
+	record.SourceDiffs = []SourceDiff{{
+		Transition:   "base->proposal",
+		FromKind:     "base",
+		ToKind:       "proposal",
+		FromSnapshot: digestString("base"),
+		ToSnapshot:   record.TargetState.Digest,
+		Patch:        state.ObjectRef{Digest: digestString("patch")},
+		PatchDigest:  digestString("patch"),
+	}}
+	record.TransitionKey = TransitionKey("base", "proposal", record.SourceDiffs[0].FromSnapshot, record.SourceDiffs[0].ToSnapshot)
 	record.StablePrefix = stable
 	record.VolatileSuffix = volatile
 	record.StableDigest = digestString(stable)
@@ -65,6 +75,7 @@ func TestResolveEventRejectsMarkdownNotBuiltFromStableAndVolatile(t *testing.T) 
 			"volatile_digest":        record.VolatileDigest,
 			"prompt_digest":          record.PromptDigest,
 			"semantic_dedupe_digest": record.SemanticDedupeKey.Digest,
+			"transition_key":         record.TransitionKey,
 			"source_completeness":    record.SourceCompleteness,
 		},
 	}
@@ -103,6 +114,16 @@ func TestResolveEventRejectsMismatchedVerificationIDs(t *testing.T) {
 	record.Repo = repo
 	record.CoverageManifest = state.ObjectRef{Digest: digestString("coverage")}
 	record.TargetState = SnapshotRef{Kind: "final", Digest: digestString("target")}
+	record.SourceDiffs = []SourceDiff{{
+		Transition:   "proposal->final",
+		FromKind:     "proposal",
+		ToKind:       "final",
+		FromSnapshot: digestString("proposal"),
+		ToSnapshot:   record.TargetState.Digest,
+		Patch:        state.ObjectRef{Digest: digestString("patch")},
+		PatchDigest:  digestString("patch"),
+	}}
+	record.TransitionKey = TransitionKey("proposal", "final", record.SourceDiffs[0].FromSnapshot, record.SourceDiffs[0].ToSnapshot)
 	record.StablePrefix = stable
 	record.VolatileSuffix = volatile
 	record.StableDigest = digestString(stable)
@@ -134,6 +155,7 @@ func TestResolveEventRejectsMismatchedVerificationIDs(t *testing.T) {
 			"volatile_digest":        record.VolatileDigest,
 			"prompt_digest":          record.PromptDigest,
 			"semantic_dedupe_digest": record.SemanticDedupeKey.Digest,
+			"transition_key":         record.TransitionKey,
 			"source_completeness":    record.SourceCompleteness,
 			"finding_ids":            "finding-a,finding-b",
 		},

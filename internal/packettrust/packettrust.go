@@ -18,22 +18,25 @@ const SchemaVersion = 1
 const EventTypePacketBuilt = "packet.built"
 
 type Ref struct {
-	Digest                 string          `json:"digest"`
-	EventID                string          `json:"event_id"`
-	Kind                   string          `json:"kind"`
-	RunKind                string          `json:"run_kind"`
-	Route                  string          `json:"route"`
-	PromptDigest           string          `json:"prompt_digest"`
-	StableDigest           string          `json:"stable_digest"`
-	VolatileDigest         string          `json:"volatile_digest,omitempty"`
-	SemanticDedupeDigest   string          `json:"semantic_dedupe_digest"`
-	Policy                 *PolicyRef      `json:"policy,omitempty"`
-	Artifact               *PacketArtifact `json:"artifact,omitempty"`
-	CoverageManifest       state.ObjectRef `json:"coverage_manifest"`
-	TargetState            SnapshotRef     `json:"target_state"`
-	SourceCompleteness     string          `json:"source_completeness"`
-	VerificationFindingID  string          `json:"verification_finding_id,omitempty"`
-	VerificationFindingIDs []string        `json:"verification_finding_ids,omitempty"`
+	Digest                 string                      `json:"digest"`
+	EventID                string                      `json:"event_id"`
+	Kind                   string                      `json:"kind"`
+	RunKind                string                      `json:"run_kind"`
+	Route                  string                      `json:"route"`
+	PromptDigest           string                      `json:"prompt_digest"`
+	StableDigest           string                      `json:"stable_digest"`
+	VolatileDigest         string                      `json:"volatile_digest"`
+	SemanticDedupeDigest   string                      `json:"semantic_dedupe_digest"`
+	Policy                 *PolicyRef                  `json:"policy,omitempty"`
+	Artifact               *PacketArtifact             `json:"artifact,omitempty"`
+	CoverageManifest       state.ObjectRef             `json:"coverage_manifest"`
+	TargetState            SnapshotRef                 `json:"target_state"`
+	SourceDiffs            []SourceDiff                `json:"source_diffs"`
+	TransitionKey          string                      `json:"transition_key"`
+	SourceCompleteness     string                      `json:"source_completeness"`
+	VerificationFindingID  string                      `json:"verification_finding_id,omitempty"`
+	VerificationFindingIDs []string                    `json:"verification_finding_ids,omitempty"`
+	VerificationTargets    []VerificationFindingTarget `json:"verification_finding_targets,omitempty"`
 }
 
 type PolicyRef struct {
@@ -46,6 +49,25 @@ type SnapshotRef struct {
 	Kind   string `json:"kind"`
 	Digest string `json:"digest"`
 	Tree   string `json:"tree,omitempty"`
+}
+
+type SourceDiff struct {
+	Transition   string          `json:"transition"`
+	FromKind     string          `json:"from_kind"`
+	ToKind       string          `json:"to_kind"`
+	FromSnapshot string          `json:"from_snapshot"`
+	ToSnapshot   string          `json:"to_snapshot"`
+	Diff         state.ObjectRef `json:"diff"`
+	Patch        state.ObjectRef `json:"patch"`
+	PatchDigest  string          `json:"patch_digest"`
+	HasChanges   bool            `json:"has_changes"`
+	ChangedPaths []string        `json:"changed_paths"`
+	HunkCount    int             `json:"hunk_count"`
+}
+
+type VerificationFindingTarget struct {
+	FindingID     string `json:"finding_id"`
+	TransitionKey string `json:"transition_key"`
 }
 
 type PacketArtifact struct {
@@ -68,6 +90,8 @@ type packetRecord struct {
 	Artifact          *PacketArtifact `json:"artifact,omitempty"`
 	TargetState       SnapshotRef     `json:"target_state"`
 	CoverageManifest  state.ObjectRef `json:"coverage_manifest"`
+	SourceDiffs       []SourceDiff    `json:"source_diffs"`
+	TransitionKey     string          `json:"transition_key"`
 	StablePrefix      string          `json:"stable_prefix"`
 	VolatileSuffix    string          `json:"volatile_suffix"`
 	StableDigest      string          `json:"stable_digest"`
@@ -87,7 +111,8 @@ type verificationRecord struct {
 }
 
 type verificationFinding struct {
-	ID string `json:"id"`
+	ID                  string `json:"id"`
+	OriginTransitionKey string `json:"origin_transition_key,omitempty"`
 }
 
 func Resolve(store state.Store, events []state.Event, stateDir, repo, packetID string) (Ref, error) {
@@ -154,16 +179,14 @@ func validateRecord(record packetRecord, repo string) error {
 	if strings.TrimSpace(record.Kind) == "" || strings.TrimSpace(record.RunKind) == "" || strings.TrimSpace(record.Route) == "" {
 		return errors.New("packet kind, run_kind, and route are required")
 	}
-	if record.StableDigest == "" || record.PromptDigest == "" || record.SemanticDedupeKey.Digest == "" {
-		return errors.New("packet missing stable, prompt, or semantic digest")
+	if record.StableDigest == "" || record.VolatileDigest == "" || record.PromptDigest == "" || record.SemanticDedupeKey.Digest == "" || strings.TrimSpace(record.SourceCompleteness) == "" {
+		return errors.New("packet missing stable, volatile, prompt, semantic digest, or source_completeness")
 	}
 	if got := digestString(record.StablePrefix); got != record.StableDigest {
 		return fmt.Errorf("packet stable_digest mismatch: %s != %s", got, record.StableDigest)
 	}
-	if record.VolatileDigest != "" {
-		if got := digestString(record.VolatileSuffix); got != record.VolatileDigest {
-			return fmt.Errorf("packet volatile_digest mismatch: %s != %s", got, record.VolatileDigest)
-		}
+	if got := digestString(record.VolatileSuffix); got != record.VolatileDigest {
+		return fmt.Errorf("packet volatile_digest mismatch: %s != %s", got, record.VolatileDigest)
 	}
 	if record.Kind == "artifact" || record.Route == "artifact_review" {
 		if record.Kind != "artifact" || record.RunKind != "discovery" || record.Route != "artifact_review" {
@@ -176,6 +199,12 @@ func validateRecord(record packetRecord, repo string) error {
 	}
 	if record.CoverageManifest.Digest == "" || record.TargetState.Digest == "" {
 		return errors.New("packet missing coverage_manifest or target_state")
+	}
+	if len(record.SourceDiffs) == 0 || strings.TrimSpace(record.TransitionKey) == "" {
+		return errors.New("packet missing source_diffs or transition_key")
+	}
+	if expected := transitionKeyForSourceDiffs(record.SourceDiffs); expected == "" || record.TransitionKey != expected {
+		return errors.New("packet transition_key does not match source_diffs")
 	}
 	ids, err := validatedVerificationIDs(record.Verification)
 	if err != nil {
@@ -208,11 +237,14 @@ func validateEventConsistency(store state.Store, event state.Event, record packe
 	if event.Details["semantic_dedupe_digest"] != record.SemanticDedupeKey.Digest {
 		return errors.New("packet.built semantic_dedupe_digest mismatch")
 	}
-	if record.VolatileDigest != "" && event.Details["volatile_digest"] != record.VolatileDigest {
+	if event.Details["volatile_digest"] != record.VolatileDigest {
 		return errors.New("packet.built volatile_digest mismatch")
 	}
-	if sourceCompleteness := strings.TrimSpace(event.Details["source_completeness"]); sourceCompleteness != "" && sourceCompleteness != record.SourceCompleteness {
+	if event.Details["source_completeness"] != record.SourceCompleteness {
 		return errors.New("packet.built source_completeness mismatch")
+	}
+	if event.Details["transition_key"] != record.TransitionKey {
+		return errors.New("packet.built transition_key mismatch")
 	}
 	markdownDigest := strings.TrimSpace(event.Details["markdown"])
 	if markdownDigest == "" {
@@ -287,15 +319,71 @@ func refFromRecord(stateDir, digest, eventID string, record packetRecord) Ref {
 		Policy:                 copyPolicy(record.Policy),
 		Artifact:               copyArtifact(record.Artifact),
 		TargetState:            record.TargetState,
+		SourceDiffs:            copySourceDiffs(record.SourceDiffs),
+		TransitionKey:          record.TransitionKey,
 		SourceCompleteness:     record.SourceCompleteness,
 		VerificationFindingID:  legacyID,
 		VerificationFindingIDs: ids,
+		VerificationTargets:    verificationTargets(record.Verification),
 	}
 	if record.CoverageManifest.Digest != "" {
 		ref.CoverageManifest = record.CoverageManifest
 		ref.CoverageManifest.Path = ObjectPathBestEffort(stateDir, record.CoverageManifest.Digest)
 	}
 	return ref
+}
+
+func transitionKeyForSourceDiffs(sourceDiffs []SourceDiff) string {
+	if len(sourceDiffs) != 1 {
+		return ""
+	}
+	diff := sourceDiffs[0]
+	return TransitionKey(diff.FromKind, diff.ToKind, diff.FromSnapshot, diff.ToSnapshot)
+}
+
+func TransitionKey(fromKind, toKind, fromSnapshot, toSnapshot string) string {
+	parts := []string{
+		strings.TrimSpace(fromKind) + "->" + strings.TrimSpace(toKind),
+		strings.TrimSpace(fromSnapshot),
+		strings.TrimSpace(toSnapshot),
+	}
+	for _, part := range parts {
+		if part == "" || strings.Contains(part, "|") {
+			return ""
+		}
+	}
+	return strings.Join(parts, "|")
+}
+
+func verificationTargets(record *verificationRecord) []VerificationFindingTarget {
+	if record == nil {
+		return nil
+	}
+	targets := map[string]string{}
+	add := func(finding verificationFinding) {
+		id := strings.TrimSpace(finding.ID)
+		key := strings.TrimSpace(finding.OriginTransitionKey)
+		if id == "" || key == "" {
+			return
+		}
+		targets[id] = key
+	}
+	if record.Finding != nil {
+		add(*record.Finding)
+	}
+	for _, finding := range record.Findings {
+		add(finding)
+	}
+	ids := make([]string, 0, len(targets))
+	for id := range targets {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]VerificationFindingTarget, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, VerificationFindingTarget{FindingID: id, TransitionKey: targets[id]})
+	}
+	return out
 }
 
 func verificationIDs(record *verificationRecord) []string {
@@ -404,6 +492,16 @@ func copyArtifact(artifact *PacketArtifact) *PacketArtifact {
 	}
 	ref := *artifact
 	return &ref
+}
+
+func copySourceDiffs(sourceDiffs []SourceDiff) []SourceDiff {
+	out := make([]SourceDiff, 0, len(sourceDiffs))
+	for _, diff := range sourceDiffs {
+		copied := diff
+		copied.ChangedPaths = append([]string(nil), diff.ChangedPaths...)
+		out = append(out, copied)
+	}
+	return out
 }
 
 func ObjectPathBestEffort(stateDir, digest string) string {

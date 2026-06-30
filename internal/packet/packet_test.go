@@ -289,6 +289,31 @@ func TestBuildPrimaryPacketReportsContextBudgetOmissions(t *testing.T) {
 	}
 }
 
+func TestBuildPrimaryPacketTargetsFinalTransitionWhenManifestHasFinal(t *testing.T) {
+	repo, stateDir := initializedPacketState(t, "one\n", "one\ntwo\n")
+	writeFile(t, repo, "alpha.txt", "one\ntwo\nfinal\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build final obligations: %v", err)
+	}
+	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(100, 0)})
+	if err != nil {
+		t.Fatalf("Build final primary: %v", err)
+	}
+	if result.TargetState.Kind != "final" || !strings.HasPrefix(result.TransitionKey, "base->final|") {
+		t.Fatalf("primary should target base->final in final manifest: %+v", result)
+	}
+	record := readPacketRecord(t, stateDir, result.Packet.Digest)
+	if len(record.SourceDiffs) != 1 || record.SourceDiffs[0].Transition != "base->final" || record.TransitionKey != result.TransitionKey {
+		t.Fatalf("packet should include only final source diff: %+v", record.SourceDiffs)
+	}
+}
+
 func TestBuildRejectsPolicyRebindAfterCoverageManifest(t *testing.T) {
 	_, stateDir := initializedPacketState(t, "one\n", "one\ntwo\n")
 	if _, err := policy.Bind(policy.BindOptions{StateDir: stateDir, ConfigPath: writePolicyConfigWithID(t, t.TempDir(), "new-policy"), Profile: "default"}); err != nil {
@@ -805,7 +830,7 @@ func TestBuildPrimaryPacketFiltersStaleGateEvidence(t *testing.T) {
 }
 
 func TestBuildVerificationPacketUsesProposalFinalState(t *testing.T) {
-	_, stateDir, findingID := initializedVerificationPacketState(t, true)
+	_, stateDir, findingID, _ := initializedVerificationPacketState(t, true)
 	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindVerification, FindingID: findingID, Now: time.Unix(200, 0)})
 	if err != nil {
 		t.Fatalf("Build verification packet: %v", err)
@@ -839,11 +864,7 @@ func TestBuildVerificationPacketUsesProposalFinalState(t *testing.T) {
 }
 
 func TestBuildVerificationPacketSupportsBatchFindingIDs(t *testing.T) {
-	_, stateDir, firstID := initializedVerificationPacketState(t, true)
-	primary, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(205, 0)})
-	if err != nil {
-		t.Fatalf("Build follow-up primary packet: %v", err)
-	}
+	_, stateDir, firstID, primary := initializedVerificationPacketState(t, true)
 	secondID := "finding-beta"
 	if _, err := reviewresult.Import(reviewresult.ImportOptions{
 		StateDir: stateDir,
@@ -919,7 +940,7 @@ func TestBuildRejectsInvalidMaxContextBytes(t *testing.T) {
 }
 
 func TestBuildVerificationPacketRequiresProposalFinalDiff(t *testing.T) {
-	_, stateDir, findingID := initializedVerificationPacketState(t, false)
+	_, stateDir, findingID, _ := initializedVerificationPacketState(t, false)
 	_, err := Build(BuildOptions{StateDir: stateDir, Kind: KindVerification, FindingID: findingID, Now: time.Unix(200, 0)})
 	if err == nil || !strings.Contains(err.Error(), "proposal->final diff") {
 		t.Fatalf("expected missing proposal->final diff error, got %v", err)
@@ -1112,7 +1133,7 @@ func initializedBinaryPacketState(t *testing.T) (string, string) {
 	return repo, stateDir
 }
 
-func initializedVerificationPacketState(t *testing.T, withProposalFinalDiff bool) (string, string, string) {
+func initializedVerificationPacketState(t *testing.T, withProposalFinalDiff bool) (string, string, string, BuildResult) {
 	t.Helper()
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
@@ -1138,24 +1159,12 @@ func initializedVerificationPacketState(t *testing.T, withProposalFinalDiff bool
 	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "proposal"}); err != nil {
 		t.Fatalf("CreateDiff base->proposal: %v", err)
 	}
-	writeFile(t, repo, "alpha.txt", "one\nfixed\n")
-	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
-		t.Fatalf("Capture final: %v", err)
-	}
-	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
-		t.Fatalf("CreateDiff base->final: %v", err)
-	}
-	if withProposalFinalDiff {
-		if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "proposal", ToKind: "final"}); err != nil {
-			t.Fatalf("CreateDiff proposal->final: %v", err)
-		}
-	}
 	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
-		t.Fatalf("Build obligations: %v", err)
+		t.Fatalf("Build proposal obligations: %v", err)
 	}
 	primary, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(20, 0)})
 	if err != nil {
-		t.Fatalf("Build primary packet: %v", err)
+		t.Fatalf("Build proposal primary packet: %v", err)
 	}
 	findingID := "finding-alpha"
 	if _, err := reviewresult.Import(reviewresult.ImportOptions{
@@ -1185,7 +1194,22 @@ func initializedVerificationPacketState(t *testing.T, withProposalFinalDiff bool
 	}); err != nil {
 		t.Fatalf("Import finding result: %v", err)
 	}
-	return repo, stateDir, findingID
+	writeFile(t, repo, "alpha.txt", "one\nfixed\n")
+	if _, err := snapshot.Capture(snapshot.CaptureOptions{StateDir: stateDir, RepoPath: repo, Kind: "final"}); err != nil {
+		t.Fatalf("Capture final: %v", err)
+	}
+	if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "base", ToKind: "final"}); err != nil {
+		t.Fatalf("CreateDiff base->final: %v", err)
+	}
+	if withProposalFinalDiff {
+		if _, err := snapshot.CreateDiff(snapshot.DiffOptions{StateDir: stateDir, FromKind: "proposal", ToKind: "final"}); err != nil {
+			t.Fatalf("CreateDiff proposal->final: %v", err)
+		}
+	}
+	if _, err := obligation.Build(obligation.BuildOptions{StateDir: stateDir}); err != nil {
+		t.Fatalf("Build obligations: %v", err)
+	}
+	return repo, stateDir, findingID, primary
 }
 
 func writePacketWorkerResult(t *testing.T, value reviewresult.WorkerResult) string {
