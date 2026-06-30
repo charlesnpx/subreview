@@ -218,11 +218,19 @@ func validateEventConsistency(store state.Store, event state.Event, record packe
 	if !contains(event.ObjectDigests, markdownDigest) {
 		return errors.New("malformed packet.built event: object_digests missing markdown")
 	}
+	expectedMarkdown := record.StablePrefix + "\n\n" + record.VolatileSuffix + "\n"
+	if got := digestString(expectedMarkdown); got != record.PromptDigest {
+		return errors.New("packet prompt_digest does not match stable/volatile packet content")
+	}
 	if markdownDigest != record.PromptDigest {
 		return errors.New("packet markdown digest does not match prompt_digest")
 	}
-	if _, err := store.Read(markdownDigest); err != nil {
+	markdownBody, err := store.Read(markdownDigest)
+	if err != nil {
 		return err
+	}
+	if string(markdownBody) != expectedMarkdown {
+		return errors.New("packet markdown body does not match stable/volatile packet content")
 	}
 	if record.CoverageManifest.Digest != "" && event.Details["coverage_manifest"] != record.CoverageManifest.Digest {
 		return errors.New("packet.built coverage_manifest mismatch")
