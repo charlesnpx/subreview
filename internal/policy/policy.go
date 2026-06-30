@@ -338,12 +338,16 @@ func Effective(cfg Config, profileName, repo string) (EffectivePolicy, error) {
 			Reason:   "required by policy profile " + profileName,
 		})
 	}
+	gates, err := normalizedGateRequirements(profile.GateRequirements)
+	if err != nil {
+		return EffectivePolicy{}, err
+	}
 	return EffectivePolicy{
 		SchemaVersion:         SchemaVersion,
 		PolicyID:              cfg.PolicyID,
 		Profile:               profileName,
 		Repo:                  repo,
-		GateRequirements:      append([]GateRequirement(nil), profile.GateRequirements...),
+		GateRequirements:      gates,
 		RouteLimits:           profile.RouteLimits,
 		RequiredEvidenceFacts: facts,
 		RiskRouting:           append([]RiskRoute(nil), profile.RiskRouting...),
@@ -352,8 +356,24 @@ func Effective(cfg Config, profileName, repo string) (EffectivePolicy, error) {
 			RequireBasisForUnresolved: profile.ClosureBasis.RequireBasisForUnresolved,
 		},
 		ClosurePredicates: predicates,
-		CommandCatalog:    commandCatalogFromGateRequirements(profile.GateRequirements),
+		CommandCatalog:    commandCatalogFromGateRequirements(gates),
 	}, nil
+}
+
+func normalizedGateRequirements(input []GateRequirement) ([]GateRequirement, error) {
+	gates := make([]GateRequirement, 0, len(input))
+	for _, gate := range input {
+		commandID, err := ident.NormalizeCommandID(gate.CommandID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid command_id: %s", gate.CommandID)
+		}
+		gates = append(gates, GateRequirement{
+			CommandID:     commandID,
+			CommandDigest: gate.CommandDigest,
+			Required:      gate.Required,
+		})
+	}
+	return gates, nil
 }
 
 func validateConfig(cfg Config) error {

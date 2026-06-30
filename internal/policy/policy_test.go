@@ -63,6 +63,24 @@ func TestCheckAllowsCustomCommandIDAndDerivesCatalog(t *testing.T) {
 	}
 }
 
+func TestCheckNormalizesGateRequirementCommandIDs(t *testing.T) {
+	root := t.TempDir()
+	cfg := validPolicyConfig()
+	profile := cfg["profiles"].(map[string]any)["default"].(map[string]any)
+	profile["gate_requirements"] = []any{map[string]any{"command_id": " go_test_all ", "command_digest": testCommandDigest, "required": true}}
+	result, err := Check(CheckOptions{ConfigPath: writePolicyConfig(t, root, cfg), RepoPath: root})
+	if err != nil {
+		t.Fatalf("Check trimmed command id: %v", err)
+	}
+	effective := result.Profiles[0]
+	if len(effective.GateRequirements) != 1 || effective.GateRequirements[0].CommandID != "go_test_all" {
+		t.Fatalf("gate requirement should be normalized: %+v", effective.GateRequirements)
+	}
+	if len(effective.CommandCatalog) != 1 || effective.CommandCatalog[0].ID != "go_test_all" {
+		t.Fatalf("command catalog should use normalized gate id: %+v", effective.CommandCatalog)
+	}
+}
+
 func TestCheckRejectsDuplicateGateRequirementCommandID(t *testing.T) {
 	root := t.TempDir()
 	cfg := validPolicyConfig()

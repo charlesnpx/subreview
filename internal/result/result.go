@@ -1864,7 +1864,7 @@ func comparePacketRefs(record PacketRef, trusted PacketRef) error {
 	if record.PromptDigest != trusted.PromptDigest || record.StableDigest != trusted.StableDigest || record.SemanticDedupeDigest != trusted.SemanticDedupeDigest {
 		return errors.New("result packet digest reference does not match packet object")
 	}
-	if trusted.VolatileDigest != "" && record.VolatileDigest != trusted.VolatileDigest {
+	if record.VolatileDigest != "" && record.VolatileDigest != trusted.VolatileDigest {
 		return errors.New("result packet volatile digest reference does not match packet object")
 	}
 	if record.SourceCompleteness != trusted.SourceCompleteness {

@@ -183,6 +183,74 @@ func TestObservationsRejectStoredResultPacketMismatch(t *testing.T) {
 	}
 }
 
+func TestObservationsAcceptLegacyResultWithoutVolatileDigest(t *testing.T) {
+	_, stateDir, built, _ := initializedResultState(t)
+	imported, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: built.Packet.Digest,
+		ResultPath: writeWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        built.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeClean,
+			Summary:       "No actionable findings.",
+		}),
+		Now: time.Unix(212, 0),
+	})
+	if err != nil {
+		t.Fatalf("Import result: %v", err)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	body, err := store.Read(imported.Result.Digest)
+	if err != nil {
+		t.Fatalf("Read result: %v", err)
+	}
+	var record reviewresult.ResultRecord
+	if err := json.Unmarshal(body, &record); err != nil {
+		t.Fatalf("Unmarshal result: %v", err)
+	}
+	record.Packet.VolatileDigest = ""
+	legacy, err := store.PutJSON(record, reviewresult.MediaTypeResult)
+	if err != nil {
+		t.Fatalf("Put legacy result: %v", err)
+	}
+	if _, err := state.AppendEvent(stateDir, state.Event{
+		Type:          reviewresult.EventTypeImported,
+		ObjectDigests: []string{legacy.Digest, imported.RawResult.Digest},
+		Repo:          record.Repo,
+		Details: map[string]string{
+			"result":                  legacy.Digest,
+			"raw_result":              imported.RawResult.Digest,
+			"packet":                  built.Packet.Digest,
+			"run_kind":                record.RunKind,
+			"route":                   record.Route,
+			"outcome":                 record.Outcome,
+			"clean":                   "true",
+			"findings":                "0",
+			"accepted_findings":       "0",
+			"duplicate_findings":      "0",
+			"rejected_structural":     "0",
+			"needs_context":           "false",
+			"needs_context_count":     "0",
+			"primary_review_evidence": "true",
+		},
+	}); err != nil {
+		t.Fatalf("Append legacy event: %v", err)
+	}
+	events := readEvents(t, stateDir)
+	observations, err := reviewresult.Observations(store, events, events[0].Repo)
+	if err != nil {
+		t.Fatalf("Observations should accept legacy missing volatile digest: %v", err)
+	}
+	if len(observations) == 0 || observations[0].Digest != legacy.Digest {
+		t.Fatalf("expected latest legacy observation first, got %+v", observations)
+	}
+}
+
 func TestImportRejectsDiscoveryRouteMismatch(t *testing.T) {
 	_, stateDir, built, _ := initializedResultState(t)
 	before := readEvents(t, stateDir)
