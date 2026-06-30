@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charlesnpx/subreview/internal/ident"
+	"github.com/charlesnpx/subreview/internal/packettrust"
 	"github.com/charlesnpx/subreview/internal/state"
 )
 
@@ -95,6 +97,19 @@ type ImportOptions struct {
 	PacketID   string
 	ResultPath string
 	Now        time.Time
+}
+
+type ValidateOptions struct {
+	StateDir   string
+	PacketID   string
+	ResultPath string
+	Now        time.Time
+}
+
+type ValidateResult struct {
+	SchemaVersion int    `json:"schema_version"`
+	Valid         bool   `json:"valid"`
+	Error         string `json:"error,omitempty"`
 }
 
 type ImportResult struct {
@@ -257,20 +272,22 @@ type ResultRecord struct {
 }
 
 type PacketRef struct {
-	Digest                string          `json:"digest"`
-	EventID               string          `json:"event_id"`
-	Kind                  string          `json:"kind"`
-	RunKind               string          `json:"run_kind"`
-	Route                 string          `json:"route"`
-	PromptDigest          string          `json:"prompt_digest"`
-	StableDigest          string          `json:"stable_digest"`
-	SemanticDedupeDigest  string          `json:"semantic_dedupe_digest"`
-	Policy                *PolicyRef      `json:"policy,omitempty"`
-	Artifact              *PacketArtifact `json:"artifact,omitempty"`
-	CoverageManifest      state.ObjectRef `json:"coverage_manifest"`
-	TargetState           SnapshotRef     `json:"target_state"`
-	SourceCompleteness    string          `json:"source_completeness"`
-	VerificationFindingID string          `json:"verification_finding_id,omitempty"`
+	Digest                 string          `json:"digest"`
+	EventID                string          `json:"event_id"`
+	Kind                   string          `json:"kind"`
+	RunKind                string          `json:"run_kind"`
+	Route                  string          `json:"route"`
+	PromptDigest           string          `json:"prompt_digest"`
+	StableDigest           string          `json:"stable_digest"`
+	VolatileDigest         string          `json:"volatile_digest,omitempty"`
+	SemanticDedupeDigest   string          `json:"semantic_dedupe_digest"`
+	Policy                 *PolicyRef      `json:"policy,omitempty"`
+	Artifact               *PacketArtifact `json:"artifact,omitempty"`
+	CoverageManifest       state.ObjectRef `json:"coverage_manifest"`
+	TargetState            SnapshotRef     `json:"target_state"`
+	SourceCompleteness     string          `json:"source_completeness"`
+	VerificationFindingID  string          `json:"verification_finding_id,omitempty"`
+	VerificationFindingIDs []string        `json:"verification_finding_ids,omitempty"`
 }
 
 type PolicyRef struct {
@@ -498,8 +515,59 @@ func Import(opts ImportOptions) (ImportResult, error) {
 	}, nil
 }
 
+func Validate(opts ValidateOptions) (ValidateResult, error) {
+	now := opts.Now.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	binding, err := stateBindingFromState(opts.StateDir)
+	if err != nil {
+		return invalidValidateResult(err), nil
+	}
+	store, err := state.Open(binding.State)
+	if err != nil {
+		return invalidValidateResult(err), nil
+	}
+	events, err := state.ReadEvents(binding.State)
+	if err != nil {
+		return invalidValidateResult(err), nil
+	}
+	packetRef, err := resolvePacket(store, events, binding.State, binding.Repo, opts.PacketID)
+	if err != nil {
+		return invalidValidateResult(err), nil
+	}
+	raw, err := readBoundedRegularFile(opts.ResultPath)
+	if err != nil {
+		return invalidValidateResult(err), nil
+	}
+	var input WorkerResult
+	if err := decodeStrict(raw, &input); err != nil {
+		return invalidValidateResult(fmt.Errorf("malformed worker result: %w", err)), nil
+	}
+	existingDigests, existingIDs, err := existingFindingIdentity(store, events, binding.Repo, packetRef)
+	if err != nil {
+		return invalidValidateResult(err), nil
+	}
+	if _, err := normalizeWorkerResult(input, packetRef, binding.Repo, now, existingDigests, existingIDs); err != nil {
+		return invalidValidateResult(err), nil
+	}
+	return ValidateResult{SchemaVersion: SchemaVersion, Valid: true}, nil
+}
+
+func invalidValidateResult(err error) ValidateResult {
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	return ValidateResult{SchemaVersion: SchemaVersion, Valid: false, Error: message}
+}
+
 func Observations(store state.Store, events []state.Event, repo string) ([]EvidenceObservation, error) {
 	return observations(store, events, repo, false)
+}
+
+func AllObservations(store state.Store, events []state.Event, repo string) ([]EvidenceObservation, error) {
+	return observations(store, events, repo, true)
 }
 
 func observations(store state.Store, events []state.Event, repo string, includeArtifact bool) ([]EvidenceObservation, error) {
@@ -527,7 +595,11 @@ func observations(store state.Store, events []state.Event, repo string, includeA
 		if err := decodeStrict(body, &record); err != nil {
 			return nil, err
 		}
-		if err := validateRecord(record, repo, event.Details["packet"]); err != nil {
+		trusted, err := resolvePacket(store, events, "", repo, event.Details["packet"])
+		if err != nil {
+			return nil, err
+		}
+		if err := validateRecord(record, repo, event.Details["packet"], &trusted); err != nil {
 			return nil, err
 		}
 		if !includeArtifact && record.Route == RouteArtifactReview {
@@ -699,6 +771,28 @@ func packetPolicyMatches(policy *PolicyRef, policyDigest string) bool {
 	return policy != nil && policy.Digest == policyDigest
 }
 
+func verificationFindingIDs(packet PacketRef) []string {
+	seen := map[string]struct{}{}
+	out := []string{}
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	for _, id := range packet.VerificationFindingIDs {
+		add(id)
+	}
+	add(packet.VerificationFindingID)
+	sort.Strings(out)
+	return out
+}
+
 func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, now time.Time, existingDigests map[string]struct{}, existingIDs map[string]string) (ResultRecord, error) {
 	if input.SchemaVersion != SchemaVersion {
 		return ResultRecord{}, fmt.Errorf("unsupported worker result schema_version: %d", input.SchemaVersion)
@@ -755,30 +849,8 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 		if packet.RunKind != runKind || packet.Route != route {
 			return ResultRecord{}, fmt.Errorf("verification result route %s/%s does not match packet route %s/%s", runKind, route, packet.RunKind, packet.Route)
 		}
-		if packet.VerificationFindingID == "" {
+		if len(verificationFindingIDs(packet)) == 0 {
 			return ResultRecord{}, errors.New("finding-level verification evidence requires a targeted verification packet")
-		}
-		for _, refutation := range input.DeterministicRefutations {
-			for _, obligationID := range refutation.ObligationIDs {
-				if strings.TrimSpace(obligationID) != "" {
-					return ResultRecord{}, errors.New("targeted verification packets cannot import obligation-level deterministic refutations")
-				}
-			}
-		}
-		seenOutcome := false
-		for _, outcome := range input.VerifierOutcomes {
-			if strings.TrimSpace(outcome.FindingID) != packet.VerificationFindingID {
-				return ResultRecord{}, fmt.Errorf("verifier outcome finding_id %q does not match packet finding_id %q", outcome.FindingID, packet.VerificationFindingID)
-			}
-			if seenOutcome {
-				return ResultRecord{}, fmt.Errorf("targeted verification packet accepts at most one verifier outcome for finding_id %q", packet.VerificationFindingID)
-			}
-			seenOutcome = true
-		}
-		for _, refutation := range input.DeterministicRefutations {
-			if findingID := strings.TrimSpace(refutation.FindingID); findingID != "" && findingID != packet.VerificationFindingID {
-				return ResultRecord{}, fmt.Errorf("deterministic refutation finding_id %q does not match packet finding_id %q", refutation.FindingID, packet.VerificationFindingID)
-			}
 		}
 	}
 	if len(input.Findings) > maxFindings {
@@ -854,6 +926,11 @@ func normalizeWorkerResult(input WorkerResult, packet PacketRef, repo string, no
 	}
 	if err := validateVerifierOutcomeEvidence(verifierOutcomes, refutations); err != nil {
 		return ResultRecord{}, err
+	}
+	if isTargetedVerificationPacket {
+		if err := validateTargetedVerificationEvidence(packet, verifierOutcomes, refutations); err != nil {
+			return ResultRecord{}, err
+		}
 	}
 	telemetry, err := normalizeTelemetry(input.Telemetry)
 	if err != nil {
@@ -1276,8 +1353,8 @@ func normalizeRequiredChecks(input []RequiredCheck) ([]RequiredCheck, error) {
 	out := make([]RequiredCheck, 0, len(input))
 	seen := map[string]struct{}{}
 	for _, check := range input {
-		commandID := strings.TrimSpace(check.CommandID)
-		if !idPattern.MatchString(commandID) {
+		commandID, err := ident.NormalizeCommandID(check.CommandID)
+		if err != nil {
 			return nil, fmt.Errorf("invalid required check command_id: %s", check.CommandID)
 		}
 		if _, exists := seen[commandID]; exists {
@@ -1452,6 +1529,64 @@ func validateVerifierOutcomeEvidence(outcomes []VerifierOutcome, refutations []D
 	return nil
 }
 
+func validateTargetedVerificationEvidence(packet PacketRef, outcomes []VerifierOutcome, refutations []DeterministicRefutation) error {
+	targetIDs := verificationFindingIDs(packet)
+	if len(targetIDs) == 0 {
+		return errors.New("targeted verification packet requires at least one finding_id")
+	}
+	targetSet := map[string]struct{}{}
+	for _, id := range targetIDs {
+		targetSet[id] = struct{}{}
+	}
+	outcomeByFinding := map[string]VerifierOutcome{}
+	for _, outcome := range outcomes {
+		if _, ok := targetSet[outcome.FindingID]; !ok {
+			return fmt.Errorf("verifier outcome finding_id %q is not in packet finding_ids %q", outcome.FindingID, strings.Join(targetIDs, ","))
+		}
+		if prior, exists := outcomeByFinding[outcome.FindingID]; exists {
+			return fmt.Errorf("duplicate verifier outcomes for finding_id %q: %s and %s", outcome.FindingID, prior.Outcome, outcome.Outcome)
+		}
+		outcomeByFinding[outcome.FindingID] = outcome
+	}
+	refutationByFinding := map[string]DeterministicRefutation{}
+	for _, refutation := range refutations {
+		if len(refutation.ObligationIDs) > 0 {
+			return errors.New("targeted verification packets cannot import obligation-level deterministic refutations")
+		}
+		if refutation.FindingID == "" {
+			return errors.New("targeted verification deterministic refutations require finding_id")
+		}
+		if _, ok := targetSet[refutation.FindingID]; !ok {
+			return fmt.Errorf("deterministic refutation finding_id %q is not in packet finding_ids %q", refutation.FindingID, strings.Join(targetIDs, ","))
+		}
+		if prior, exists := refutationByFinding[refutation.FindingID]; exists {
+			return fmt.Errorf("duplicate deterministic refutations for finding_id %q: %s and %s", refutation.FindingID, prior.ID, refutation.ID)
+		}
+		refutationByFinding[refutation.FindingID] = refutation
+	}
+	for _, findingID := range targetIDs {
+		outcome, hasOutcome := outcomeByFinding[findingID]
+		_, hasRefutation := refutationByFinding[findingID]
+		if !hasOutcome && !hasRefutation {
+			return fmt.Errorf("targeted verification packet missing verdict for finding_id %q", findingID)
+		}
+		if !hasOutcome {
+			continue
+		}
+		deterministicOutcome := outcome.State == StateInvalidated && (outcome.Basis == BasisDeterministicRefutation || outcome.Basis == BasisExecutableRefutation)
+		if deterministicOutcome {
+			if !hasRefutation {
+				return fmt.Errorf("deterministic verifier outcome for %s requires matching deterministic refutation evidence", findingID)
+			}
+			continue
+		}
+		if hasRefutation {
+			return fmt.Errorf("deterministic refutation for %s conflicts with verifier outcome %s/%s", findingID, outcome.Outcome, outcome.Basis)
+		}
+	}
+	return nil
+}
+
 func normalizeEvidenceRefs(input []EvidenceRef) ([]EvidenceRef, error) {
 	if len(input) > maxRefsPerFinding {
 		return nil, fmt.Errorf("too many evidence_refs: %d > %d", len(input), maxRefsPerFinding)
@@ -1468,6 +1603,13 @@ func normalizeEvidenceRefs(input []EvidenceRef) ([]EvidenceRef, error) {
 		}
 		eventID := strings.TrimSpace(ref.EventID)
 		commandID := strings.TrimSpace(ref.CommandID)
+		if commandID != "" {
+			var err error
+			commandID, err = ident.NormalizeCommandID(commandID)
+			if err != nil {
+				return nil, fmt.Errorf("invalid evidence_ref command_id: %s", ref.CommandID)
+			}
+		}
 		if digest == "" && eventID == "" && commandID == "" {
 			return nil, errors.New("evidence_ref requires digest, event_id, or command_id")
 		}
@@ -1546,97 +1688,54 @@ func evidenceSummary(runKind, route, outcome string, findings []FindingRecord, r
 }
 
 func resolvePacket(store state.Store, events []state.Event, stateDir, repo, packetID string) (PacketRef, error) {
-	packetID = strings.TrimSpace(packetID)
-	if packetID == "" {
-		return PacketRef{}, errors.New("--packet is required")
+	ref, err := packettrust.Resolve(store, events, stateDir, repo, packetID)
+	if err != nil {
+		return PacketRef{}, err
 	}
-	for i := len(events) - 1; i >= 0; i-- {
-		event := events[i]
-		if event.Type != "packet.built" {
-			continue
-		}
-		if event.Repo != repo {
-			return PacketRef{}, errors.New("malformed packet.built event: repo mismatch")
-		}
-		candidates := []string{event.Details["packet"], event.Details["semantic_dedupe_digest"], event.EventID}
-		if !containsString(candidates, packetID) {
-			continue
-		}
-		digest := event.Details["packet"]
-		if strings.TrimSpace(digest) == "" {
-			return PacketRef{}, errors.New("malformed packet.built event: missing packet")
-		}
-		if !containsDigest(event.ObjectDigests, digest) {
-			return PacketRef{}, errors.New("malformed packet.built event: object_digests missing packet")
-		}
-		body, err := store.Read(digest)
-		if err != nil {
-			return PacketRef{}, err
-		}
-		var record packetRecord
-		if err := json.Unmarshal(body, &record); err != nil {
-			return PacketRef{}, err
-		}
-		if record.SchemaVersion != SchemaVersion {
-			return PacketRef{}, fmt.Errorf("unsupported packet schema_version: %d", record.SchemaVersion)
-		}
-		if record.Repo != repo {
-			return PacketRef{}, errors.New("packet repo mismatch")
-		}
-		if record.Kind == "artifact" || record.Route == RouteArtifactReview {
-			if record.Kind != "artifact" || record.RunKind != RunKindDiscovery || record.Route != RouteArtifactReview {
-				return PacketRef{}, errors.New("artifact packet route is malformed")
-			}
-			if record.Artifact == nil || strings.TrimSpace(record.Artifact.ID) == "" || strings.TrimSpace(record.Artifact.Artifact.Digest) == "" || strings.TrimSpace(record.Artifact.Content.Digest) == "" {
-				return PacketRef{}, errors.New("artifact packet missing artifact reference")
-			}
-			artifact := *record.Artifact
-			return PacketRef{
-				Digest:               digest,
-				EventID:              event.EventID,
-				Kind:                 record.Kind,
-				RunKind:              record.RunKind,
-				Route:                record.Route,
-				PromptDigest:         record.PromptDigest,
-				StableDigest:         record.StableDigest,
-				SemanticDedupeDigest: record.SemanticDedupeKey.Digest,
-				Artifact:             &artifact,
-				SourceCompleteness:   record.SourceCompleteness,
-			}, nil
-		}
-		if record.CoverageManifest.Digest == "" || record.TargetState.Digest == "" {
-			return PacketRef{}, errors.New("packet missing coverage_manifest or target_state")
-		}
-		return PacketRef{
-			Digest:                digest,
-			EventID:               event.EventID,
-			Kind:                  record.Kind,
-			RunKind:               record.RunKind,
-			Route:                 record.Route,
-			PromptDigest:          record.PromptDigest,
-			StableDigest:          record.StableDigest,
-			SemanticDedupeDigest:  record.SemanticDedupeKey.Digest,
-			Policy:                copyPolicyRef(record.Policy),
-			VerificationFindingID: strings.TrimSpace(record.Verification.Finding.ID),
-			CoverageManifest: state.ObjectRef{
-				Digest:    record.CoverageManifest.Digest,
-				MediaType: record.CoverageManifest.MediaType,
-				Size:      record.CoverageManifest.Size,
-				Path:      objectPathBestEffort(stateDir, record.CoverageManifest.Digest),
-			},
-			TargetState:        record.TargetState,
-			SourceCompleteness: record.SourceCompleteness,
-		}, nil
-	}
-	return PacketRef{}, fmt.Errorf("packet not found in state: %s", packetID)
+	return packetRefFromTrusted(ref), nil
 }
 
-func copyPolicyRef(policy *PolicyRef) *PolicyRef {
+func packetRefFromTrusted(ref packettrust.Ref) PacketRef {
+	return PacketRef{
+		Digest:                 ref.Digest,
+		EventID:                ref.EventID,
+		Kind:                   ref.Kind,
+		RunKind:                ref.RunKind,
+		Route:                  ref.Route,
+		PromptDigest:           ref.PromptDigest,
+		StableDigest:           ref.StableDigest,
+		VolatileDigest:         ref.VolatileDigest,
+		SemanticDedupeDigest:   ref.SemanticDedupeDigest,
+		Policy:                 policyRefFromTrusted(ref.Policy),
+		Artifact:               artifactRefFromTrusted(ref.Artifact),
+		CoverageManifest:       ref.CoverageManifest,
+		TargetState:            SnapshotRef{Kind: ref.TargetState.Kind, Digest: ref.TargetState.Digest, Tree: ref.TargetState.Tree},
+		SourceCompleteness:     ref.SourceCompleteness,
+		VerificationFindingID:  ref.VerificationFindingID,
+		VerificationFindingIDs: append([]string(nil), ref.VerificationFindingIDs...),
+	}
+}
+
+func policyRefFromTrusted(policy *packettrust.PolicyRef) *PolicyRef {
 	if policy == nil {
 		return nil
 	}
-	ref := *policy
-	return &ref
+	return &PolicyRef{Profile: policy.Profile, PolicyID: policy.PolicyID, Digest: policy.Digest}
+}
+
+func artifactRefFromTrusted(artifact *packettrust.PacketArtifact) *PacketArtifact {
+	if artifact == nil {
+		return nil
+	}
+	return &PacketArtifact{
+		ID:            artifact.ID,
+		Kind:          artifact.Kind,
+		Title:         artifact.Title,
+		Revises:       artifact.Revises,
+		Content:       artifact.Content,
+		ContentDigest: artifact.ContentDigest,
+		Artifact:      artifact.Artifact,
+	}
 }
 
 func readBoundedRegularFile(path string) ([]byte, error) {
@@ -1698,7 +1797,7 @@ func findingIdentityScopeMatches(record ResultRecord, packet PacketRef) bool {
 	return record.Route != RouteArtifactReview && record.Packet.CoverageManifest.Digest == packet.CoverageManifest.Digest
 }
 
-func validateRecord(record ResultRecord, repo, packetDigest string) error {
+func validateRecord(record ResultRecord, repo, packetDigest string, trusted *PacketRef) error {
 	if record.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("unsupported result schema_version: %d", record.SchemaVersion)
 	}
@@ -1710,6 +1809,25 @@ func validateRecord(record ResultRecord, repo, packetDigest string) error {
 	}
 	if !validRunKind(record.RunKind) || !validRoute(record.Route) || !validOutcome(record.Outcome) {
 		return errors.New("result run_kind, route, or outcome is invalid")
+	}
+	if trusted != nil {
+		if err := comparePacketRefs(record.Packet, *trusted); err != nil {
+			return err
+		}
+	}
+	for _, check := range record.RequiredChecks {
+		if err := ident.ValidateCommandID(check.CommandID); err != nil {
+			return err
+		}
+	}
+	for _, refutation := range record.DeterministicRefutations {
+		for _, ref := range refutation.EvidenceRefs {
+			if ref.CommandID != "" {
+				if err := ident.ValidateCommandID(ref.CommandID); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	if record.Route == RouteArtifactReview {
 		if record.RunKind != RunKindDiscovery || record.Packet.Kind != "artifact" || record.Packet.Route != RouteArtifactReview {
@@ -1734,6 +1852,61 @@ func validateRecord(record ResultRecord, repo, packetDigest string) error {
 		}
 	}
 	return nil
+}
+
+func comparePacketRefs(record PacketRef, trusted PacketRef) error {
+	if record.Digest != trusted.Digest || record.EventID != trusted.EventID {
+		return errors.New("result packet reference does not match packet.built event")
+	}
+	if record.Kind != trusted.Kind || record.RunKind != trusted.RunKind || record.Route != trusted.Route {
+		return errors.New("result packet route reference does not match packet object")
+	}
+	if record.PromptDigest != trusted.PromptDigest || record.StableDigest != trusted.StableDigest || record.SemanticDedupeDigest != trusted.SemanticDedupeDigest {
+		return errors.New("result packet digest reference does not match packet object")
+	}
+	if record.VolatileDigest != "" && record.VolatileDigest != trusted.VolatileDigest {
+		return errors.New("result packet volatile digest reference does not match packet object")
+	}
+	if record.SourceCompleteness != trusted.SourceCompleteness {
+		return errors.New("result packet source completeness does not match packet object")
+	}
+	if !samePolicyRef(record.Policy, trusted.Policy) {
+		return errors.New("result packet policy reference does not match packet object")
+	}
+	if !sameArtifactRef(record.Artifact, trusted.Artifact) {
+		return errors.New("result packet artifact reference does not match packet object")
+	}
+	if !sameObjectRef(record.CoverageManifest, trusted.CoverageManifest) || record.TargetState != trusted.TargetState {
+		return errors.New("result packet target or coverage reference does not match packet object")
+	}
+	if strings.Join(verificationFindingIDs(record), ",") != strings.Join(verificationFindingIDs(trusted), ",") {
+		return errors.New("result packet verification finding ids do not match packet object")
+	}
+	return nil
+}
+
+func samePolicyRef(a, b *PolicyRef) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Profile == b.Profile && a.PolicyID == b.PolicyID && a.Digest == b.Digest
+}
+
+func sameArtifactRef(a, b *PacketArtifact) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.ID == b.ID &&
+		a.Kind == b.Kind &&
+		a.Title == b.Title &&
+		a.Revises == b.Revises &&
+		a.ContentDigest == b.ContentDigest &&
+		sameObjectRef(a.Content, b.Content) &&
+		sameObjectRef(a.Artifact, b.Artifact)
+}
+
+func sameObjectRef(a, b state.ObjectRef) bool {
+	return a.Digest == b.Digest && a.MediaType == b.MediaType && a.Size == b.Size
 }
 
 func stateBindingFromState(stateDir string) (stateBinding, error) {

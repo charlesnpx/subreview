@@ -1189,12 +1189,9 @@ func latestBoundPolicy(store state.Store, events []state.Event, repo string) (*b
 		if err != nil {
 			return nil, err
 		}
-		var effective policy.EffectivePolicy
-		if err := decodeStrict(body, &effective); err != nil {
+		effective, err := policy.DecodeBoundEffectivePolicy(body, profile, repo, policyID)
+		if err != nil {
 			return nil, err
-		}
-		if effective.SchemaVersion != policy.SchemaVersion || effective.Repo != repo || effective.Profile != profile || effective.PolicyID != policyID {
-			return nil, errors.New("bound policy object does not match policy.bound event")
 		}
 		return &boundPolicy{
 			Ref:       PolicyRef{Profile: profile, PolicyID: policyID, Digest: digest},

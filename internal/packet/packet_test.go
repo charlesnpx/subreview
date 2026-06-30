@@ -509,14 +509,16 @@ func TestVerificationLeakageScanIncludesFindingText(t *testing.T) {
 		SourceComplete: "complete",
 		TokenTelemetry: NewTokenTelemetry(RunKindVerification, "complete"),
 	}
+	finding := reviewresult.FindingRecord{
+		ID:              "finding-one",
+		Severity:        "high",
+		Class:           "correctness",
+		Claim:           "This claim mentions true_miss.",
+		FailureScenario: "The verifier should reject leaked evaluation terms.",
+	}
 	report := CheckLeakage(verificationLeakageScanText(material, VerificationRecord{
-		Finding: reviewresult.FindingRecord{
-			ID:              "finding-one",
-			Severity:        "high",
-			Class:           "correctness",
-			Claim:           "This claim mentions true_miss.",
-			FailureScenario: "The verifier should reject leaked evaluation terms.",
-		},
+		Finding:  &finding,
+		Findings: []reviewresult.FindingRecord{finding},
 	}))
 	if report.OK || len(report.ForbiddenTerms) == 0 {
 		t.Fatalf("verification leakage scan should include finding text: %+v", report)
@@ -667,8 +669,8 @@ func TestVerificationContentBundleIncludesExpectedFixSurface(t *testing.T) {
 		EndLine:   4,
 	}}
 	target := SnapshotRef{Kind: "final", Digest: "sha256:target", Tree: "sha256:tree"}
-	first := digestJSON(verificationContentBundleDigestMaterial(nil, target, "sha256:context", nil, baseFinding))
-	second := digestJSON(verificationContentBundleDigestMaterial(nil, target, "sha256:context", nil, changedFinding))
+	first := digestJSON(verificationContentBundleDigestMaterial(nil, target, "sha256:context", nil, []reviewresult.FindingRecord{baseFinding}))
+	second := digestJSON(verificationContentBundleDigestMaterial(nil, target, "sha256:context", nil, []reviewresult.FindingRecord{changedFinding}))
 	if first == second {
 		t.Fatalf("verification content bundle digest should include expected fix surface: %s", first)
 	}
@@ -815,7 +817,7 @@ func TestBuildVerificationPacketUsesProposalFinalState(t *testing.T) {
 		t.Fatalf("verification summary incomplete: %+v", result.Verification)
 	}
 	record := readPacketRecord(t, stateDir, result.Packet.Digest)
-	if record.Verification == nil || record.Verification.Finding.ID != findingID || record.TargetState.Kind != "final" {
+	if record.Verification == nil || record.Verification.Finding == nil || record.Verification.Finding.ID != findingID || len(record.Verification.Findings) != 1 || record.Verification.Findings[0].ID != findingID || record.TargetState.Kind != "final" {
 		t.Fatalf("verification record incomplete: %+v", record.Verification)
 	}
 	if record.SemanticDedupeKey.RunKind != RunKindVerification || record.SemanticDedupeKey.Route != RouteVerification {
@@ -833,6 +835,86 @@ func TestBuildVerificationPacketUsesProposalFinalState(t *testing.T) {
 		if !strings.Contains(string(markdown), want) {
 			t.Fatalf("verification markdown missing %q:\n%s", want, markdown)
 		}
+	}
+}
+
+func TestBuildVerificationPacketSupportsBatchFindingIDs(t *testing.T) {
+	_, stateDir, firstID := initializedVerificationPacketState(t, true)
+	primary, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, Now: time.Unix(205, 0)})
+	if err != nil {
+		t.Fatalf("Build follow-up primary packet: %v", err)
+	}
+	secondID := "finding-beta"
+	if _, err := reviewresult.Import(reviewresult.ImportOptions{
+		StateDir: stateDir,
+		PacketID: primary.Packet.Digest,
+		ResultPath: writePacketWorkerResult(t, reviewresult.WorkerResult{
+			SchemaVersion: reviewresult.SchemaVersion,
+			Packet:        primary.Packet.Digest,
+			RunKind:       reviewresult.RunKindDiscovery,
+			Route:         reviewresult.RoutePrimaryReview,
+			Outcome:       reviewresult.OutcomeFindings,
+			Findings: []reviewresult.FindingInput{{
+				ID:              secondID,
+				Severity:        "high",
+				Class:           "correctness",
+				Claim:           "alpha.txt leaves a second independent bug marker visible.",
+				FailureScenario: "A reader sees a second marker that should not ship.",
+				Citations:       []reviewresult.LineRef{{Path: "alpha.txt", StartLine: 1, EndLine: 2}},
+				Anchors:         []reviewresult.AnchorRef{{Kind: "hunk", Path: "alpha.txt", StartLine: 1, EndLine: 2}},
+			}},
+		}),
+		Now: time.Unix(206, 0),
+	}); err != nil {
+		t.Fatalf("Import second finding: %v", err)
+	}
+	if _, err := Build(BuildOptions{StateDir: stateDir, Kind: KindVerification, FindingIDs: []string{firstID, " " + firstID + " "}, Now: time.Unix(207, 0)}); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("expected duplicate finding rejection, got %v", err)
+	}
+	result, err := Build(BuildOptions{StateDir: stateDir, Kind: KindVerification, FindingIDs: []string{secondID, firstID}, Now: time.Unix(208, 0)})
+	if err != nil {
+		t.Fatalf("Build batch verification packet: %v", err)
+	}
+	if result.Verification == nil || result.Verification.FindingID != "" || strings.Join(result.Verification.FindingIDs, ",") != firstID+","+secondID {
+		t.Fatalf("bad batch verification summary: %+v", result.Verification)
+	}
+	record := readPacketRecord(t, stateDir, result.Packet.Digest)
+	if record.Verification == nil || record.Verification.Finding != nil || len(record.Verification.Findings) != 2 || strings.Join(record.Verification.FindingIDs, ",") != firstID+","+secondID {
+		t.Fatalf("bad batch verification record: %+v", record.Verification)
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("Open state: %v", err)
+	}
+	markdown, err := store.Read(result.Markdown.Digest)
+	if err != nil {
+		t.Fatalf("Read markdown: %v", err)
+	}
+	for _, want := range []string{"resolved each referenced finding", "exactly one logical verdict per finding_id", "resolve each referenced finding in the final state"} {
+		if !strings.Contains(string(markdown), want) {
+			t.Fatalf("batch verification markdown missing %q:\n%s", want, markdown)
+		}
+	}
+	events, err := state.ReadEvents(stateDir)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	last := events[len(events)-1]
+	if last.Details["finding_id"] != "" || last.Details["finding_ids"] != firstID+","+secondID {
+		t.Fatalf("batch event should use finding_ids only: %+v", last.Details)
+	}
+}
+
+func TestBuildRejectsInvalidMaxContextBytes(t *testing.T) {
+	_, stateDir := initializedPacketState(t, "one\n", "one\ntwo\n")
+	if _, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, MaxContextBytes: -1}); err == nil || !strings.Contains(err.Error(), "max context bytes") {
+		t.Fatalf("expected negative max context error, got %v", err)
+	}
+	if _, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, MaxContextBytes: MaxContextBytesLimit + 1}); err == nil || !strings.Contains(err.Error(), "max context bytes") {
+		t.Fatalf("expected oversized max context error, got %v", err)
+	}
+	if _, err := Build(BuildOptions{StateDir: stateDir, Kind: KindPrimary, MaxContextBytes: 0}); err != nil {
+		t.Fatalf("zero max context should use default: %v", err)
 	}
 }
 

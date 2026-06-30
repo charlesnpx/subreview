@@ -43,8 +43,9 @@ const (
 	MediaTypePacket   = "application/vnd.subreview.packet+json"
 	MediaTypeMarkdown = "text/markdown; charset=utf-8"
 
-	defaultContextBytes = 24 * 1024
-	defaultSnippetLines = 3
+	defaultContextBytes  = 24 * 1024
+	MaxContextBytesLimit = 256 * 1024
+	defaultSnippetLines  = 3
 )
 
 var (
@@ -67,6 +68,7 @@ type BuildOptions struct {
 	Kind            string
 	Route           string
 	FindingID       string
+	FindingIDs      []string
 	ArtifactID      string
 	Now             time.Time
 	MaxContextBytes int
@@ -212,7 +214,8 @@ type GateSummary struct {
 }
 
 type VerificationSummary struct {
-	FindingID          string   `json:"finding_id"`
+	FindingID          string   `json:"finding_id,omitempty"`
+	FindingIDs         []string `json:"finding_ids,omitempty"`
 	ProposalState      string   `json:"proposal_state"`
 	FinalState         string   `json:"final_state"`
 	ProposalFinalPatch string   `json:"proposal_final_patch"`
@@ -220,12 +223,14 @@ type VerificationSummary struct {
 }
 
 type VerificationRecord struct {
-	Finding            reviewresult.FindingRecord `json:"finding"`
-	ProposalState      SnapshotRef                `json:"proposal_state"`
-	FinalState         SnapshotRef                `json:"final_state"`
-	ProposalFinalDiff  SourceDiff                 `json:"proposal_final_diff"`
-	ExpectedFixSurface []reviewresult.FixSurface  `json:"expected_fix_surface"`
-	Questions          []VerificationQuestion     `json:"questions"`
+	Finding            *reviewresult.FindingRecord  `json:"finding,omitempty"`
+	Findings           []reviewresult.FindingRecord `json:"findings,omitempty"`
+	FindingIDs         []string                     `json:"finding_ids,omitempty"`
+	ProposalState      SnapshotRef                  `json:"proposal_state"`
+	FinalState         SnapshotRef                  `json:"final_state"`
+	ProposalFinalDiff  SourceDiff                   `json:"proposal_final_diff"`
+	ExpectedFixSurface []reviewresult.FixSurface    `json:"expected_fix_surface"`
+	Questions          []VerificationQuestion       `json:"questions"`
 }
 
 type VerificationQuestion struct {
@@ -300,6 +305,9 @@ type patchHunk struct {
 }
 
 func Build(opts BuildOptions) (BuildResult, error) {
+	if opts.MaxContextBytes < 0 || opts.MaxContextBytes > MaxContextBytesLimit {
+		return BuildResult{}, fmt.Errorf("max context bytes must be 0-%d", MaxContextBytesLimit)
+	}
 	if opts.Kind == "" {
 		opts.Kind = KindPrimary
 	}
@@ -442,6 +450,7 @@ func buildArtifact(opts BuildOptions) (BuildResult, error) {
 			"volatile_digest":        volatileDigest,
 			"prompt_digest":          promptDigest,
 			"semantic_dedupe_digest": dedupe.Digest,
+			"source_completeness":    sourceCompleteness,
 		},
 	})
 	if err != nil {
@@ -621,6 +630,7 @@ func buildPrimary(opts BuildOptions) (BuildResult, error) {
 			"prompt_digest":          promptDigest,
 			"semantic_dedupe_digest": dedupe.Digest,
 			"target_state":           target.Digest,
+			"source_completeness":    sourceCompleteness,
 		},
 	})
 	if err != nil {
@@ -703,7 +713,11 @@ func buildVerification(opts BuildOptions) (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, err
 	}
-	finding, err := latestFindingForVerification(store, events, binding.Repo, manifestRef.Digest, proposal.Digest, policyDigest, opts.FindingID)
+	findingIDs, err := normalizeVerificationFindingIDs(opts.FindingID, opts.FindingIDs)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	findings, err := latestFindingsForVerification(store, events, binding.Repo, manifestRef.Digest, proposal.Digest, policyDigest, findingIDs)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -729,16 +743,23 @@ func buildVerification(opts BuildOptions) (BuildResult, error) {
 		return BuildResult{}, err
 	}
 	context.AllowedContextDigest = digestJSON(contextDigestMaterial(context))
-	questions := verificationQuestions(finding)
+	questions := verificationQuestions()
 	verification := VerificationRecord{
-		Finding:            finding,
-		ProposalState:      proposal,
-		FinalState:         final,
-		ProposalFinalDiff:  proposalFinal,
-		ExpectedFixSurface: append([]reviewresult.FixSurface(nil), finding.ExpectedFixSurface...),
-		Questions:          questions,
+		Findings:          append([]reviewresult.FindingRecord(nil), findings...),
+		FindingIDs:        append([]string(nil), findingIDs...),
+		ProposalState:     proposal,
+		FinalState:        final,
+		ProposalFinalDiff: proposalFinal,
+		Questions:         questions,
 	}
-	contentBundleHash := digestJSON(verificationContentBundleDigestMaterial([]SourceDiff{proposalFinal}, final, context.AllowedContextDigest, gates, finding))
+	if len(findings) == 1 {
+		finding := findings[0]
+		verification.Finding = &finding
+		verification.ExpectedFixSurface = append([]reviewresult.FixSurface(nil), finding.ExpectedFixSurface...)
+	} else {
+		verification.ExpectedFixSurface = combinedFixSurface(findings)
+	}
+	contentBundleHash := digestJSON(verificationContentBundleDigestMaterial([]SourceDiff{proposalFinal}, final, context.AllowedContextDigest, gates, findings))
 	context.ContentBundleHash = contentBundleHash
 	dedupe := NewSemanticDedupeKey(SemanticDedupeFields{
 		PolicyID:             policyID,
@@ -817,27 +838,33 @@ func buildVerification(opts BuildOptions) (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, err
 	}
+	details := map[string]string{
+		"kind":                   KindVerification,
+		"run_kind":               RunKindVerification,
+		"route":                  route,
+		"packet":                 packetRef.Digest,
+		"markdown":               markdownRef.Digest,
+		"coverage_manifest":      manifestRef.Digest,
+		"stable_digest":          stableDigest,
+		"volatile_digest":        volatileDigest,
+		"prompt_digest":          promptDigest,
+		"semantic_dedupe_digest": dedupe.Digest,
+		"target_state":           final.Digest,
+		"proposal_state":         proposal.Digest,
+		"final_state":            final.Digest,
+		"proposal_final_patch":   proposalFinal.Patch.Digest,
+		"source_completeness":    sourceCompleteness,
+	}
+	if len(findingIDs) == 1 {
+		details["finding_id"] = findingIDs[0]
+	} else {
+		details["finding_ids"] = strings.Join(findingIDs, ",")
+	}
 	event, err := state.AppendEvent(binding.State, state.Event{
 		Type:          EventTypePacketBuilt,
 		ObjectDigests: []string{packetRef.Digest, markdownRef.Digest},
 		Repo:          binding.Repo,
-		Details: map[string]string{
-			"kind":                   KindVerification,
-			"run_kind":               RunKindVerification,
-			"route":                  route,
-			"packet":                 packetRef.Digest,
-			"markdown":               markdownRef.Digest,
-			"coverage_manifest":      manifestRef.Digest,
-			"stable_digest":          stableDigest,
-			"volatile_digest":        volatileDigest,
-			"prompt_digest":          promptDigest,
-			"semantic_dedupe_digest": dedupe.Digest,
-			"target_state":           final.Digest,
-			"finding_id":             finding.ID,
-			"proposal_state":         proposal.Digest,
-			"final_state":            final.Digest,
-			"proposal_final_patch":   proposalFinal.Patch.Digest,
-		},
+		Details:       details,
 	})
 	if err != nil {
 		return BuildResult{}, err
@@ -865,7 +892,8 @@ func buildVerification(opts BuildOptions) (BuildResult, error) {
 		TargetState:        final,
 		SourceCompleteness: sourceCompleteness,
 		Verification: &VerificationSummary{
-			FindingID:          finding.ID,
+			FindingID:          singletonFindingID(findingIDs),
+			FindingIDs:         append([]string(nil), findingIDs...),
 			ProposalState:      proposal.Digest,
 			FinalState:         final.Digest,
 			ProposalFinalPatch: proposalFinal.Patch.Digest,
@@ -1161,14 +1189,27 @@ func verificationLeakageScanText(data recordLeakageMaterial, verification Verifi
 	for _, question := range verification.Questions {
 		questionText = append(questionText, question.Question)
 	}
+	findings := make([]map[string]string, 0, len(verification.Findings))
+	for _, finding := range verification.Findings {
+		findings = append(findings, map[string]string{
+			"claim":            finding.Claim,
+			"failure_scenario": finding.FailureScenario,
+			"severity":         finding.Severity,
+			"class":            finding.Class,
+		})
+	}
+	if len(findings) == 0 && verification.Finding != nil {
+		finding := verification.Finding
+		findings = append(findings, map[string]string{
+			"claim":            finding.Claim,
+			"failure_scenario": finding.FailureScenario,
+			"severity":         finding.Severity,
+			"class":            finding.Class,
+		})
+	}
 	body, err := json.Marshal(map[string]any{
-		"base": leakageScanText(data),
-		"finding": map[string]string{
-			"claim":            verification.Finding.Claim,
-			"failure_scenario": verification.Finding.FailureScenario,
-			"severity":         verification.Finding.Severity,
-			"class":            verification.Finding.Class,
-		},
+		"base":      leakageScanText(data),
+		"findings":  findings,
 		"questions": questionText,
 	})
 	if err != nil {
@@ -1420,9 +1461,9 @@ func renderVerificationStablePrefix(data verificationRenderData) string {
 	fmt.Fprintln(&b, "# Subreview Verification Packet")
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "## Verification Contract")
-	fmt.Fprintln(&b, "- Verify whether the proposal-to-final changes resolved the referenced finding.")
+	fmt.Fprintln(&b, "- Verify whether the proposal-to-final changes resolved each referenced finding.")
 	fmt.Fprintln(&b, "- Use only the included proposal-to-final diff, final-state context, gate evidence, and explicit omissions.")
-	fmt.Fprintln(&b, "- Return exactly one verification outcome for the finding unless deterministic refutation evidence is supplied.")
+	fmt.Fprintln(&b, "- Return exactly one logical verdict per finding_id, using verifier_outcomes or deterministic_refutations evidence.")
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "## Identity")
 	fmt.Fprintf(&b, "- route: %s\n", data.Dedupe.Route)
@@ -1436,14 +1477,16 @@ func renderVerificationStablePrefix(data verificationRenderData) string {
 	fmt.Fprintf(&b, "- coverage_manifest: %s\n", data.Manifest.Digest)
 	fmt.Fprintf(&b, "- semantic_dedupe_digest: %s\n", data.Dedupe.Digest)
 	fmt.Fprintln(&b)
-	fmt.Fprintln(&b, "## Finding Under Verification")
-	fmt.Fprintf(&b, "- finding_id: %s\n", data.Verification.Finding.ID)
-	fmt.Fprintf(&b, "- severity: %s\n", data.Verification.Finding.Severity)
-	fmt.Fprintf(&b, "- class: %s\n", data.Verification.Finding.Class)
-	fmt.Fprintf(&b, "- claim: %s\n", markdownJSONString(data.Verification.Finding.Claim))
-	fmt.Fprintf(&b, "- failure_scenario: %s\n", markdownJSONString(data.Verification.Finding.FailureScenario))
-	renderLineRefs(&b, "citations", data.Verification.Finding.Citations)
-	renderAnchorRefs(&b, "anchors", data.Verification.Finding.Anchors)
+	fmt.Fprintln(&b, "## Findings Under Verification")
+	for _, finding := range data.Verification.Findings {
+		fmt.Fprintf(&b, "### %s\n", finding.ID)
+		fmt.Fprintf(&b, "- severity: %s\n", finding.Severity)
+		fmt.Fprintf(&b, "- class: %s\n", finding.Class)
+		fmt.Fprintf(&b, "- claim: %s\n", markdownJSONString(finding.Claim))
+		fmt.Fprintf(&b, "- failure_scenario: %s\n", markdownJSONString(finding.FailureScenario))
+		renderLineRefs(&b, "citations", finding.Citations)
+		renderAnchorRefs(&b, "anchors", finding.Anchors)
+	}
 	if len(data.Verification.ExpectedFixSurface) > 0 {
 		fmt.Fprintln(&b, "- expected_fix_surface:")
 		for _, surface := range data.Verification.ExpectedFixSurface {
@@ -2149,34 +2192,65 @@ func snapshotForManifestTransition(store state.Store, events []state.Event, repo
 	return SnapshotRef{}, fmt.Errorf("%s->%s diff is required for verification packet", fromKind, toKind)
 }
 
-func latestFindingForVerification(store state.Store, events []state.Event, repo, manifestDigest, proposalDigest, policyDigest, findingID string) (reviewresult.FindingRecord, error) {
-	findingID = strings.TrimSpace(findingID)
-	if findingID == "" {
-		return reviewresult.FindingRecord{}, errors.New("--finding is required for verification packets")
+func normalizeVerificationFindingIDs(single string, values []string) ([]string, error) {
+	ids := []string{}
+	if strings.TrimSpace(single) != "" {
+		ids = append(ids, single)
 	}
+	ids = append(ids, values...)
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(ids))
+	for _, raw := range ids {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			return nil, fmt.Errorf("duplicate --finding: %s", id)
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("--finding is required for verification packets")
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func latestFindingsForVerification(store state.Store, events []state.Event, repo, manifestDigest, proposalDigest, policyDigest string, findingIDs []string) ([]reviewresult.FindingRecord, error) {
 	observations, err := reviewresult.Observations(store, events, repo)
 	if err != nil {
-		return reviewresult.FindingRecord{}, err
+		return nil, err
 	}
-	var carried *reviewresult.FindingRecord
-	for _, observation := range observations {
-		for _, finding := range observation.Record.Findings {
-			if finding.ID != findingID || !finding.Accepted {
-				continue
-			}
-			if observation.Record.Packet.CoverageManifest.Digest == manifestDigest {
-				return finding, nil
-			}
-			if carried == nil && carriedFindingRecordApplies(observation.Record, proposalDigest, policyDigest) {
-				value := finding
-				carried = &value
+	results := make([]reviewresult.FindingRecord, 0, len(findingIDs))
+	for _, findingID := range findingIDs {
+		var carried *reviewresult.FindingRecord
+		for _, observation := range observations {
+			for _, finding := range observation.Record.Findings {
+				if finding.ID != findingID || !finding.Accepted {
+					continue
+				}
+				if observation.Record.Packet.CoverageManifest.Digest == manifestDigest {
+					results = append(results, finding)
+					carried = nil
+					goto nextFinding
+				}
+				if carried == nil && carriedFindingRecordApplies(observation.Record, proposalDigest, policyDigest) {
+					value := finding
+					carried = &value
+				}
 			}
 		}
+		if carried != nil {
+			results = append(results, *carried)
+			continue
+		}
+		return nil, fmt.Errorf("accepted finding not found for verification: %s", findingID)
+	nextFinding:
 	}
-	if carried != nil {
-		return *carried, nil
-	}
-	return reviewresult.FindingRecord{}, fmt.Errorf("accepted finding not found for verification: %s", findingID)
+	sort.Slice(results, func(i, j int) bool { return results[i].ID < results[j].ID })
+	return results, nil
 }
 
 func carriedFindingRecordApplies(record reviewresult.ResultRecord, proposalDigest, policyDigest string) bool {
@@ -2241,13 +2315,39 @@ func patchFilesForDiff(store state.Store, diff SourceDiff) ([]patchFile, error) 
 	return parsePatch(body), nil
 }
 
-func verificationQuestions(finding reviewresult.FindingRecord) []VerificationQuestion {
+func verificationQuestions() []VerificationQuestion {
 	return []VerificationQuestion{
-		{ID: "resolution", Question: "Did the proposal-to-final changes resolve the referenced finding in the final state?"},
+		{ID: "resolution", Question: "Did the proposal-to-final changes resolve each referenced finding in the final state?"},
 		{ID: "regression", Question: "Did the fix introduce a new regression or unexpected scope change?"},
 		{ID: "context", Question: "Is the included context sufficient to verify the outcome?"},
 		{ID: "deterministic", Question: "Is there deterministic or executable evidence that refutes the finding?"},
 	}
+}
+
+func combinedFixSurface(findings []reviewresult.FindingRecord) []reviewresult.FixSurface {
+	seen := map[string]reviewresult.FixSurface{}
+	for _, finding := range findings {
+		for _, surface := range finding.ExpectedFixSurface {
+			seen[digestJSON(surface)] = surface
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]reviewresult.FixSurface, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, seen[key])
+	}
+	return out
+}
+
+func singletonFindingID(ids []string) string {
+	if len(ids) == 1 {
+		return ids[0]
+	}
+	return ""
 }
 
 func questionStrings(questions []VerificationQuestion) []string {
@@ -2443,12 +2543,9 @@ func latestBoundPolicy(store state.Store, events []state.Event, repo string) (*b
 		if err != nil {
 			return nil, err
 		}
-		var effective policy.EffectivePolicy
-		if err := decodeStrict(body, &effective); err != nil {
+		effective, err := policy.DecodeBoundEffectivePolicy(body, profile, repo, policyID)
+		if err != nil {
 			return nil, err
-		}
-		if effective.Repo != repo || effective.Profile != profile || effective.PolicyID != policyID {
-			return nil, errors.New("bound policy object does not match policy.bound event")
 		}
 		return &boundPolicy{Ref: PolicyRef{Profile: profile, PolicyID: policyID, Digest: digest}, Effective: effective}, nil
 	}
@@ -2554,19 +2651,24 @@ func contentBundleDigestMaterial(sourceDiffs []SourceDiff, target SnapshotRef, a
 	}
 }
 
-func verificationContentBundleDigestMaterial(sourceDiffs []SourceDiff, target SnapshotRef, allowedContextDigest string, gates []GateSummary, finding reviewresult.FindingRecord) any {
-	return map[string]any{
-		"source_diffs": sourceDiffDigestMaterial(sourceDiffs),
-		"target_state": targetDigestMaterial(target),
-		"context":      allowedContextDigest,
-		"gates":        gateDigestMaterial(gates),
-		"finding": map[string]any{
+func verificationContentBundleDigestMaterial(sourceDiffs []SourceDiff, target SnapshotRef, allowedContextDigest string, gates []GateSummary, findings []reviewresult.FindingRecord) any {
+	findingMaterial := make([]map[string]any, 0, len(findings))
+	for _, finding := range findings {
+		findingMaterial = append(findingMaterial, map[string]any{
 			"id":                   finding.ID,
 			"dedupe_digest":        finding.DedupeDigest,
 			"severity":             finding.Severity,
 			"class":                finding.Class,
 			"expected_fix_surface": finding.ExpectedFixSurface,
-		},
+		})
+	}
+	sort.Slice(findingMaterial, func(i, j int) bool { return findingMaterial[i]["id"].(string) < findingMaterial[j]["id"].(string) })
+	return map[string]any{
+		"source_diffs": sourceDiffDigestMaterial(sourceDiffs),
+		"target_state": targetDigestMaterial(target),
+		"context":      allowedContextDigest,
+		"gates":        gateDigestMaterial(gates),
+		"findings":     findingMaterial,
 	}
 }
 

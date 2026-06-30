@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -328,6 +329,101 @@ func TestArtifactImportAndStatusCLI(t *testing.T) {
 		t.Fatalf("bad final artifact status output: %s", finalStatusOut)
 	}
 	assertCLIStateValid(t, bin, stateDir)
+}
+
+func TestResultValidateCLIJSONAndContextBounds(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "subreview")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build subreview: %v\n%s", err, out)
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	stateDir := filepath.Join(root, "state")
+	planPath := filepath.Join(root, "plan.md")
+	if err := os.WriteFile(planPath, []byte("# Plan\n\nReview me.\n"), 0o644); err != nil {
+		t.Fatalf("write plan: %v", err)
+	}
+	if out, err := exec.Command(bin, "state", "init", "--state", stateDir, "--repo", repo, "--json").CombinedOutput(); err != nil {
+		t.Fatalf("state init failed: %v\n%s", err, out)
+	}
+	importOut, err := exec.Command(bin, "artifact", "import", "--state", stateDir, "--kind", "plan", "--path", planPath, "--title", "Validate Plan", "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("artifact import failed: %v\n%s", err, importOut)
+	}
+	var imported struct {
+		ArtifactID string `json:"artifact_id"`
+	}
+	if err := json.Unmarshal(importOut, &imported); err != nil {
+		t.Fatalf("artifact import output is not json: %v\n%s", err, importOut)
+	}
+	packetOut, err := exec.Command(bin, "packet", "build", "--state", stateDir, "--kind", "artifact", "--artifact", imported.ArtifactID, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("artifact packet build failed: %v\n%s", err, packetOut)
+	}
+	var builtPacket struct {
+		Packet struct {
+			Digest string `json:"digest"`
+		} `json:"packet"`
+	}
+	if err := json.Unmarshal(packetOut, &builtPacket); err != nil {
+		t.Fatalf("packet output is not json: %v\n%s", err, packetOut)
+	}
+	validPath := writeCLIWorkerResult(t, reviewresult.WorkerResult{
+		SchemaVersion: reviewresult.SchemaVersion,
+		Packet:        builtPacket.Packet.Digest,
+		RunKind:       reviewresult.RunKindDiscovery,
+		Route:         reviewresult.RouteArtifactReview,
+		Outcome:       reviewresult.OutcomeClean,
+		Summary:       "No actionable findings.",
+	})
+	validOut, err := exec.Command(bin, "result", "validate", "--state", stateDir, "--packet", builtPacket.Packet.Digest, "--result", validPath, "--json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("valid result validate failed: %v\n%s", err, validOut)
+	}
+	var valid struct {
+		Valid bool `json:"valid"`
+	}
+	if err := json.Unmarshal(validOut, &valid); err != nil || !valid.Valid {
+		t.Fatalf("valid result validate output is wrong: err=%v out=%s", err, validOut)
+	}
+	invalidPath := filepath.Join(root, "invalid-result.json")
+	if err := os.WriteFile(invalidPath, []byte(`{"schema_version": 1,`), 0o644); err != nil {
+		t.Fatalf("write invalid result: %v", err)
+	}
+	cmd := exec.Command(bin, "result", "validate", "--state", stateDir, "--packet", builtPacket.Packet.Digest, "--result", invalidPath, "--json")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	invalidOut, err := cmd.Output()
+	if err == nil {
+		t.Fatalf("invalid result validate should exit non-zero: %s", invalidOut)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("invalid result validate should not write stderr: %s", stderr.String())
+	}
+	if bytes.Contains(invalidOut, []byte("\n  ")) {
+		t.Fatalf("invalid result validate should be compact json: %s", invalidOut)
+	}
+	var invalid struct {
+		SchemaVersion int    `json:"schema_version"`
+		Valid         bool   `json:"valid"`
+		Error         string `json:"error"`
+	}
+	if err := json.Unmarshal(invalidOut, &invalid); err != nil {
+		t.Fatalf("invalid result output is not json: %v\n%s", err, invalidOut)
+	}
+	if invalid.SchemaVersion != 1 || invalid.Valid || invalid.Error == "" {
+		t.Fatalf("bad invalid result output: %s", invalidOut)
+	}
+	for _, raw := range []string{"0", "-1", "262145"} {
+		args := []string{"packet", "build", "--state", filepath.Join(root, "missing-state"), "--kind", "primary", "--max-context-bytes=" + raw}
+		out, err := exec.Command(bin, args...).CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "--max-context-bytes") {
+			t.Fatalf("max-context-bytes=%s should fail before packet build, err=%v out=%s", raw, err, out)
+		}
+	}
 }
 
 func TestHelpLiteralIsAcceptedAsFlagValue(t *testing.T) {

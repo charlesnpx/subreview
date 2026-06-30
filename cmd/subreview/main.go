@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/charlesnpx/subreview/internal/anchor"
 	"github.com/charlesnpx/subreview/internal/artifact"
@@ -61,9 +64,21 @@ func main() {
 		err = fmt.Errorf("unknown command: %s", os.Args[1])
 	}
 	if err != nil {
+		var exit handledExit
+		if errors.As(err, &exit) {
+			os.Exit(exit.Code)
+		}
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+type handledExit struct {
+	Code int
+}
+
+func (h handledExit) Error() string {
+	return "handled exit"
 }
 
 func usage(w io.Writer) {
@@ -79,11 +94,12 @@ func usage(w io.Writer) {
   subreview install-skills [--plan|--install|--uninstall] [--target tools|claude|codex|all] [--json] [--install-root <dir>]
   subreview obligations build --state <dir> [--json]
   subreview obligations status --state <dir> [--json]
-  subreview packet build --state <dir> --kind <primary|verification|artifact> [--artifact <id>] [--finding <id>] [--route targeted_verification|artifact_review] [--json]
+  subreview packet build --state <dir> --kind <primary|verification|artifact> [--artifact <id>] [--finding <id>] [--max-context-bytes <n>] [--route targeted_verification|artifact_review] [--json]
   subreview policy check --config <path> --repo <path> [--json]
   subreview policy bind --state <dir> --config <path> --profile <name> [--json]
   subreview policy explain --state <dir> --profile <name> [--json]
   subreview result import --state <dir> --packet <id> --result <file> [--json]
+  subreview result validate --state <dir> --packet <id> --result <file> --json
   subreview snapshot capture --state <dir> --kind <base|proposal|final> --repo <path> [--ref <ref>] [--json]
   subreview snapshot restore --state <dir> --kind <base|proposal|final> --output <dir> [--json]
   subreview state init --state <dir> --repo <path> [--json]
@@ -257,7 +273,10 @@ func packetBuild(args []string) error {
 	stateDir := fs.String("state", "", "Explicit state directory")
 	kind := fs.String("kind", packet.KindPrimary, "Packet kind")
 	artifactID := fs.String("artifact", "", "Artifact id for artifact packets")
-	findingID := fs.String("finding", "", "Finding id for verification packets")
+	var findingIDs stringListFlag
+	fs.Var(&findingIDs, "finding", "Finding id for verification packets; repeat for batch verification")
+	maxContextBytes := optionalIntFlag{}
+	fs.Var(&maxContextBytes, "max-context-bytes", "Maximum context bytes, 1-262144")
 	route := fs.String("route", "", "Optional packet route")
 	asJSON := fs.Bool("json", false, "Emit JSON")
 	if err := fs.Parse(args); err != nil {
@@ -266,7 +285,14 @@ func packetBuild(args []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("packet build does not accept positional arguments")
 	}
-	result, err := packet.Build(packet.BuildOptions{StateDir: *stateDir, Kind: *kind, ArtifactID: *artifactID, FindingID: *findingID, Route: *route})
+	maxBytes := 0
+	if maxContextBytes.set {
+		if maxContextBytes.value <= 0 || maxContextBytes.value > packet.MaxContextBytesLimit {
+			return fmt.Errorf("--max-context-bytes must be 1-%d", packet.MaxContextBytesLimit)
+		}
+		maxBytes = maxContextBytes.value
+	}
+	result, err := packet.Build(packet.BuildOptions{StateDir: *stateDir, Kind: *kind, ArtifactID: *artifactID, FindingIDs: findingIDs.values, Route: *route, MaxContextBytes: maxBytes})
 	if err != nil {
 		return err
 	}
@@ -279,20 +305,21 @@ func packetBuild(args []string) error {
 
 func usagePacket(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  subreview packet build --state <dir> --kind <primary|verification|artifact> [--artifact <id>] [--finding <id>] [--route targeted_verification|artifact_review] [--json]`)
+  subreview packet build --state <dir> --kind <primary|verification|artifact> [--artifact <id>] [--finding <id>] [--max-context-bytes <n>] [--route targeted_verification|artifact_review] [--json]`)
 }
 
 func usagePacketBuild(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  subreview packet build --state <dir> --kind <primary|verification|artifact> [--artifact <id>] [--finding <id>] [--route targeted_verification|artifact_review] [--json]
+  subreview packet build --state <dir> --kind <primary|verification|artifact> [--artifact <id>] [--finding <id>] [--max-context-bytes <n>] [--route targeted_verification|artifact_review] [--json]
 
 Builds a canonical primary, finding-targeted verification, or standalone artifact packet with stable and volatile prompt sections.
+Repeat --finding to build one verification packet covering multiple findings.
 Artifact packets use --kind artifact --artifact <id>, route artifact_review, and do not require snapshots, diffs, obligations, policy, gates, coverage manifests, or close.`)
 }
 
 func resultCommand(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("result requires subcommand: import")
+		return fmt.Errorf("result requires subcommand: import or validate")
 	}
 	if isHelpCommand(args[0]) {
 		usageResult(os.Stdout)
@@ -301,8 +328,10 @@ func resultCommand(args []string) error {
 	switch args[0] {
 	case "import":
 		return resultImport(args[1:])
+	case "validate":
+		return resultValidate(args[1:])
 	default:
-		return fmt.Errorf("result requires subcommand: import")
+		return fmt.Errorf("result requires subcommand: import or validate")
 	}
 }
 
@@ -336,7 +365,8 @@ func resultImport(args []string) error {
 
 func usageResult(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  subreview result import --state <dir> --packet <id> --result <file> [--json]`)
+  subreview result import --state <dir> --packet <id> --result <file> [--json]
+  subreview result validate --state <dir> --packet <id> --result <file> --json`)
 }
 
 func usageResultImport(w io.Writer) {
@@ -345,6 +375,50 @@ func usageResultImport(w io.Writer) {
 
 Imports a bounded structured worker result, normalizes findings, records lifecycle evidence, and appends one ledger event.
 For artifact_review packets, import the reviewer result here and use artifact status as the loop gate; subreview close remains code-review closure only.`)
+}
+
+func resultValidate(args []string) error {
+	if hasHelpFlag(args) {
+		usageResultValidate(os.Stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("result validate", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateDir := fs.String("state", "", "Explicit state directory")
+	packetID := fs.String("packet", "", "Packet digest, semantic dedupe digest, or packet event id")
+	resultPath := fs.String("result", "", "Structured worker result JSON file")
+	asJSON := fs.Bool("json", false, "Emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("result validate does not accept positional arguments")
+	}
+	validated, err := reviewresult.Validate(reviewresult.ValidateOptions{StateDir: *stateDir, PacketID: *packetID, ResultPath: *resultPath})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		if validated.Valid {
+			return writeJSON(validated)
+		}
+		if err := writeCompactJSON(validated); err != nil {
+			return err
+		}
+		return handledExit{Code: 1}
+	}
+	if !validated.Valid {
+		return fmt.Errorf("worker result invalid: %s", validated.Error)
+	}
+	fmt.Println("worker result valid")
+	return nil
+}
+
+func usageResultValidate(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  subreview result validate --state <dir> --packet <id> --result <file> --json
+
+Validates a bounded structured worker result using result import normalization without writing CAS objects or ledger events.`)
 }
 
 func gatesCommand(args []string) error {
@@ -1111,4 +1185,48 @@ func writeJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+func writeCompactJSON(v any) error {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(os.Stdout, string(body))
+	return err
+}
+
+type stringListFlag struct {
+	values []string
+}
+
+func (f *stringListFlag) String() string {
+	return strings.Join(f.values, ",")
+}
+
+func (f *stringListFlag) Set(value string) error {
+	f.values = append(f.values, value)
+	return nil
+}
+
+type optionalIntFlag struct {
+	value int
+	set   bool
+}
+
+func (f *optionalIntFlag) String() string {
+	if !f.set {
+		return ""
+	}
+	return strconv.Itoa(f.value)
+}
+
+func (f *optionalIntFlag) Set(value string) error {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return err
+	}
+	f.value = parsed
+	f.set = true
+	return nil
 }
